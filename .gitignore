@@ -1,0 +1,41 @@
+# ============= Rust =============
+# 编译产物
+/target/
+**/target/
+# Cargo 锁文件（应用通常提交，库通常不提交；这里 Tauri 应用提交）
+# Cargo.lock
+
+# ============= Tauri =============
+src-tauri/target/
+src-tauri/gen/
+
+# ============= Node / 前端工具 =============
+node_modules/
+*.log
+npm-debug.log*
+
+# ============= IDE / 编辑器 =============
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ============= 临时 / 测试文件 =============
+# 调试时用的临时 HTML / md 文件
+src/_test*.html
+src/_test*.js
+src/test*.md
+src/_*.md
+*.tmp
+*.bak
+*.orig
+
+# ============= 用户配置 / 本地 =============
+*.local
+.env
+.env.local
+config.local.*

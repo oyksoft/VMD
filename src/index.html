@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VMD</title>
+    <link rel="stylesheet" href="./style.css" />
+    <!-- marked.js (markdown → HTML) -->
+    <script src="vendor/marked.min.js"></script>
+    <!-- highlight.js (代码高亮) — cdnjs 浏览器版，含全部语言 -->
+    <link rel="stylesheet" href="vendor/highlight-dark.css">
+    <script src="vendor/highlight.min.js"></script>
+    <!-- KaTeX (LaTeX 数学公式渲染) -->
+    <link rel="stylesheet" href="vendor/katex/katex.min.css">
+    <script src="vendor/katex/katex.min.js"></script>
+    <script src="vendor/katex/contrib/auto-render.min.js"></script>
+    <!-- Mermaid (流程图/序列图/类图等) -->
+    <script src="vendor/mermaid.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <header id="toolbar">
+            <button id="btn-new" title="新建 (Ctrl+N)">新建</button>
+            <button id="btn-open" title="打开 (Ctrl+O)">打开</button>
+            <button id="btn-save" title="保存 (Ctrl+S)">保存</button>
+            <button id="btn-save-as" title="另存为 (Ctrl+Shift+S)">另存为</button>
+            <span class="sep"></span>
+            <span id="filename">未保存</span>
+            <span class="spacer"></span>
+            <span id="status"></span>
+            <div class="seg" id="mode-seg" role="group" aria-label="模式切换">
+                <button class="seg-btn read-mode is-active" data-mode="read">
+                    <span class="seg-icon">📖</span><span class="seg-label">阅读</span>
+                </button>
+                <button class="seg-btn edit-mode" data-mode="edit">
+                    <span class="seg-icon">✏️</span><span class="seg-label">编辑</span>
+                </button>
+            </div>
+            <div class="dropdown" id="theme-dropdown">
+                <button id="btn-theme" class="dropdown-toggle" title="切换主题">
+                    <span id="theme-label">🌙 暗色</span>
+                    <span class="dropdown-arrow">▼</span>
+                </button>
+                <div class="dropdown-menu" id="theme-menu">
+                    <div class="dropdown-item" data-theme="auto">🖥️ <span>跟随系统</span></div>
+                    <div class="dropdown-item" data-theme="dark">🌙 <span>暗色</span></div>
+                    <div class="dropdown-item" data-theme="gray">🌫️ <span>灰色</span></div>
+                    <div class="dropdown-item" data-theme="light">☀️ <span>浅色</span></div>
+                </div>
+            </div>
+        </header>
+
+        <div id="content">
+            <aside id="toc">
+                <div class="toc-header">目录</div>
+                <div id="toc-list"></div>
+            </aside>
+
+            <div class="splitter" id="split-toc" title="拖动调整宽度（双击重置）"></div>
+
+            <main id="editor-wrap">
+                <textarea id="editor" spellcheck="false" placeholder="在此输入 Markdown..."></textarea>
+            </main>
+
+            <div class="splitter" id="split-preview" title="拖动调整宽度（双击重置）"></div>
+
+            <section id="preview-wrap">
+                <article id="preview"></article>
+            </section>
+        </div>
+
+        <!-- 自定义右键菜单 -->
+        <div id="ctx-menu" class="ctx-menu"></div>
+    </div>
+    <script src="./app.js"></script>
+</body>
+</html>

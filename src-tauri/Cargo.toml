@@ -1,0 +1,26 @@
+[package]
+name = "vmd"
+version = "0.1.0"
+edition = "2021"
+description = "VMD - 一个轻量级的 Markdown 查看与编辑工具"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "0.39"
+windows = "0.62"
+
+[profile.dev]
+debug = 1
+incremental = true
+opt-level = 0
