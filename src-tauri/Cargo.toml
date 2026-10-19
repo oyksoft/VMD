@@ -24,3 +24,14 @@ windows = "0.62"
 debug = 1
 incremental = true
 opt-level = 0
+
+[profile.release]
+opt-level = "z"           # size 优化（同等速度更小）
+lto = "fat"               # 完全 LTO，跨模块优化
+codegen-units = 1         # 单 codegen unit，体积更小
+panic = "abort"           # 不要 unwinding 代码，减小体积
+strip = "symbols"         # 去掉符号表
+incremental = false       # release 不要增量
+
+[profile.release.package."*"]
+opt-level = "z"           # 依赖也用 size 优化
