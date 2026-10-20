@@ -3,6 +3,11 @@
 html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
 
 :root {
+    /* 等宽字体栈：西文用 Cascadia/Consolas，中文用无衬线（避免落到宋体） */
+    --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo,
+                 "Noto Sans Mono CJK SC", "Sarasa Mono SC",
+                 "Noto Sans SC", "Microsoft YaHei UI", "Microsoft YaHei",
+                 "PingFang SC", "DengXian", "Heiti SC", monospace, sans-serif;
     --bg: #0d1117;
     --bg-panel: #161b22;
     --bg-elevated: #21262d;
@@ -283,9 +288,11 @@ html[data-theme="gray"] .seg {
     border: none;
     outline: none;
     resize: none;
-    font-family: ui-monospace, "Cascadia Code", "Consolas", "Microsoft YaHei Mono", monospace;
-    font-size: 13px;
-    line-height: 1.6;
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    line-height: 1.7;
+    font-variant-ligatures: none;   /* 关掉连字，代码更清晰 */
+    font-feature-settings: "liga" 0, "calt" 0;
     tab-size: 4;
     user-select: text;
 }
@@ -333,15 +340,17 @@ html[data-theme="gray"] .seg {
     background: var(--bg-code);
     padding: 2px 6px;
     border-radius: 4px;
-    font-family: ui-monospace, monospace;
-    font-size: 0.92em;
+    font-family: var(--font-mono);
+    font-size: 0.94em;
+    font-variant-ligatures: none;
 }
 #preview pre {
     background: var(--bg-code);
     padding: 16px;
     border-radius: 6px;
     overflow-x: auto;
-    line-height: 1.45;
+    line-height: 1.6;
+    font-size: 13px;
     margin: 0 0 16px;
     border: 1px solid rgba(255, 255, 255, 0.08);
 }
@@ -370,20 +379,67 @@ html[data-theme="gray"] .seg {
     margin: 24px 0;
 }
 
-#preview table {
-    border-collapse: collapse;
+/* 表格：外层 .table-wrap 负责横向滚动，table 保持 table 布局（border-collapse 才生效） */
+#preview .table-wrap {
     margin: 0 0 16px;
-    overflow: auto;
-    display: block;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-panel);
 }
-#preview table th, #preview table td {
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    padding: 6px 12px;
+#preview .table-wrap::-webkit-scrollbar { height: 8px; }
+#preview .table-wrap::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
+}
+#preview .table-wrap::-webkit-scrollbar-track { background: transparent; }
+
+#preview table {
+    /* separate + spacing 0：每格边框独立，方便用 overflow:hidden 裁圆角 */
+    border-collapse: separate;
+    border-spacing: 0;
+    width: 100%;
+    margin: 0;
+    font-size: 0.94em;
+    line-height: 1.5;
+}
+#preview table th,
+#preview table td {
+    /* 网格线用淡色；不画 top/left（交给外框），避免和外框叠成双线 */
+    border: 0;
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 14px;
     text-align: left;
+    vertical-align: top;
 }
-#preview table th { background: var(--bg-panel); font-weight: 600; }
-#preview table tr:nth-child(even) td { background: rgba(255, 255, 255, 0.04); }
-#preview table tr:nth-child(odd) td { background: var(--bg-panel); }
+#preview table th {
+    background: var(--bg-elevated);
+    font-weight: 600;
+    color: var(--text-strong);
+    white-space: nowrap;
+    border-bottom: 1px solid var(--border);   /* 表头线稍强 */
+}
+#preview table th:last-child,
+#preview table td:last-child {
+    border-right: 0;    /* 最右列不画竖线，避免和外框重叠 */
+}
+#preview table tbody tr:last-child td {
+    border-bottom: 0;   /* 最后一行不画横线 */
+}
+#preview table tbody tr:nth-child(even) td {
+    background: rgba(127, 127, 127, 0.05);
+}
+#preview table tbody tr:hover td {
+    background: rgba(127, 127, 127, 0.11);
+}
+/* markdown 里用 :---: 指定的对齐 */
+#preview table th[align="center"], #preview table td[align="center"] { text-align: center; }
+#preview table th[align="right"],  #preview table td[align="right"]  { text-align: right; }
+#preview table th[align="left"],   #preview table td[align="left"]   { text-align: left; }
+/* 表格里的代码块不要重复外框 */
+#preview .table-wrap .code-block { margin: 0; }
 
 /* 图片 */
 #preview img.emoji {
@@ -501,6 +557,7 @@ html[data-theme="gray"] .seg {
 .mermaid-block svg {
     max-width: 100%;
     height: auto;
+    background: transparent !important;
 }
 /* dark/gray 主题下 mermaid 颜色变量反转 */
 :root[data-theme="dark"] .mermaid-block,
@@ -577,3 +634,142 @@ html[data-theme="gray"] .seg {
 .toc-item.lvl4 { padding-left: 44px; color: var(--text-dim); font-size: 11.5px; opacity: 0.75; }
 .toc-item.lvl5 { padding-left: 56px; color: var(--text-dim); font-size: 11px;   opacity: 0.65; }
 .toc-item.lvl6 { padding-left: 68px; color: var(--text-dim); font-size: 11px;   opacity: 0.55; }
+
+/* === 打印模式（导出 PDF 时临时启用：只显示预览内容） === */
+/* 关键：html/body 的 height:100% + overflow:hidden 会把内容裁到一屏，
+   PrintToPdf 就只能导出一页。必须全部放开。 */
+html.print-mode,
+html.print-mode body {
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+}
+body.print-mode { background: #fff !important; }
+body.print-mode #app {
+    display: block !important;
+    height: auto !important;
+    min-height: 100% !important;
+    overflow: visible !important;
+}
+body.print-mode #toolbar { display: none !important; }
+body.print-mode #toc,
+body.print-mode #split-toc,
+body.print-mode #editor-wrap,
+body.print-mode #split-preview { display: none !important; }
+body.print-mode #content { position: static !important; display: block !important; overflow: visible !important; }
+body.print-mode #preview-wrap {
+    flex: none !important;
+    width: 100% !important;
+    max-width: none !important;
+    overflow: visible !important;
+    height: auto !important;
+    background: transparent !important;
+}
+body.print-mode #preview {
+    max-width: none !important;
+    padding: 0 !important;
+    color: #000 !important;
+}
+body.print-mode #preview a { color: #0645ad !important; text-decoration: underline; }
+body.print-mode #preview h1,
+body.print-mode #preview h2,
+body.print-mode #preview h3,
+body.print-mode #preview h4,
+body.print-mode #preview h5,
+body.print-mode #preview h6 { color: #000 !important; border-color: #ccc !important; }
+body.print-mode #preview code { background: #f5f5f5 !important; color: #24292f !important; }
+body.print-mode #preview pre { background: #f5f5f5 !important; border: 1px solid #ddd !important; }
+body.print-mode #preview blockquote { border-color: #ccc !important; color: #555 !important; }
+body.print-mode .table-wrap { border-color: #ddd !important; background: #fff !important; }
+body.print-mode #preview table th { border-bottom-color: #bbb !important; }
+body.print-mode #preview table th,
+body.print-mode #preview table td { border-bottom-color: #e5e5e5 !important; }
+body.print-mode #preview table th { border-bottom-color: #bbb !important; }
+body.print-mode #preview table th { background: #f0f0f0 !important; color: #000 !important; }
+body.print-mode #preview table tbody tr:nth-child(even) td { background: #fafafa !important; }
+body.print-mode #preview hr { border-color: #ccc !important; }
+/* 打印时用浅色主题（深色背景打印出来耗墨且不清晰） */
+body.print-mode .mermaid-block { background: transparent !important; }
+
+/* === 代码块：右上角浮动语言标签 + 复制按钮（不占行） === */
+.code-block {
+    position: relative;
+    margin: 0 0 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--bg-code);
+}
+.code-block-header {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 6px 5px 24px;
+    /* 从右往左渐隐，融进代码背景，不挡字 */
+    background: linear-gradient(to left, var(--bg-code) 55%, transparent);
+    border-bottom-left-radius: 8px;
+    pointer-events: none;          /* 空白区不挡选中文本 */
+    user-select: none;
+    opacity: 0.6;
+    transition: opacity 0.18s;
+}
+.code-block:hover .code-block-header { opacity: 1; }
+.code-lang {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    letter-spacing: 0.4px;
+    text-transform: lowercase;
+}
+.code-copy {
+    pointer-events: auto;           /* 按钮可点 */
+    appearance: none;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 11.5px;
+    line-height: 1;
+    padding: 3px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.code-copy svg { display: block; }
+.code-copy:hover {
+    background: var(--bg-elevated);
+    color: var(--text);
+    border-color: var(--border);
+}
+.code-copy.copied {
+    color: #3fb950;
+    border-color: rgba(63, 185, 80, 0.35);
+    background: rgba(63, 185, 80, 0.1);
+}
+.code-copy.failed {
+    color: #f85149;
+    border-color: rgba(248, 81, 73, 0.35);
+    background: rgba(248, 81, 73, 0.1);
+}
+/* 代码块本体：去掉外边距和圆角（由 .code-block 负责） */
+#preview .code-block pre {
+    margin: 0;
+    border-radius: 0;
+    border: none;
+    background: transparent;
+    padding-top: 20px;      /* 给浮动标签留点空间 */
+}
+#preview .code-block pre code {
+    background: transparent;
+}
+
+/* 打印（导出 PDF）时隐藏复制按钮和语言标签 */
+body.print-mode .code-block-header { display: none !important; }
+body.print-mode .code-block { border: 1px solid #ddd !important; }

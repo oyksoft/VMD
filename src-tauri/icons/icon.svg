@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f8ef7"/>
+      <stop offset="0.55" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 底板 -->
+  <rect x="28" y="28" width="456" height="456" rx="116" fill="url(#bg)"/>
+  <!-- 顶部高光 -->
+  <rect x="28" y="28" width="456" height="456" rx="116" fill="url(#sheen)"/>
+  <!-- 内描边 -->
+  <rect x="34" y="34" width="444" height="444" rx="110" fill="none" stroke="rgba(255,255,255,0.22)" stroke-width="5"/>
+
+  <!-- Markdown 标志：M + 下箭头 -->
+  <g fill="none" stroke="#ffffff" stroke-width="36" stroke-linecap="round" stroke-linejoin="round">
+    <!-- M -->
+    <path d="M132 348 V172 l62 76 62-76 v176"/>
+    <!-- 下箭头 -->
+    <path d="M346 168 v152 M292 272 l54 54 54-54"/>
+  </g>
+</svg>

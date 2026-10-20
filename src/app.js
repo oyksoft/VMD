@@ -4,8 +4,10 @@
 // - emoji 用系统字体渲染（Segoe UI Emoji / Apple Color Emoji）
 // - Tauri 后端只做文件 I/O
 
-const { invoke } = window.__TAURI__.core;
-const { open, save } = window.__TAURI__.dialog;
+// Tauri API（带兜底，方便在普通浏览器里调试前端）
+const T = window.__TAURI__ || {};
+const invoke = (T.core && T.core.invoke) ? T.core.invoke : async () => { throw new Error('Tauri not available'); };
+const { open, save } = T.dialog || { open: async () => null, save: async () => null };
 
 // ============ 主题 ============
 
@@ -26,6 +28,7 @@ const THEMES = {
             '--bg-elevated': '#21262d',
             '--bg-code': '#161b22',
             '--border': '#30363d',
+            '--border-soft': 'rgba(255,255,255,0.09)',
             '--text': '#c9d1d9',
             '--text-strong': '#f0f6fc',
             '--text-dim': '#8b949e',
@@ -45,6 +48,7 @@ const THEMES = {
             '--bg-elevated': '#383d45',
             '--bg-code': '#2b2f36',
             '--border': '#454b54',
+            '--border-soft': 'rgba(255,255,255,0.10)',
             '--text': '#d2d6db',
             '--text-strong': '#f2f4f7',
             '--text-dim': '#9aa3ae',
@@ -64,6 +68,7 @@ const THEMES = {
             '--bg-elevated': '#eaeef2',
             '--bg-code': '#f6f8fa',
             '--border': '#d0d7de',
+            '--border-soft': 'rgba(27,31,36,0.12)',
             '--text': '#24292f',
             '--text-strong': '#0d1117',
             '--text-dim': '#57606a',
@@ -80,6 +85,7 @@ const THEME_ORDER = ['auto', 'dark', 'gray', 'light'];
 
 let currentTheme = 'auto';   // 用户选的（可能是 auto）
 let activeTheme = 'dark';    // 实际生效的（auto 时是系统决定的）
+let currentAppTheme = 'dark'; // 供 Mermaid 选择配色用
 
 /** 读系统当前是亮还是暗 */
 function systemPrefersDark() {
@@ -100,32 +106,46 @@ function applyConcreteTheme(key) {
     link.href = t.css;
     link.dataset.hljs = '1';
     document.head.appendChild(link);
+    // Mermaid 图的线条/文字颜色在渲染时就固化了 —— 换主题必须重渲染
+    currentAppTheme = key;
+    rerenderMermaid();
 }
 
 /** 用户选主题（可能是 auto） */
-function applyTheme(key) {
+async function applyTheme(key) {
     currentTheme = key;
     if (key === 'auto') {
-        activeTheme = systemPrefersDark() ? 'dark' : 'light';
+        // Tauri 2 在窗口主题为 Auto 时会把 WebView2 强制设成 Light，
+        // 所以 matchMedia 读不到真实系统主题 —— 改从 Rust 读注册表。
+        let sys = 'light';
+        try {
+            sys = await invoke('system_theme');
+        } catch (e) {
+            sys = systemPrefersDark() ? 'dark' : 'light';
+        }
+        activeTheme = sys;
     } else {
         activeTheme = key;
     }
+    // 同步 WebView2 的配色方案，让 prefers-color-scheme 与实际显示一致
+    // （gray 是暗色系，WebView2 侧用 dark）
+    const webviewScheme = (key === 'auto')
+        ? activeTheme
+        : (key === 'gray' ? 'dark' : key);
+    try {
+        await invoke('set_webview_color_scheme', { scheme: webviewScheme });
+    } catch (e) { /* 忽略：不影响配色变量 */ }
     applyConcreteTheme(activeTheme);
     renderPreview();
+    updateThemeButton();
 }
 
 // 跟随系统时，系统主题变化要实时响应
-if (window.matchMedia) {
-    const mq = window.matchMedia('(prefers-color-scheme: light)');
-    const onChange = () => {
-        if (currentTheme === 'auto') {
-            activeTheme = systemPrefersDark() ? 'dark' : 'light';
-            applyConcreteTheme(activeTheme);
-            renderPreview();
-        }
-    };
-    if (mq.addEventListener) mq.addEventListener('change', onChange);
-    else if (mq.addListener) mq.addListener(onChange);
+// 监听 Tauri 的 tauri://theme-changed（窗口主题保持 Auto，tao 仍会感知系统变化）
+if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen('tauri://theme-changed', () => {
+        if (currentTheme === 'auto') applyTheme('auto');
+    });
 }
 
 // ============ 配置 ============
@@ -144,29 +164,124 @@ marked.setOptions({
 // 渲染后高亮代码块
 function highlightCodeBlocks() {
     if (!window.hljs) return;
-    const codes = preview.querySelectorAll('pre code');
-    codes.forEach(code => {
-        if (code.dataset.highlighted) return;   // 避免重复高亮
-        const cls = code.className;
-        const lang = (cls.match(/language-(\S+)/) || [])[1] || '';
-        // 跳过 KaTeX / Mermaid 专用代码块——后面有专用渲染器
-        if (/^(latex|math|tex|katex|mermaid|seq|flow|sequence|diagram)$/.test(lang)) {
-            code.dataset.highlighted = '1';
+    const pres = Array.from(preview.querySelectorAll('pre'));
+    pres.forEach(pre => {
+        if (pre.dataset.codeBlockDone) return;   // 避免重复处理
+        const code = pre.querySelector('code');
+        if (!code) return;
+        const cls = code.className || '';
+        const lang = (cls.match(/language-([\w+#.-]+)/) || [])[1] || '';
+        // 跳过 KaTeX / Mermaid 专用代码块——它们有各自的渲染器
+        if (/^(latex|math|tex|katex|mermaid|seq|flow|sequence|diagram)$/i.test(lang)) {
+            pre.dataset.codeBlockDone = '1';
             return;
         }
         const text = code.textContent;
-        let result;
+        let result = null;
         try {
             result = (lang && hljs.getLanguage(lang))
                 ? hljs.highlight(text, { language: lang })
                 : hljs.highlightAuto(text);
-        } catch (e) {
-            return;
+        } catch (e) { /* 高亮失败就保持原样 */ }
+        if (result) {
+            code.innerHTML = result.value;
+            code.className = 'hljs' + (result.language ? ' language-' + result.language : '');
         }
-        code.innerHTML = result.value;
-        code.className = 'hljs' + (result.language ? ' language-' + result.language : '');
-        code.dataset.highlighted = '1';
+        // 套一层：右上角显示语言名 + 复制按钮
+        wrapCodeBlock(pre, lang);
+        pre.dataset.codeBlockDone = '1';
     });
+}
+
+// 复制按钮图标（内联 SVG，避免 emoji 风格不统一）
+const ICON_COPY = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+const ICON_CHECK = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+
+// 表格外套一个可横向滚动的容器（table 本身保持 table 布局，border-collapse 才生效）
+function wrapTables() {
+    const tables = Array.from(preview.querySelectorAll('table'));
+    tables.forEach(table => {
+        if (table.parentNode && table.parentNode.classList.contains('table-wrap')) return;
+        const wrap = document.createElement('div');
+        wrap.className = 'table-wrap';
+        table.parentNode.insertBefore(wrap, table);
+        wrap.appendChild(table);
+    });
+}
+
+// 给代码块加"头部"：语言标签 + 复制按钮
+function wrapCodeBlock(pre, lang) {
+    const parent = pre.parentNode;
+    if (!parent || parent.classList.contains('code-block')) return;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'code-block';
+
+    const header = document.createElement('div');
+    header.className = 'code-block-header';
+
+    // 语言名（源码里没指定就不显示）
+    if (lang) {
+        const label = document.createElement('span');
+        label.className = 'code-lang';
+        label.textContent = lang;
+        header.appendChild(label);
+    }
+
+    const btn = document.createElement('button');
+    btn.className = 'code-copy';
+    btn.type = 'button';
+    btn.title = '复制代码';
+    btn.setAttribute('aria-label', '复制代码');
+    btn.innerHTML = ICON_COPY;
+    btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const codeEl = pre.querySelector('code');
+        const text = codeEl ? codeEl.textContent : '';
+        copyToClipboard(text).then(ok => {
+            btn.innerHTML = ok ? ICON_CHECK : ICON_COPY;
+            btn.classList.toggle('copied', ok);
+            btn.classList.toggle('failed', !ok);
+            btn.title = ok ? '已复制' : '复制失败';
+            setTimeout(() => {
+                btn.innerHTML = ICON_COPY;
+                btn.classList.remove('copied', 'failed');
+                btn.title = '复制代码';
+            }, 1600);
+        });
+    });
+    header.appendChild(btn);
+
+    parent.insertBefore(wrapper, pre);
+    wrapper.appendChild(header);
+    wrapper.appendChild(pre);
+}
+
+// 复制到剪贴板（优先用 Clipboard API，失败则退回 execCommand）
+function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text)
+            .then(() => true)
+            .catch(() => legacyCopy(text));
+    }
+    return Promise.resolve(legacyCopy(text));
+}
+function legacyCopy(text) {
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return !!ok;
+    } catch (e) {
+        return false;
+    }
 }
 
 // ============ DOM ============
@@ -186,7 +301,7 @@ preview.addEventListener('click', async (e) => {
     if (!href) return;
     if (href.startsWith('#')) return;   // 锚点不处理（marked 会渲染成普通链接）
     try {
-        await window.__TAURI_INTERNALS__.invoke('plugin:shell|open', { path: href });
+        await invoke('open_url', { url: href });
     } catch (err) {
         console.warn('open url failed:', err);
     }
@@ -261,31 +376,62 @@ previewScroll && previewScroll.addEventListener('scroll', () => {
 
 function renderPreview() {
     const text = editor.value;
-    // [TOC] / [TOCM] 是目录占位符，预处理为一个唯一标记，在 marked.parse 后替换为实际目录
-    const hasTOC = /\[\s*TOC(M)?\s*\]/i.test(text);
-    let workText = text.replace(/\[\s*TOC(M)?\s*\]/gi, '\n\nVMDPLACEHOLDERTOCEND\n\n');
+    // [TOC] / [TOCM] 是目录占位符。代码块/行内代码里的不算（应该原样显示）。
+    const { text: workText, types: tocTypes, count: tocCount } = replaceTocPlaceholders(text);
     let html = marked.parse(workText);
     preview.innerHTML = html;
     renderMermaidBlocks();    // 必须在 highlightCodeBlocks 前——后者会冲掉 language-* class
     highlightCodeBlocks();
     highlightUnmatchedDelimiters(text);   // 从源文本扫描错误写法，映射到 DOM 文本节点标黄
-    if (hasTOC) renderInlineToc();
+    wrapTables();
+    if (tocCount > 0) renderInlineToc(tocTypes);
     renderMath();
     renderToc();
     updateFilename();
 }
 
-// 把预览里的 [TOC] 占位符换为实际的目录 HTML
-function renderInlineToc() {
-    // 找所有占位符段落，根据标记区分 [TOC] 层级式 vs [TOCM] 列表式
-    const ps = Array.from(preview.querySelectorAll('p'));
-    // 先扫一遍源文本，记录每个 [TOC]/[TOCM] 的位置及类型
-    const placeholderTypes = [];   // ['toc'|'tocm', ...] 与源文本顺序对应
+// 找出文本中所有“代码区域”的字符范围：[围栏代码块] + [行内代码]
+function findCodeRanges(text) {
+    const ranges = [];
+    // 围栏代码块：``` ... ``` 或 ~~~ ... ~~~
+    const fenceRe = /(^|\n)[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:\n[ \t]*\2[^\n]*|$)/g;
+    let m;
+    while ((m = fenceRe.exec(text))) {
+        ranges.push([m.index, m.index + m[0].length]);
+    }
+    // 行内代码：`...`（跳过落在围栏块里的）
+    const inlineRe = /(`+)([^\n]*?)\1/g;
+    while ((m = inlineRe.exec(text))) {
+        const inFence = ranges.some(r => m.index >= r[0] && m.index < r[1]);
+        if (!inFence) ranges.push([m.index, m.index + m[0].length]);
+    }
+    return ranges;
+}
+
+// 把代码区域之外的 [TOC] / [TOCM] 替换为占位符
+function replaceTocPlaceholders(text) {
+    const codeRanges = findCodeRanges(text);
+    const types = [];
+    let out = '';
+    let last = 0;
     const re = /\[\s*TOC(M)?\s*\]/gi;
     let mm;
-    while ((mm = re.exec(editor.value))) {
-        placeholderTypes.push(mm[1] ? 'tocm' : 'toc');
+    while ((mm = re.exec(text))) {
+        const inCode = codeRanges.some(r => mm.index >= r[0] && mm.index < r[1]);
+        if (inCode) continue;   // 代码里的保持原样
+        out += text.slice(last, mm.index);
+        out += '\n\nVMDPLACEHOLDERTOCEND\n\n';
+        types.push(mm[1] ? 'tocm' : 'toc');
+        last = mm.index + mm[0].length;
     }
+    out += text.slice(last);
+    return { text: out, types, count: types.length };
+}
+
+// 把预览里的 [TOC] 占位符换为实际的目录 HTML
+function renderInlineToc(placeholderTypes) {
+    // 找所有占位符段落，根据标记区分 [TOC] 层级式 vs [TOCM] 列表式
+    const ps = Array.from(preview.querySelectorAll('p'));
     let typeIdx = 0;
     for (const p of ps) {
         if (p.children.length === 0 && p.textContent.trim() === 'VMDPLACEHOLDERTOCEND') {
@@ -483,15 +629,83 @@ function convertOldFlowchart(src) {
 
 let mermaidReady = false;
 let mermaidCounter = 0;
-function ensureMermaid() {
-    if (mermaidReady) return Promise.resolve();
+// 从 App 的 CSS 变量取色，生成 Mermaid 的 themeVariables
+// 这样图表的线条/文字/节点颜色和当前主题完全一致（深色主题下也能看清）
+function mermaidThemeVars() {
+    const cs = getComputedStyle(document.documentElement);
+    const v = (name, fallback) => {
+        const val = cs.getPropertyValue(name).trim();
+        return val || fallback;
+    };
+    const bg        = v('--bg', '#ffffff');
+    const panel     = v('--bg-panel', '#eeeeee');
+    const elevated  = v('--bg-elevated', '#eeeeee');
+    const border    = v('--border', '#cccccc');
+    const text      = v('--text', '#000000');
+    const textStrong= v('--text-strong', '#000000');
+    const textDim   = v('--text-dim', '#888888');
+    const accent    = v('--accent', '#58a6ff');
+    return {
+        // 基础
+        background:      bg,
+        primaryColor:    elevated,
+        primaryTextColor:textStrong,
+        primaryBorderColor: border,
+        secondaryColor:  panel,
+        secondaryTextColor: text,
+        secondaryBorderColor: border,
+        tertiaryColor:   panel,
+        tertiaryTextColor: text,
+        tertiaryBorderColor: border,
+        lineColor:       textDim,
+        textColor:       text,
+        titleColor:      textStrong,
+        edgeLabelBackground: bg,
+        // 流程图
+        mainBkg:         elevated,
+        nodeBorder:      border,
+        nodeTextColor:   textStrong,
+        clusterBkg:      panel,
+        clusterBorder:   border,
+        defaultRenderer: 'dagre-wrapper',
+        // 序列图
+        actorBkg:        elevated,
+        actorBorder:     border,
+        actorTextColor:  textStrong,
+        actorLineColor:  textDim,
+        signalColor:     text,
+        signalTextColor: textStrong,
+        labelBoxBkgColor: elevated,
+        labelBoxBorderColor: border,
+        labelTextColor:  text,
+        loopTextColor:   text,
+        activationBkgColor: elevated,
+        activationBorderColor: border,
+        noteBkgColor:    elevated,
+        noteTextColor:   text,
+        noteBorderColor: border,
+        // 饼图 / 其它
+        pie1: accent, pie2: v('--link', '#58a6ff'),
+        pie3: '#d29922', pie4: '#3fb950', pie5: '#a371f7',
+        pie6: '#db6d28', pie7: '#db61a2', pie8: '#39c5cf',
+        pie9: '#8b949e', pie10: '#7ee787', pie11: '#ffa657', pie12: '#79c0ff',
+        // 字体
+        fontFamily:      'inherit',
+        fontSize:        '14px',
+    };
+}
+let currentMermaidTheme = null;
+function ensureMermaid(theme) {
     if (!window.mermaid) return Promise.reject('mermaid not loaded');
-    if (mermaidReady) return Promise.resolve();
+    const want = theme || currentAppTheme;
+    if (mermaidReady && currentMermaidTheme === want) return Promise.resolve();
     mermaidReady = true;
+    currentMermaidTheme = want;
     try {
         window.mermaid.initialize({
             startOnLoad: false,
-            theme: 'default',
+            theme: 'base',                 // base 主题不覆盖 themeVariables
+            themeVariables: mermaidThemeVars(),
             securityLevel: 'loose',
             fontFamily: 'inherit',
         });
@@ -499,6 +713,27 @@ function ensureMermaid() {
         console.warn('mermaid init error:', e);
     }
     return Promise.resolve();
+}
+
+// 主题切换后：重新渲染所有 Mermaid 图
+function rerenderMermaid() {
+    if (!window.mermaid) return;
+    const blocks = Array.from(preview.querySelectorAll('.mermaid-block'));
+    if (blocks.length === 0) return;
+    const want = currentAppTheme;
+    if (currentMermaidTheme === want) return;
+    ensureMermaid(want).then(() => {
+        blocks.forEach(container => {
+            const source = container.dataset.mermaidSource;
+            if (!source) return;
+            const id = 'mermaid-' + (++mermaidCounter);
+            window.mermaid.render(id + '-svg', source)
+                .then(({ svg }) => { container.innerHTML = svg; })
+                .catch(e => {
+                    container.innerHTML = '<pre style="color:#cc0000;background:#fff5f5;padding:10px;">Mermaid 渲染失败：' + e.message + '</pre>';
+                });
+        });
+    });
 }
 function renderMermaidBlocks() {
     if (!window.mermaid) return;
@@ -528,6 +763,7 @@ function renderMermaidBlocks() {
         container.className = 'mermaid-block';
         container.id = id;
         container.textContent = source;
+        container.dataset.mermaidSource = source;   // 主题切换时按新主题重渲染
         pre.parentNode.replaceChild(container, pre);
         ensureMermaid().then(() => {
             return window.mermaid.render(id + '-svg', source);
@@ -554,7 +790,7 @@ function highlightUnmatchedDelimiters(sourceText) {
     });
     if (!sourceText) return;
 
-    // 在源文本里找 **..** / *..*，只看那些在源里“不紧贴”的（inner 末尾是空格或 delim 前是空格）
+    // 在源文本里找 **..** / *..*，只看那些“不紧贴”的
     const pattern = /(?<!\\)(\*\*?)([^\*\n]+?)\1(?!\\)/g;
     const errRanges = [];   // [{ start, end }]
     let m;
@@ -562,16 +798,16 @@ function highlightUnmatchedDelimiters(sourceText) {
         const delim = m[1];
         const inner = m[2];
         if (!inner) continue;
-        // 紧贴成对的 **bold**/**italic** 不报
         const startPos = m.index;
-        const beforeChar = startPos > 0 ? sourceText[startPos - 1] : '';
-        const innerEndSpace = /\s/.test(inner.slice(-1));
-        const beforeIsSpace = beforeChar === ' ' || beforeChar === '\t';
-        // 在源里有以下任一才是错误写法：
-        // - inner 末尾是空格（如 **WebView **）
-        // - delim 前面是空格（如 ** bold**）
-        if (innerEndSpace || beforeIsSpace) {
-            errRanges.push({ start: startPos, end: startPos + m[0].length });
+        // CommonMark 规则：delimiter 必须紧贴内容，即 inner 的首尾都不能有空白
+        // - **text **  → inner 末尾有空格 → 不成粗体（错误写法）
+        // - ** text**  → inner 开头有空格 → 不成粗体（错误写法）
+        // - **text**   → 紧贴 → 正常
+        // 注意：delim 前面有空格是允许的（如 "- **左侧**：..."），不是错误
+        const innerStartSpace = /^\s/.test(inner);
+        const innerEndSpace = /\s$/.test(inner);
+        if (innerStartSpace || innerEndSpace) {
+            errRanges.push({ start: startPos, end: startPos + m[0].length, delimLen: delim.length });
         }
     }
 
@@ -604,19 +840,20 @@ function highlightUnmatchedDelimiters(sourceText) {
     // 对每个 errRange，在 preview 的文本节点里找对应的全文
     for (const range of errRanges) {
         const snippet = sourceText.slice(range.start, range.end);   // e.g. "**WebView **"
-        // preview 里对应的文本：去掉 ** 后就是 inner
-        const inner = snippet.slice(2, -2);
-        // 找包含 snippet 字面的文本节点（去掉 ** 后匹配 inner）
+        const d = range.delimLen || 2;
+        const inner = snippet.slice(d, snippet.length - d);        // 去掉 delimiter
+        if (!inner) continue;
         for (const tn of textNodes) {
             const text = tn.textContent;
             // 跳过已被标过的
             if (tn.parentNode && tn.parentNode.classList && tn.parentNode.classList.contains('md-unmatched')) continue;
+            // 优先匹配完整 snippet（marked 原样输出未渲染的 **..**）
             const idx = text.indexOf(snippet);
             if (idx >= 0) {
                 wrapWithUnmatched(tn, idx, snippet);
                 break;
             }
-            // 也试 inner（marked 有时变换）
+            // 退而求其次：匹配 inner（去掉 delimiter 后的文字）
             const idx2 = text.indexOf(inner);
             if (idx2 >= 0) {
                 wrapWithUnmatched(tn, idx2, inner);
@@ -684,6 +921,8 @@ function slugify(s) {
 function updateFilename() {
     const name = currentFile ? currentFile.replace(/^.*[\\\/]/, '') : '(未保存)';
     filenameEl.textContent = dirty ? name + ' ●' : name;
+    // 窗口标题也带上文件名，方便多文档时区分
+    document.title = (currentFile ? name + (dirty ? ' ●' : '') : '未命名') + ' - VMD';
 }
 
 function escapeHtml(s) {
@@ -736,11 +975,12 @@ document.addEventListener('click', () => {
 
 function updateThemeButton() {
     const t = THEMES[currentTheme];
-    // auto 时显示实际生效的主题名
-    const label = currentTheme === 'auto'
-        ? THEMES[activeTheme].icon + ' ' + THEMES[activeTheme].name
-        : t.icon + ' ' + t.name;
+    // auto 显示"跟随系统"，tooltip 里提示当前实际生效的是哪个
+    const label = t.icon + ' ' + t.name;
     themeLabel.textContent = label;
+    themeToggle.title = currentTheme === 'auto'
+        ? '跟随系统（当前：' + THEMES[activeTheme].name + '）'
+        : t.name;
     // 高亮当前选中项
     themeMenu.querySelectorAll('.dropdown-item').forEach(item => {
         item.classList.toggle('active', item.dataset.theme === currentTheme);
@@ -758,6 +998,7 @@ document.getElementById('btn-new').addEventListener('click', () => {
 document.getElementById('btn-open').addEventListener('click', openFile);
 document.getElementById('btn-save').addEventListener('click', saveFile);
 document.getElementById('btn-save-as').addEventListener('click', saveAsFile);
+document.getElementById('btn-export-pdf').addEventListener('click', exportPdf);
 
 async function openFile() {
     try {
@@ -812,12 +1053,64 @@ async function saveAsFile() {
     }
 }
 
+// ============ 导出 PDF ============
+async function exportPdf() {
+    try {
+        const baseName = currentFile
+            ? currentFile.replace(/^.*[\\\/]/, '').replace(/\.[^.]+$/, '')
+            : 'untitled';
+        const path = await save({
+            filters: [{ name: 'PDF', extensions: ['pdf'] }],
+            defaultPath: baseName + '.pdf',
+        });
+        if (!path) return;
+
+        statusEl.textContent = '正在导出 PDF…';
+        // 临时切到打印模式：只保留预览内容（隐藏工具栏/目录/编辑区）+ 浅色配色
+        const prevHljs = document.querySelector('link[data-hljs]')?.href || null;
+        document.querySelectorAll('link[data-hljs]').forEach(l => l.remove());
+        const lightLink = document.createElement('link');
+        lightLink.rel = 'stylesheet';
+        lightLink.href = 'vendor/highlight-light.css';
+        lightLink.dataset.hljs = '1';
+        document.head.appendChild(lightLink);
+        document.body.classList.add('print-mode');
+        document.documentElement.classList.add('print-mode');   // html 也要放开 height/overflow
+        // 等浏览器完成布局刷新，确保打印的是新样式
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+        try {
+            await invoke('export_pdf', { path });
+            statusEl.textContent = 'PDF 已导出';
+        } catch (e) {
+            console.error(e);
+            alert('导出 PDF 失败：' + (e && e.message ? e.message : e));
+            statusEl.textContent = '';
+        } finally {
+            document.body.classList.remove('print-mode');
+            document.documentElement.classList.remove('print-mode');
+            // 恢复原来的代码高亮主题
+            document.querySelectorAll('link[data-hljs]').forEach(l => l.remove());
+            if (prevHljs) {
+                const back = document.createElement('link');
+                back.rel = 'stylesheet';
+                back.href = prevHljs;
+                back.dataset.hljs = '1';
+                document.head.appendChild(back);
+            }
+        }
+        setTimeout(() => statusEl.textContent = '', 2500);
+    } catch (e) {
+        alert('导出 PDF 失败：' + e);
+    }
+}
+
 // ============ 快捷键 ============
 
 document.addEventListener('keydown', (e) => {
     const ctrl = e.ctrlKey || e.metaKey;
     if (ctrl && e.key === 'o') { e.preventDefault(); openFile(); }
     else if (ctrl && e.shiftKey && e.key === 's') { e.preventDefault(); saveAsFile(); }
+    else if (ctrl && e.shiftKey && e.key === 'e') { e.preventDefault(); exportPdf(); }
     else if (ctrl && !e.shiftKey && e.key === 's') { e.preventDefault(); saveFile(); }
     else if (ctrl && e.key === 'n') { e.preventDefault(); document.getElementById('btn-new').click(); }
 });
@@ -945,11 +1238,15 @@ window.addEventListener('resize', () => {
 
 // ============ 启动 ============
 
-applyTheme('auto');
+// 立即同步更新主题按钮（不等 async，避免显示旧值）
 updateThemeButton();
-setEditMode(false);  // 初始进入阅读模式
-renderPreview();
-applyWidths(true);
+(async function start() {
+    // 初始跟随系统主题（async：要等 system_theme 命令返回）
+    await applyTheme('auto');
+    setEditMode(false);  // 初始进入阅读模式
+    renderPreview();
+    applyWidths(true);
+})();
 
 // =================== 自定义右键菜单 ===================
 (function () {
@@ -1139,8 +1436,7 @@ applyWidths(true);
             else if (act === 'open-link' && menuLink) {
                 const url = menuLink.href;
                 if (url.startsWith('http')) {
-                    try { window.__TAURI_INTERNALS__.invoke('plugin:shell|open', { path: url }); }
-                    catch {}
+                    try { invoke('open_url', { url }); } catch (e) { console.warn(e); }
                 }
             }
         }
