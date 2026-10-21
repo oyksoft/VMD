@@ -2003,6 +2003,13 @@ updateThemeButton();
     renderPreview();
     applyWidths(true);
     refreshEditorLineHeight();
+
+    // 用文件关联双击打开时，命令行里会带文件路径 → 直接打开它
+    invoke('startup_files')
+        .then(files => {
+            if (files && files.length) openPath(files[0]);
+        })
+        .catch(() => { /* 不在 Tauri 里跑时忽略 */ });
 })();
 
 // 外部修改检测：每 3 秒查一次（窗口没焦点时不查，切回来立刻查）

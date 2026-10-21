@@ -243,6 +243,28 @@ fn file_association_status() -> serde_json::Value {
     }
 }
 
+/// 启动时命令行里带的文件路径
+///
+/// 用文件关联双击 `.md` 打开时，Windows 会把路径作为参数传给 exe（`"exe" "%1"`），
+/// 这个命令把它交给前端去打开。
+#[tauri::command]
+fn startup_files() -> Vec<String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .filter_map(|a| {
+            let p = PathBuf::from(&a);
+            let p = if p.is_absolute() { p } else { cwd.join(p) };
+            if p.is_file() {
+                Some(p.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// 设置窗口标题（打开文件后显示"文件名 - VMD"）
 #[tauri::command]
 fn set_window_title(window: tauri::WebviewWindow, title: String) {
@@ -593,6 +615,7 @@ fn main() {
             set_context_menu_enabled,
             settings_path,
             save_settings,
+            startup_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
