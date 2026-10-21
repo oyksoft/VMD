@@ -11,77 +11,11 @@ const { open, save } = T.dialog || { open: async () => null, save: async () => n
 
 // ============ 主题 ============
 
-const THEMES = {
-    auto: {
-        name: '跟随系统',
-        icon: '🖥️',
-        css: null,   // 自动时用实际的 light/dark
-        vars: null,
-    },
-    dark: {
-        name: '暗色',
-        icon: '🌙',
-        css: 'vendor/highlight-dark.css',
-        vars: {
-            '--bg': '#0d1117',
-            '--bg-panel': '#161b22',
-            '--bg-elevated': '#21262d',
-            '--bg-code': '#161b22',
-            '--border': '#30363d',
-            '--border-soft': 'rgba(255,255,255,0.09)',
-            '--text': '#c9d1d9',
-            '--text-strong': '#f0f6fc',
-            '--text-dim': '#8b949e',
-            '--link': '#58a6ff',
-            '--accent': '#58a6ff',
-            '--quote-bar': '#3b434b',
-            '--quote-text': '#8b949e',
-        },
-    },
-    gray: {
-        name: '灰色',
-        icon: '🌫️',
-        css: 'vendor/highlight-gray.css',
-        vars: {
-            '--bg': '#22252a',
-            '--bg-panel': '#2b2f36',
-            '--bg-elevated': '#383d45',
-            '--bg-code': '#2b2f36',
-            '--border': '#454b54',
-            '--border-soft': 'rgba(255,255,255,0.10)',
-            '--text': '#d2d6db',
-            '--text-strong': '#f2f4f7',
-            '--text-dim': '#9aa3ae',
-            '--link': '#7fb3f5',
-            '--accent': '#7fb3f5',
-            '--quote-bar': '#5a616b',
-            '--quote-text': '#aab2bd',
-        },
-    },
-    light: {
-        name: '浅色',
-        icon: '☀️',
-        css: 'vendor/highlight-light.css',
-        vars: {
-            '--bg': '#ffffff',
-            '--bg-panel': '#f6f8fa',
-            '--bg-elevated': '#eaeef2',
-            '--bg-code': '#f6f8fa',
-            '--border': '#d0d7de',
-            '--border-soft': 'rgba(27,31,36,0.12)',
-            '--text': '#24292f',
-            '--text-strong': '#0d1117',
-            '--text-dim': '#57606a',
-            '--link': '#0969da',
-            '--accent': '#0969da',
-            '--quote-bar': '#d0d7de',
-            '--quote-text': '#57606a',
-        },
-    },
-};
+// 调色板在 src/theme.js 里（要在首帧前应用，所以放在 <head> 里加载）
+const THEMES = window.VMD_THEMES;
 
 // 主题循环顺序
-const THEME_ORDER = ['auto', 'dark', 'gray', 'light'];
+const THEME_ORDER = ['auto', 'dark', 'gray', 'light', 'sepia', 'bamboo', 'mist', 'dusk'];
 
 let currentTheme = 'auto';   // 用户选的（可能是 auto）
 let activeTheme = 'dark';    // 实际生效的（auto 时是系统决定的）
@@ -96,9 +30,13 @@ function systemPrefersDark() {
 function applyConcreteTheme(key) {
     const t = THEMES[key];
     const root = document.documentElement;
+    // 标记当前主题，CSS 里可以用 :root[data-theme="..."] 做主题专属样式
+    root.dataset.theme = key;
     for (const [k, v] of Object.entries(t.vars)) {
         root.style.setProperty(k, v);
     }
+    // 画布/滚动条跟着主题走（浅色主题下浏览器默认画布是黑的）
+    root.style.colorScheme = (key === 'light') ? 'light' : 'dark';
     // 切换 highlight.js 配色
     document.querySelectorAll('link[data-hljs]').forEach(l => l.remove());
     const link = document.createElement('link');
@@ -135,18 +73,76 @@ async function applyTheme(key) {
     try {
         await invoke('set_webview_color_scheme', { scheme: webviewScheme });
     } catch (e) { /* 忽略：不影响配色变量 */ }
+    // 同步窗口 + WebView2 背景色，避免切换主题的瞬间露出旧底色
+    try {
+        await invoke('set_window_background', { theme: activeTheme });
+    } catch (e) { /* 忽略 */ }
     applyConcreteTheme(activeTheme);
     renderPreview();
     updateThemeButton();
 }
 
 // 跟随系统时，系统主题变化要实时响应
-// 监听 Tauri 的 tauri://theme-changed（窗口主题保持 Auto，tao 仍会感知系统变化）
+// 监听 Tauri 的 tauri://theme-changed（窗口主题保持 Auto，tao 仍能感知系统变化）
 if (window.__TAURI__ && window.__TAURI__.event) {
     window.__TAURI__.event.listen('tauri://theme-changed', () => {
         if (currentTheme === 'auto') applyTheme('auto');
     });
 }
+
+// ============ 拖放打开文件 ============
+
+// 能打开的文件类型（和"打开"对话框的 filters 保持一致）
+const OPENABLE_EXT = ['md', 'markdown', 'txt'];
+
+function extOf(path) {
+    const m = String(path).match(/\.([a-z0-9]+)$/i);
+    return m ? m[1].toLowerCase() : '';
+}
+
+/** 拖进来的文件：只打开符合类型的第一个 */
+async function openDroppedFiles(paths) {
+    const list = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+    const ok = list.filter(p => OPENABLE_EXT.includes(extOf(p)));
+    if (!ok.length) {
+        const names = list.map(p => p.replace(/^.*[\\\/]/, '')).join('、');
+        alert('只能打开 .md / .markdown / .txt 文件' + (names ? '：\n' + names : ''));
+        return;
+    }
+    if (ok.length > 1) {
+        alert('一次只能打开一个文件，已打开第一个：\n' + ok[0].replace(/^.*[\\\/]/, ''));
+    }
+    try {
+        await openPath(ok[0]);
+    } catch (e) {
+        alert('打开失败：' + (e && e.message ? e.message : e));
+    }
+}
+
+// Tauri 在 Win32 层面接管了拖放（所以网页里的 HTML5 drop 不会触发），
+// 路径由 Rust 端的 drop target 通过 vmd-drop-files 事件送来
+if (window.__TAURI__ && window.__TAURI__.event) {
+    // 拖进来的是能打开的类型时才给提示
+    window.__TAURI__.event.listen('vmd-drag-enter', (e) => {
+        const paths = (e && e.payload && e.payload.paths) || [];
+        if (paths.some(p => OPENABLE_EXT.includes(extOf(p)))) {
+            document.body.classList.add('drag-over');
+        }
+    });
+    window.__TAURI__.event.listen('vmd-drag-leave', () => {
+        document.body.classList.remove('drag-over');
+    });
+    window.__TAURI__.event.listen('vmd-drop-files', (e) => {
+        document.body.classList.remove('drag-over');
+        const paths = (e && e.payload) || [];
+        openDroppedFiles(paths);
+    });
+}
+
+// 兜底：万一 WebView2 自己也派发了 HTML5 的 drag/drop 事件，
+// 阻止浏览器默认行为（否则拖进来的文件会被当成网页打开，把当前文档顶掉）
+document.addEventListener('dragover', (e) => { e.preventDefault(); });
+document.addEventListener('drop', (e) => { e.preventDefault(); });
 
 // ============ 配置 ============
 
@@ -335,6 +331,18 @@ fn main() {
 |------|------|
 | Rust | 🦀 系统编程 |
 | VMD  | markdown viewer |
+
+## 流程图
+
+\`\`\`mermaid
+flowchart TD
+    A[写 Markdown] --> B{文件类型?}
+    B -->|md| C[渲染预览]
+    B -->|txt| C
+    C --> D{满意?}
+    D -->|改| A
+    D -->|导出| E[导出 PDF]
+\`\`\`
 `;
 
 editor.value = WELCOME;
@@ -352,26 +360,48 @@ editor.addEventListener('input', () => {
 // 编辑区滚动 → 同步到预览区
 const previewScroll = document.getElementById('preview-wrap');
 let syncing = false;
-editor.addEventListener('scroll', () => {
-    if (syncing || !previewScroll) return;
+let syncUnlockTimer = null;
+
+/** 锁住自动同步一小会儿（防止两个方向互相触发形成回弹） */
+function lockSync() {
     syncing = true;
-    const maxEdit = editor.scrollHeight - editor.clientHeight;
-    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
-    if (maxEdit > 0 && maxPrev > 0) {
-        previewScroll.scrollTop = (editor.scrollTop / maxEdit) * maxPrev;
-    }
+    // rAF 下一帧就解锁（正常情况）
     requestAnimationFrame(() => { syncing = false; });
-});
-// 反向同步：预览区滚动 → 编辑区
-previewScroll && previewScroll.addEventListener('scroll', () => {
-    if (syncing || !editor) return;
-    syncing = true;
+    // 兜底：窗口隐藏时 rAF 不会执行，锁会永久卡住 → 滚动同步就废了
+    if (syncUnlockTimer) clearTimeout(syncUnlockTimer);
+    syncUnlockTimer = setTimeout(() => { syncing = false; syncUnlockTimer = null; }, 200);
+}
+
+/** 预览区位置 → 编辑区位置（按可滚动高度比例换算） */
+function syncEditorToPreview() {
+    if (!editor || !previewScroll) return;
     const maxEdit = editor.scrollHeight - editor.clientHeight;
     const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
     if (maxEdit > 0 && maxPrev > 0) {
         editor.scrollTop = (previewScroll.scrollTop / maxPrev) * maxEdit;
     }
-    requestAnimationFrame(() => { syncing = false; });
+}
+
+/** 编辑区位置 → 预览区位置 */
+function syncPreviewToEditor() {
+    if (!editor || !previewScroll) return;
+    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+    if (maxEdit > 0 && maxPrev > 0) {
+        previewScroll.scrollTop = (editor.scrollTop / maxEdit) * maxPrev;
+    }
+}
+
+editor.addEventListener('scroll', () => {
+    if (syncing || !previewScroll) return;
+    lockSync();
+    syncPreviewToEditor();
+});
+// 反向同步：预览区滚动 → 编辑区
+previewScroll && previewScroll.addEventListener('scroll', () => {
+    if (syncing || !editor) return;
+    lockSync();
+    syncEditorToPreview();
 });
 
 function renderPreview() {
@@ -386,6 +416,7 @@ function renderPreview() {
     wrapTables();
     if (tocCount > 0) renderInlineToc(tocTypes);
     renderMath();
+    mapHeadingLines(text);   // 把预览区的标题和源码行号对应起来（目录跳转要精确落行）
     renderToc();
     updateFilename();
 }
@@ -882,6 +913,100 @@ function wrapWithUnmatched(textNode, start, middle) {
     textNode.parentNode.replaceChild(frag, textNode);
 }
 
+/**
+ * 扫描源码里的标题，返回 [{ level, text, line }]
+ * 用来把"预览区的标题"和"编辑器里的行号"对应起来 —— 目录跳转时能精确落到那一行。
+ * 尽量按 CommonMark 的规则来（跳过代码块、认出 ATX / setext、剥掉引用和列表前缀）。
+ */
+function scanHeadings(text) {
+    const lines = text.split('\n');
+    const out = [];
+    let inFence = false;
+    let fenceChar = '';
+    for (let i = 0; i < lines.length; i++) {
+        const raw = lines[i];
+        const trimmed = raw.trim();
+        // 围栏代码块（``` 或 ~~~）
+        const fence = trimmed.match(/^(`{3,}|~{3,})/);
+        if (fence) {
+            if (!inFence) {
+                inFence = true;
+                fenceChar = fence[1][0];
+            } else if (fence[1][0] === fenceChar) {
+                inFence = false;
+            }
+            continue;
+        }
+        if (inFence) continue;
+        if (/^ {4,}/.test(raw)) continue;        // 缩进 4 空格 = 代码块
+        // 剥掉引用块 / 列表项前缀（标题在引用或列表里也算标题）
+        let content = trimmed.replace(/^>\s*/, '').replace(/^([-*+]|\d+[.)])\s+/, '');
+        if (!content) continue;
+        // ATX：# ~ ######
+        const atx = content.match(/^(#{1,6})\s+(.*?)\s*#*$/);
+        if (atx) {
+            out.push({ level: atx[1].length, text: atx[2], line: i });
+            continue;
+        }
+        // setext：标题行 + 下一行是 === 或 ---
+        const next = (lines[i + 1] || '').trim();
+        if (content && /^(=+|-+)\s*$/.test(next) && !/^[-*+]\s/.test(content)) {
+            out.push({ level: next[0] === '=' ? 1 : 2, text: content, line: i });
+        }
+    }
+    return out;
+}
+
+/** 标题文本归一化：去掉 markdown 标记，方便和渲染后的标题文字比对 */
+function normalizeHeadingText(s) {
+    return String(s)
+        .replace(/`([^`]*)`/g, '$1')
+        .replace(/\*\*([^*]*)\*\*/g, '$1')
+        .replace(/\*([^*]*)\*/g, '$1')
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/** 渲染后：把预览区的每个标题和源码行号对应起来 */
+let headingLines = new Map();   // heading 元素 → 源码行号
+
+function mapHeadingLines(sourceText) {
+    headingLines = new Map();
+    const src = scanHeadings(sourceText);
+    const doms = Array.from(preview.querySelectorAll('h1, h2, h3, h4, h5, h6'));
+    let si = 0;
+    for (const h of doms) {
+        const level = parseInt(h.tagName.charAt(1));
+        const text = normalizeHeadingText(h.textContent);
+        // 按顺序往后找：层级和文字都要对得上
+        for (let k = si; k < src.length; k++) {
+            if (src[k].level === level && normalizeHeadingText(src[k].text) === text) {
+                headingLines.set(h, src[k].line);
+                si = k + 1;
+                break;
+            }
+        }
+    }
+}
+
+/** 编辑区一行的像素高度（不折行时，行高固定，scrollTop = 行号 × 行高） */
+let editorLineHeight = 0;
+function refreshEditorLineHeight() {
+    const lh = parseFloat(getComputedStyle(editor).lineHeight);
+    editorLineHeight = isNaN(lh) ? 16 : lh;
+}
+
+/** 把编辑区精确滚动到第 line 行（0 起） */
+function scrollEditorToLine(line) {
+    if (!editorLineHeight) refreshEditorLineHeight();
+    const cs = getComputedStyle(editor);
+    const padTop = parseFloat(cs.paddingTop) || 0;   // 滚动的原点是 padding 顶边，要补上
+    editor.scrollTop = line * editorLineHeight + padTop;
+}
+
 function renderToc() {
     tocList.innerHTML = '';
     const headings = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
@@ -899,15 +1024,33 @@ function renderToc() {
         div.className = `toc-item lvl${level}`;
         div.textContent = h.textContent;
         div.dataset.id = h.id;
+        const srcLine = headingLines.get(h);
+        if (srcLine !== undefined) div.dataset.line = String(srcLine);
         div.addEventListener('click', () => {
             const previewWrap = document.getElementById('preview-wrap');
             if (!previewWrap) return;
-            // 点击 TOC 期间禁止同步，防止 smooth scroll 的中间帧跳回原位置
+            // 锁住自动同步，防止 smooth scroll 的中间帧把编辑区拽回原位
             syncing = true;
             const top = h.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top + previewWrap.scrollTop - 12;
             previewWrap.scrollTo({ top, behavior: 'smooth' });
-            // smooth scroll 完成后释放同步锁（设长一点保险）
-            setTimeout(() => { syncing = false; }, 800);
+            // 编辑区精确落到对应的那一行（不折行时 scrollTop = 行号 × 行高）
+            const line = parseInt(div.dataset.line, 10);
+            if (!isNaN(line)) {
+                scrollEditorToLine(line);
+            }
+            // 跳转结束后解锁。
+            // 注意：这里**不能**再按比例同步一次 —— 那样会把精确位置冲掉。
+            let finished = false;
+            const done = () => {
+                if (finished) return;
+                finished = true;
+                previewWrap.removeEventListener('scrollend', done);
+                clearTimeout(fallback);
+                syncing = false;
+            };
+            previewWrap.addEventListener('scrollend', done);
+            // 兜底：位置没变（不会触发 scrollend）或动画被打断
+            const fallback = setTimeout(done, 1200);
         });
         tocList.appendChild(div);
         lastId = h.id;
@@ -918,11 +1061,20 @@ function slugify(s) {
     return s.toLowerCase().replace(/[^a-z0-9一-龥]+/g, '-').replace(/^-|-$/g, '');
 }
 
+// 上一次设置过的窗口标题（变了才通知后端，避免每次输入都发 IPC）
+let lastWindowTitle = '';
+
 function updateFilename() {
     const name = currentFile ? currentFile.replace(/^.*[\\\/]/, '') : '(未保存)';
     filenameEl.textContent = dirty ? name + ' ●' : name;
     // 窗口标题也带上文件名，方便多文档时区分
-    document.title = (currentFile ? name + (dirty ? ' ●' : '') : '未命名') + ' - VMD';
+    const title = (currentFile ? name + (dirty ? ' ●' : '') : '未命名') + ' - VMD';
+    document.title = title;
+    // 真正的窗口标题（标题栏那个）得让 Rust 改，网页的 document.title 管不到它
+    if (title !== lastWindowTitle) {
+        lastWindowTitle = title;
+        invoke('set_window_title', { title }).catch(() => { /* 不在 Tauri 里跑时忽略 */ });
+    }
 }
 
 function escapeHtml(s) {
@@ -944,7 +1096,10 @@ function setEditMode(on) {
 }
 
 segBtns.forEach(btn => {
-    btn.addEventListener('click', () => setEditMode(btn.dataset.mode === 'edit'));
+    btn.addEventListener('click', () => {
+        setEditMode(btn.dataset.mode === 'edit');
+        // 注意：这里只改"当前模式"，不覆盖设置里的"默认模式"
+    });
 });
 
 // ---- 主题下拉菜单 ----
@@ -965,6 +1120,7 @@ themeMenu.querySelectorAll('.dropdown-item').forEach(item => {
         applyTheme(item.dataset.theme);
         updateThemeButton();
         themeDropdown.classList.remove('open');
+        // 注意：这里只改"当前主题"，不覆盖设置里的"默认主题"（那是下次启动用的）
     });
 });
 
@@ -992,6 +1148,10 @@ document.getElementById('btn-new').addEventListener('click', () => {
     editor.value = '';
     currentFile = null;
     dirty = false;
+    fileStamp = null;
+    setExternalChange(false);
+    // 新建是要写字的 → 自动重载（只读）没意义，顺手关掉
+    if (autoReload) setAutoReload(false);
     renderPreview();
     updateFilename();
 });
@@ -999,6 +1159,51 @@ document.getElementById('btn-open').addEventListener('click', openFile);
 document.getElementById('btn-save').addEventListener('click', saveFile);
 document.getElementById('btn-save-as').addEventListener('click', saveAsFile);
 document.getElementById('btn-export-pdf').addEventListener('click', exportPdf);
+
+// 外部修改徽章：点一下重新问一下要不要加载
+document.getElementById('ext-badge').addEventListener('click', () => {
+    if (externalChange) promptExternalChange();
+});
+
+// 模态框的按钮
+document.getElementById('modal-ok').addEventListener('click', () => closeDialog(true));
+document.getElementById('modal-cancel').addEventListener('click', () => closeDialog(false));
+document.getElementById('modal-always').addEventListener('click', () => closeDialog('always'));
+document.getElementById('modal-mask').addEventListener('mousedown', (e) => {
+    if (e.target.id === 'modal-mask') closeDialog(false);   // 点遮罩 = 取消
+});
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modalResolve) closeDialog(false);
+});
+
+// 文字缩放快捷键（跟浏览器一样）：Ctrl + / - / 0
+document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    const k = e.key;
+    if (k === '=' || k === '+') { e.preventDefault(); setZoom((settings.zoom || 100) + ZOOM_STEP); }
+    else if (k === '-' || k === '_') { e.preventDefault(); setZoom((settings.zoom || 100) - ZOOM_STEP); }
+    else if (k === '0') { e.preventDefault(); setZoom(100); }
+});
+
+// 自动重载开关
+document.getElementById('btn-auto-reload').addEventListener('click', toggleAutoReload);
+
+// 设置面板
+
+/** 打开指定路径的文件（"打开"对话框和拖放共用） */
+async function openPath(path) {
+    const content = await invoke('read_file', { path });
+    editor.value = content;
+    currentFile = path;
+    dirty = false;
+    renderPreview();
+    updateFilename();
+    setExternalChange(false);       // 换了文件，之前的"外部已修改"标记作废
+    await recordStamp();
+    applyReadOnly();                // 自动重载开着 → 只读
+    statusEl.textContent = '已打开';
+    setTimeout(() => statusEl.textContent = '', 1500);
+}
 
 async function openFile() {
     try {
@@ -1009,14 +1214,7 @@ async function openFile() {
         });
         console.log('[VMD] open() returned:', path);
         if (!path) return;
-        const content = await invoke('read_file', { path });
-        editor.value = content;
-        currentFile = path;
-        dirty = false;
-        renderPreview();
-        updateFilename();
-        statusEl.textContent = '已打开';
-        setTimeout(() => statusEl.textContent = '', 1500);
+        await openPath(path);
     } catch (e) {
         alert('打开失败：' + e);
     }
@@ -1024,10 +1222,18 @@ async function openFile() {
 
 async function saveFile() {
     if (!currentFile) return saveAsFile();
+    if (editor.readOnly) {           // 自动重载（只读）模式下没有可保存的修改
+        statusEl.textContent = '自动重载模式下内容是只读的';
+        setTimeout(() => statusEl.textContent = '', 2000);
+        return;
+    }
     try {
         await invoke('write_file', { path: currentFile, content: editor.value });
         dirty = false;
         updateFilename();
+        // 存回去的内容就是当前内容了，外部修改的问题随之解决
+        setExternalChange(false);
+        await recordStamp();
         statusEl.textContent = '已保存';
         setTimeout(() => statusEl.textContent = '', 1500);
     } catch (e) {
@@ -1046,10 +1252,550 @@ async function saveAsFile() {
         currentFile = path;
         dirty = false;
         updateFilename();
+        // 另存到新文件：原文件仍然是"被外部改过"的状态，标记要留着
+        await recordStamp();
         statusEl.textContent = '已保存';
         setTimeout(() => statusEl.textContent = '', 1500);
     } catch (e) {
         alert('保存失败：' + e);
+    }
+}
+
+// ============ 外部修改检测 ============
+
+// 当前打开文件的快照（mtime + size），用来判断有没有被外部程序改过
+let fileStamp = null;
+// 外部已修改（决定要不要显示徽章、要不要再弹窗）
+let externalChange = false;
+// 弹窗正开着（避免重复弹）
+let changeDialogOpen = false;
+// 上次提示"文件已被删除"的时间
+let lastDeleteNotice = 0;
+// 连续几轮检测不到文件（>=2 才算真被删了）
+let deleteRounds = 0;
+// 窗口有没有焦点（用 Tauri 的窗口事件，比 document.hasFocus() 可靠）
+let winFocused = true;
+
+/** 记下当前文件的元信息（打开 / 保存后调用） */
+async function recordStamp() {
+    fileStamp = null;
+    if (!currentFile) return;
+    try {
+        fileStamp = await invoke('file_stamp', { path: currentFile });
+    } catch (e) {
+        // 文件没了也无所谓，等轮询时再提示
+    }
+}
+
+/** 切换"外部已修改"标记 */
+function setExternalChange(on) {
+    externalChange = !!on;
+    const badge = document.getElementById('ext-badge');
+    if (badge) badge.classList.toggle('show', externalChange);
+}
+
+/** 每 3 秒查一次文件有没有被外部改过（只在窗口有焦点时查） */
+async function checkExternalChange() {
+    if (!currentFile || !fileStamp || changeDialogOpen) return;
+    if (!winFocused) return;   // 窗口在后台就不查，切回来会立刻查一次
+    let now;
+    try {
+        now = await invoke('file_stamp', { path: currentFile });
+    } catch (e) {
+        return;
+    }
+    if (!now) {
+        // 文件被删了：连续两轮都不在才算真删了（有些编辑器保存是"先删后写"）
+        deleteRounds++;
+        if (deleteRounds >= 2) {
+            statusEl.textContent = '文件已被删除';
+            setTimeout(() => statusEl.textContent = '', 3000);
+        }
+        return;
+    }
+    deleteRounds = 0;
+    if (now.mtime === fileStamp.mtime && now.size === fileStamp.size) return;
+
+    // 有变化了
+    if (autoReload) {
+        // 自动重载开着：编辑器是只读的，直接同步（不会丢用户的东西）
+        await autoReloadFromDisk();
+        return;
+    }
+    // 还没弹过窗 → 问一次；已经问过了就只亮着徽章，不打扰
+    if (!externalChange) {
+        setExternalChange(true);
+        await promptExternalChange();
+    }
+}
+
+/** 问用户要不要重新加载 */
+async function promptExternalChange() {
+    if (changeDialogOpen) return;
+    changeDialogOpen = true;
+    const name = currentFile ? currentFile.replace(/^.*[\\\/]/, '') : '文件';
+    // 用 DOM 节点拼内容，文件名不走 innerHTML
+    const body = document.createElement('div');
+    const line = document.createElement('div');
+    line.textContent = name + ' 在 VMD 之外被改过了。';
+    body.appendChild(line);
+    if (dirty) {
+        const warn = document.createElement('div');
+        warn.className = 'modal-warn';
+        warn.textContent = '⚠ 当前编辑区里有未保存的修改，重新加载会被覆盖掉。';
+        body.appendChild(warn);
+    }
+    const choice = await showDialog({
+        title: '文件已被外部程序修改',
+        body: body,
+        okText: '重新加载',
+        cancelText: '保留当前内容',
+        alwaysText: '以后自动重载',
+    });
+    changeDialogOpen = false;
+    if (choice === true) {
+        await reloadFromDisk();
+    } else if (choice === 'always') {
+        // 以后自动重载：立刻同步一次，然后切到只读跟随
+        await reloadFromDisk();
+        setAutoReload(true);
+    }
+    // 选"保留当前内容"：什么都不动，徽章一直亮着，点徽章可以再问一次
+}
+
+/** 用磁盘上的内容覆盖编辑器 */
+async function reloadFromDisk() {
+    try {
+        const content = await invoke('read_file', { path: currentFile });
+        applyExternalContent(content, '已重新加载');
+    } catch (e) {
+        alert('重新加载失败：' + (e && e.message ? e.message : e));
+    }
+}
+
+/** 自动重载：防抖 + 确认文件稳定了再替换内容 */
+async function autoReloadFromDisk() {
+    const path = currentFile;
+    if (!path) return;
+    // 外部可能正在写，等一下再读
+    await new Promise(r => setTimeout(r, 500));
+    if (currentFile !== path) return;   // 期间换了文件，放弃
+    let before;
+    try {
+        before = await invoke('file_stamp', { path });
+    } catch (e) {
+        return;
+    }
+    if (!before) return;                // 文件没了，下一轮再说
+    let content;
+    try {
+        content = await invoke('read_file', { path });
+    } catch (e) {
+        return;
+    }
+    let after;
+    try {
+        after = await invoke('file_stamp', { path });
+    } catch (e) {
+        return;
+    }
+    // 读的过程中还在变 → 这轮放弃，等下一个周期
+    if (!after || after.mtime !== before.mtime || after.size !== before.size) return;
+    if (currentFile !== path) return;
+    applyExternalContent(content, '已自动重新加载');
+}
+
+/** 把外部的内容灌进编辑器（保持光标和滚动位置） */
+function applyExternalContent(content, tip) {
+    const selStart = editor.selectionStart;
+    const selEnd = editor.selectionEnd;
+    const edScroll = editor.scrollTop;
+    const pvScroll = previewScroll ? previewScroll.scrollTop : 0;
+    editor.value = content;
+    dirty = false;
+    try { editor.setSelectionRange(selStart, selEnd); } catch (e) { /* 忽略 */ }
+    editor.scrollTop = edScroll;
+    if (previewScroll) previewScroll.scrollTop = pvScroll;
+    renderPreview();
+    updateFilename();
+    setExternalChange(false);
+    recordStamp();
+    statusEl.textContent = tip;
+    setTimeout(() => statusEl.textContent = '', 1500);
+}
+
+// ============ 自动重载开关 ============
+
+// 自动重载总开关
+let autoReload = false;
+
+/** 开关切换。开启时如果编辑器里有未保存的修改，先问一句 */
+async function toggleAutoReload() {
+    if (autoReload) {
+        setAutoReload(false);
+        return;
+    }
+    if (dirty) {
+        // 有未保存的修改 → 开启会切成只读，这些修改就没了 → 确认一下
+        const ok = await showDialog({
+            title: '开启自动重载？',
+            body: '<div>当前编辑区里有未保存的修改。</div><div class="modal-warn">开启自动重载后编辑器会变成只读，这些修改会被丢弃。</div>',
+            okText: '仍然开启',
+            cancelText: '取消',
+        });
+        if (!ok) return;
+    }
+    setAutoReload(true);
+}
+
+/** 设置自动重载状态（并同步界面） */
+function setAutoReload(on) {
+    autoReload = !!on;
+    const btn = document.getElementById('btn-auto-reload');
+    if (btn) {
+        btn.classList.toggle('on', autoReload);
+        btn.title = autoReload
+            ? '自动重载已开启：文件被外部修改时自动更新内容（编辑器为只读，点此关闭）'
+            : '自动重载：文件被外部修改时自动更新内容（开启后编辑器为只读）';
+    }
+    applyReadOnly();
+    statusEl.textContent = autoReload ? '自动重载已开启（只读）' : '自动重载已关闭';
+    setTimeout(() => statusEl.textContent = '', 2000);
+}
+
+/** 自动重载开着时，编辑器变只读（防的是自动重载把用户正在写的内容冲掉） */
+function applyReadOnly() {
+    const readOnly = autoReload && !!currentFile;
+    editor.readOnly = readOnly;
+}
+
+// ============ 文字缩放 ============
+
+// 缩放范围：80% ~ 150%
+// 上限压到 150% 是因为字号放大而宽度不变时，每行能装的字会少一半，
+// 字再大就"观感翻倍"、一行只剩几个字，很难读。
+const ZOOM_MIN = 80, ZOOM_MAX = 150, ZOOM_STEP = 10;
+
+/** 应用缩放（只影响内容区：目录 / 编辑区 / 预览区） */
+function applyZoom(percent) {
+    const z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(percent)));
+    document.documentElement.style.setProperty('--ui-zoom', z / 100);
+    const btn = document.getElementById('btn-zoom');
+    if (btn) btn.textContent = '🔍 ' + z + '%';
+    const val = document.getElementById('zoom-value');
+    if (val) val.textContent = z + '%';
+    const range = document.getElementById('zoom-range');
+    if (range && Number(range.value) !== z) range.value = String(z);
+    return z;
+}
+
+/** 改缩放并记住（下次启动仍然生效） */
+function setZoom(percent) {
+    const z = applyZoom(percent);
+    settings.zoom = z;
+    saveSettings();
+}
+
+function initZoom() {
+    const range = document.getElementById('zoom-range');
+    const popup = document.getElementById('zoom-popup');
+    const btn = document.getElementById('btn-zoom');
+    if (!range || !popup || !btn) return;
+
+    applyZoom(settings.zoom || 100);
+
+    btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const show = !popup.classList.contains('show');
+        popup.classList.toggle('show', show);
+        if (show) {
+            // 面板开着的时候点别处就关掉
+            setTimeout(() => {
+                const close = (ev) => {
+                    if (popup.contains(ev.target) || btn.contains(ev.target)) return;
+                    popup.classList.remove('show');
+                    document.removeEventListener('mousedown', close);
+                };
+                document.addEventListener('mousedown', close);
+            }, 0);
+        }
+    });
+
+    range.addEventListener('input', () => setZoom(Number(range.value)));
+
+    popup.querySelectorAll('.zoom-btn[data-zoom]').forEach(b => {
+        b.addEventListener('click', () => {
+            setZoom((settings.zoom || 100) + Number(b.dataset.zoom));
+        });
+    });
+    document.getElementById('zoom-reset').addEventListener('click', () => setZoom(100));
+}
+
+// ============ 设置 ============
+
+const GITHUB_URL = 'https://github.com/oyksoft/VMD';
+
+// 存的是设置文件（Rust 侧权威，%LOCALAPPDATA%\com.vmd.app\settings.json）
+// 用文件而不是 localStorage：窗口底色在页面加载之前就要定下来，Rust 得能同步读到
+let settings = {
+    theme: 'auto',      // 默认主题：auto/dark/gray/light
+    mode: 'read',       // 默认模式：read/edit
+    ctxMenu: true,      // VMD 自己的右键菜单
+    zoom: 100,          // 文字缩放（%）
+};
+
+function loadSettings() {
+    // Rust 启动时已经把设置文件的内容注入进来了（同步可用，首帧就能用）
+    if (window.__VMD_SETTINGS__ && typeof window.__VMD_SETTINGS__ === 'object') {
+        Object.assign(settings, window.__VMD_SETTINGS__);
+    } else {
+        // 迁移：老版本把设置存在 localStorage，第一次改用文件存储时搬过来
+        try {
+            const raw = localStorage.getItem('vmd.settings');
+            if (raw) {
+                const obj = JSON.parse(raw);
+                if (obj && typeof obj === 'object') {
+                    Object.assign(settings, obj);
+                    saveSettings();
+                }
+            }
+        } catch (e) { /* 读不出来就用默认值 */ }
+    }
+    if (!THEMES[settings.theme]) settings.theme = 'auto';
+    if (settings.mode !== 'edit') settings.mode = 'read';
+    settings.ctxMenu = settings.ctxMenu !== false;
+    let z = Number(settings.zoom);
+    if (!isFinite(z)) z = 100;
+    z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));   // 超出范围就钳到边界
+    settings.zoom = z;
+}
+
+/** VMD 自己的右键菜单开没开（关掉后恢复浏览器原生菜单） */
+function setCtxMenuEnabled(on) {
+    settings.ctxMenu = !!on;
+    saveSettings();
+    // 必须立刻通知 Rust：它那边决定要不要屏蔽 WebView2 的原生菜单，
+    // 两边不同步的话会出现"自定义菜单没了、原生菜单也没了"的情况
+    invoke('set_context_menu_enabled', { enabled: settings.ctxMenu }).catch((e) => {
+        alert('设置右键菜单失败：' + (e && e.message ? e.message : e));
+    });
+    syncSettingsUI();
+}
+
+// ---- 设置项：只保存，不动当前状态，下次启动才生效 ----
+
+/** 默认主题（下次启动用） */
+function setDefaultTheme(v) {
+    settings.theme = v;
+    saveSettings();
+    syncSettingsUI();
+}
+
+/** 默认模式（下次启动用） */
+function setDefaultMode(v) {
+    settings.mode = v;
+    saveSettings();
+    syncSettingsUI();
+}
+
+/** 启动时是否启用软件内右键菜单（这个开关要立即生效，不然点了没反应） */
+function setDefaultCtxMenu(v) {
+    setCtxMenuEnabled(v === '1');
+}
+
+function saveSettings() {
+    // 存到设置文件（Rust 写），下次启动时 Rust 会读它来决定窗口底色
+    invoke('save_settings', { settings: settings }).catch((e) => {
+        console.error('保存设置失败', e);
+    });
+}
+
+/** 把设置面板里的按钮状态同步成当前值 */
+function syncSettingsUI() {
+    document.querySelectorAll('#set-theme .theme-chip').forEach(b => {
+        b.classList.toggle('active', b.dataset.v === settings.theme);
+    });
+    document.querySelectorAll('#set-mode .seg-btn').forEach(b => {
+        b.classList.toggle('is-active', b.dataset.v === settings.mode);
+    });
+    document.querySelectorAll('#set-ctx .seg-btn').forEach(b => {
+        b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.ctxMenu);
+    });
+}
+
+/** 生成主题色块（颜色直接取自 THEMES，避免两处各写一份） */
+function buildThemeChips() {
+    const grid = document.getElementById('set-theme');
+    if (!grid) return;
+    grid.innerHTML = '';
+    for (const key of THEME_ORDER) {
+        const t = THEMES[key];
+        if (!t) continue;
+        const btn = document.createElement('button');
+        btn.className = 'theme-chip';
+        btn.dataset.v = key;
+        btn.title = t.name;
+        // emoji 打头：暗色/灰色这种相近的颜色靠色块分不出来
+        const icon = document.createElement('span');
+        icon.className = 'chip-icon';
+        icon.textContent = t.icon || '';
+        btn.appendChild(icon);
+        const sw = document.createElement('span');
+        sw.className = 'chip-swatch' + (key === 'auto' ? ' auto' : '');
+        if (key !== 'auto' && t.vars) sw.style.background = t.vars['--bg'];
+        btn.appendChild(sw);
+        const name = document.createElement('span');
+        name.textContent = t.short || t.name;
+        btn.appendChild(name);
+        grid.appendChild(btn);
+    }
+}
+
+function openSettingsPanel() {
+    document.getElementById('settings-panel').classList.add('show');
+    syncSettingsUI();
+    refreshShellMenuState();
+    invoke('app_version')
+        .then(v => { document.getElementById('app-version').textContent = 'v' + v; })
+        .catch(() => { document.getElementById('app-version').textContent = ''; });
+    // 告诉用户设置存在哪
+    invoke('settings_path')
+        .then(p => {
+            document.getElementById('settings-path').textContent = p ? ('存储位置：' + p) : '';
+        })
+        .catch(() => { document.getElementById('settings-path').textContent = ''; });
+}
+
+function closeSettingsPanel() {
+    document.getElementById('settings-panel').classList.remove('show');
+}
+
+// VMD 自己的右键菜单开关（设置项：只保存，下次启动生效）
+document.querySelectorAll('#set-ctx .seg-btn').forEach(b => {
+    b.addEventListener('click', () => setDefaultCtxMenu(b.dataset.v));
+});
+// 系统右键菜单项（.md 文件右键时多一个「用 VMD 打开」）
+document.getElementById('menu-on').addEventListener('click', async () => {
+    try {
+        await invoke('set_shell_menu', { enable: true });
+        statusEl.textContent = '已添加「用 VMD 打开」菜单项';
+    } catch (e) {
+        alert('添加失败：' + (e && e.message ? e.message : e));
+    }
+    setTimeout(() => statusEl.textContent = '', 2500);
+    refreshShellMenuState();
+});
+document.getElementById('menu-off').addEventListener('click', async () => {
+    try {
+        await invoke('set_shell_menu', { enable: false });
+        statusEl.textContent = '已移除右键菜单项';
+    } catch (e) {
+        alert('移除失败：' + (e && e.message ? e.message : e));
+    }
+    setTimeout(() => statusEl.textContent = '', 2500);
+    refreshShellMenuState();
+});
+async function refreshShellMenuState() {
+    const el = document.getElementById('menu-state');
+    try {
+        const on = await invoke('shell_menu_status');
+        el.textContent = on ? '当前：已添加' : '当前：未添加';
+    } catch (e) {
+        el.textContent = '';
+    }
+}
+
+// 设置面板里的各项
+document.getElementById('settings-close').addEventListener('click', closeSettingsPanel);
+document.getElementById('btn-settings').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const panel = document.getElementById('settings-panel');
+    if (panel.classList.contains('show')) closeSettingsPanel();
+    else openSettingsPanel();
+});
+// 点面板外面就关掉
+document.addEventListener('mousedown', (e) => {
+    const panel = document.getElementById('settings-panel');
+    if (!panel.classList.contains('show')) return;
+    if (e.target.closest('#settings-panel') || e.target.closest('#btn-settings')) return;
+    closeSettingsPanel();
+});
+// GitHub 链接交给系统浏览器打开
+document.getElementById('app-github').addEventListener('click', (e) => {
+    e.preventDefault();
+    invoke('open_url', { url: GITHUB_URL }).catch(() => { window.open(GITHUB_URL, '_blank'); });
+});
+// 默认主题（设置项：只保存，下次启动生效）
+// 色块是运行时生成的，所以用事件委托
+document.getElementById('set-theme').addEventListener('click', (e) => {
+    const chip = e.target.closest('.theme-chip');
+    if (chip) setDefaultTheme(chip.dataset.v);
+});
+// 默认模式（设置项：只保存，下次启动生效）
+document.querySelectorAll('#set-mode .seg-btn').forEach(b => {
+    b.addEventListener('click', () => setDefaultMode(b.dataset.v));
+});
+// 文件关联
+document.getElementById('assoc-on').addEventListener('click', async () => {
+    try {
+        await invoke('set_file_association', { enable: true });
+        statusEl.textContent = '已关联 .md / .markdown';
+    } catch (e) {
+        alert('关联失败：' + (e && e.message ? e.message : e));
+    }
+    setTimeout(() => statusEl.textContent = '', 2500);
+});
+document.getElementById('assoc-off').addEventListener('click', async () => {
+    try {
+        await invoke('set_file_association', { enable: false });
+        statusEl.textContent = '已取消文件关联';
+    } catch (e) {
+        alert('取消失败：' + (e && e.message ? e.message : e));
+    }
+    setTimeout(() => statusEl.textContent = '', 2500);
+});
+
+// ============ 通用模态对话框 ============
+
+let modalResolve = null;
+
+function showDialog(opts) {
+    const mask = document.getElementById('modal-mask');
+    const bodyEl = document.getElementById('modal-body');
+    document.getElementById('modal-title').textContent = opts.title || '';
+    // body 可以是 HTML 字符串，也可以是 DOM 节点（文件名这种用节点更安全）
+    bodyEl.innerHTML = '';
+    if (typeof opts.body === 'string') {
+        bodyEl.innerHTML = opts.body;
+    } else if (opts.body) {
+        bodyEl.appendChild(opts.body);
+    }
+    const okBtn = document.getElementById('modal-ok');
+    const cancelBtn = document.getElementById('modal-cancel');
+    const alwaysBtn = document.getElementById('modal-always');
+    okBtn.textContent = opts.okText || '确定';
+    cancelBtn.textContent = opts.cancelText || '取消';
+    // 第三个按钮（"以后自动重载"）只在需要时显示
+    if (opts.alwaysText) {
+        alwaysBtn.textContent = opts.alwaysText;
+        alwaysBtn.style.display = 'inline-block';
+    } else {
+        alwaysBtn.style.display = 'none';
+    }
+    // 只有一个按钮的面板（设置面板用）
+    cancelBtn.style.display = opts.hideCancel ? 'none' : 'inline-block';
+    mask.style.display = 'flex';
+    okBtn.focus();
+    return new Promise((resolve) => { modalResolve = resolve; });
+}
+
+function closeDialog(result) {
+    const mask = document.getElementById('modal-mask');
+    if (mask) mask.style.display = 'none';
+    if (modalResolve) {
+        const r = modalResolve;
+        modalResolve = null;
+        r(result);
     }
 }
 
@@ -1241,12 +1987,33 @@ window.addEventListener('resize', () => {
 // 立即同步更新主题按钮（不等 async，避免显示旧值）
 updateThemeButton();
 (async function start() {
-    // 初始跟随系统主题（async：要等 system_theme 命令返回）
-    await applyTheme('auto');
-    setEditMode(false);  // 初始进入阅读模式
+    // 先读设置（默认主题 / 默认模式）
+    loadSettings();
+    // 设置面板里的主题色块
+    buildThemeChips();
+    // 文字缩放
+    initZoom();
+    // 主题：默认跟随系统，用户在设置里改过就用他选的
+    await applyTheme(settings.theme);
+    updateThemeButton();
+    // 模式：默认阅读模式
+    setEditMode(settings.mode === 'edit');
+    // VMD 自己的右键菜单
+    invoke('set_context_menu_enabled', { enabled: settings.ctxMenu !== false }).catch(() => { /* 忽略 */ });
     renderPreview();
     applyWidths(true);
+    refreshEditorLineHeight();
 })();
+
+// 外部修改检测：每 3 秒查一次（窗口没焦点时不查，切回来立刻查）
+setInterval(checkExternalChange, 3000);
+if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen('tauri://focus', () => {
+        winFocused = true;
+        checkExternalChange();
+    });
+    window.__TAURI__.event.listen('tauri://blur', () => { winFocused = false; });
+}
 
 // =================== 自定义右键菜单 ===================
 (function () {
@@ -1349,6 +2116,8 @@ updateThemeButton();
     // 在菜单刚打开时设个“防护”标记，期间忽略点击（防右键连带 click 关掉菜单）
     let protectUntil = 0;
     function handleRightClick(e) {
+        // 设置里关掉了 VMD 自己的右键菜单 → 放行，交给浏览器原生菜单
+        if (!settings.ctxMenu) return;
         const targetEl = e.target;
         // 点菜单本身 → 不处理
         if (targetEl.closest('#ctx-menu')) return;
@@ -1373,6 +2142,7 @@ updateThemeButton();
     // mousedown.button===2 走 handleRightClick（捕获阶段拦截，阻止原生 contextmenu 出现）
     document.addEventListener('mousedown', (e) => {
         if (e.button === 2) {
+            if (!settings.ctxMenu) return;   // 关掉了就放行原生菜单
             e.preventDefault();
             e.stopImmediatePropagation();
             handleRightClick(e);

@@ -5,10 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>VMD</title>
     <link rel="stylesheet" href="./style.css" />
+    <!-- 主题调色板：必须排在 style.css 之后（它追加的 highlight.js 配色表要压在 style.css 上面），
+         并且要在首帧绘制前把启动主题的配色写进 <html>，否则会先闪一下默认的暗色 -->
+    <script src="./theme.js"></script>
     <!-- marked.js (markdown → HTML) -->
     <script src="vendor/marked.min.js"></script>
     <!-- highlight.js (代码高亮) — cdnjs 浏览器版，含全部语言 -->
-    <link rel="stylesheet" href="vendor/highlight-dark.css">
     <script src="vendor/highlight.min.js"></script>
     <!-- KaTeX (LaTeX 数学公式渲染) -->
     <link rel="stylesheet" href="vendor/katex/katex.min.css">
@@ -27,8 +29,10 @@
             <button id="btn-export-pdf" title="导出 PDF">导出 PDF</button>
             <span class="sep"></span>
             <span id="filename">未保存</span>
-            <span class="spacer"></span>
-            <span id="status"></span>
+            <span id="ext-badge" class="ext-badge" title="文件已被外部程序修改，点击可重新加载">⚠ 外部已修改</span>
+            <button id="btn-auto-reload" class="toggle-btn" title="自动重载：文件被外部修改时自动更新内容（开启后编辑器为只读）">⟳ 自动重载</button>
+            <button id="btn-zoom" class="toolbar-icon-btn" title="文字缩放（Ctrl + / - / 0）">🔍 100%</button>
+            <span class="spacer"></span>            <span id="status"></span>
             <div class="seg" id="mode-seg" role="group" aria-label="模式切换">
                 <button class="seg-btn read-mode is-active" data-mode="read">
                     <span class="seg-icon">📖</span><span class="seg-label">阅读</span>
@@ -47,8 +51,14 @@
                     <div class="dropdown-item" data-theme="dark">🌙 <span>暗色</span></div>
                     <div class="dropdown-item" data-theme="gray">🌫️ <span>灰色</span></div>
                     <div class="dropdown-item" data-theme="light">☀️ <span>浅色</span></div>
+                    <div class="dropdown-sep"></div>
+                    <div class="dropdown-item" data-theme="sepia">🌾 <span>暖阳</span></div>
+                    <div class="dropdown-item" data-theme="bamboo">🎋 <span>青竹</span></div>
+                    <div class="dropdown-item" data-theme="mist">🌊 <span>雾蓝</span></div>
+                    <div class="dropdown-item" data-theme="dusk">💜 <span>暮紫</span></div>
                 </div>
             </div>
+            <button id="btn-settings" class="toolbar-icon-btn" title="设置（文件关联等）">⚙</button>
         </header>
 
         <div id="content">
@@ -60,7 +70,7 @@
             <div class="splitter" id="split-toc" title="拖动调整宽度（双击重置）"></div>
 
             <main id="editor-wrap">
-                <textarea id="editor" spellcheck="false" placeholder="在此输入 Markdown..."></textarea>
+                <textarea id="editor" spellcheck="false" wrap="off" placeholder="在此输入 Markdown..."></textarea>
             </main>
 
             <div class="splitter" id="split-preview" title="拖动调整宽度（双击重置）"></div>
@@ -72,6 +82,97 @@
 
         <!-- 自定义右键菜单 -->
         <div id="ctx-menu" class="ctx-menu"></div>
+
+        <!-- 拖放文件时的提示 -->
+        <div id="drop-hint">松开鼠标打开文件</div>
+
+        <!-- 通用模态对话框 -->
+        <div id="modal-mask" class="modal-mask">
+            <div class="modal">
+                <div id="modal-title" class="modal-title"></div>
+                <div id="modal-body" class="modal-body"></div>
+                <div class="modal-actions">
+                    <button id="modal-always" class="modal-btn modal-btn-text">以后自动重载</button>
+                    <span class="spacer"></span>
+                    <button id="modal-cancel" class="modal-btn">取消</button>
+                    <button id="modal-ok" class="modal-btn modal-btn-primary">确定</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 文字缩放浮层 -->
+        <div id="zoom-popup" class="zoom-popup">
+            <div class="zoom-head">
+                <span>文字缩放</span>
+                <span id="zoom-value">100%</span>
+            </div>
+            <input type="range" id="zoom-range" min="80" max="150" step="10" value="100" />
+            <div class="zoom-foot">
+                <button class="zoom-btn" data-zoom="-10">A−</button>
+                <button class="zoom-btn" data-zoom="10">A+</button>
+                <button class="zoom-btn" id="zoom-reset">重置</button>
+            </div>
+        </div>
+
+        <!-- 设置面板 -->
+        <div id="settings-panel" class="settings-panel">
+            <div class="settings-head">
+                <div class="settings-title">设置</div>
+                <div class="settings-meta">
+                    <span id="app-version"></span>
+                    <a id="app-github" href="https://github.com/oyksoft/VMD" target="_blank" rel="noreferrer"
+                       class="settings-link" title="打开项目主页">GitHub</a>
+                    <button id="settings-close" class="toolbar-icon-btn" title="关闭">✕</button>
+                </div>
+            </div>
+
+            <div class="settings-body">
+                <div class="settings-note">下次启动生效</div>
+
+                <div class="settings-item">
+                    <div class="settings-label">默认主题</div>
+                    <div class="theme-grid" id="set-theme"></div>
+                </div>
+
+                <div class="settings-item">
+                    <div class="settings-label">默认模式</div>
+                    <div class="seg settings-seg" id="set-mode">
+                        <button class="seg-btn" data-v="read">阅读</button>
+                        <button class="seg-btn" data-v="edit">编辑</button>
+                    </div>
+                </div>
+
+                <div class="settings-item">
+                    <div class="settings-label">文件关联</div>
+                    <div class="settings-desc">双击 .md 时用 VMD 打开</div>
+                    <div class="settings-btns">
+                        <button class="modal-btn modal-btn-primary" id="assoc-on">关联</button>
+                        <button class="modal-btn" id="assoc-off">取消关联</button>
+                    </div>
+                </div>
+
+                <div class="settings-item">
+                    <div class="settings-label">右键菜单</div>
+                    <div class="settings-desc">右键 .md 时的「用 VMD 打开」</div>
+                    <div class="settings-btns">
+                        <button class="modal-btn modal-btn-primary" id="menu-on">添加</button>
+                        <button class="modal-btn" id="menu-off">移除</button>
+                    </div>
+                    <div class="set-path" id="menu-state"></div>
+                </div>
+
+                <div class="settings-item">
+                    <div class="settings-label">软件内右键菜单</div>
+                    <div class="settings-desc">编辑区、预览区右键时弹出</div>
+                    <div class="seg settings-seg" id="set-ctx">
+                        <button class="seg-btn" data-v="1">启用</button>
+                        <button class="seg-btn" data-v="0">停用</button>
+                    </div>
+                </div>
+
+                <div class="settings-foot" id="settings-path"></div>
+            </div>
+        </div>
     </div>
     <script src="./app.js"></script>
 </body>

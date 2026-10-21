@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "VMD",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "identifier": "com.vmd.app",
   "build": {
     "frontendDist": "../src"
@@ -10,10 +10,12 @@
     "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
+        "create": false,
         "title": "VMD - Markdown 编辑器",
         "width": 1200,
         "height": 720,
-        "minWidth": 800,
+        "minWidth": 960,
         "minHeight": 500
       }
     ],

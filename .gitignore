@@ -43,3 +43,7 @@ src/_*.md
 .env
 .env.local
 config.local.*
+
+# ============= AI 协作者的本地笔记 =============
+# 给 AI 协作者看的仓库说明，只在本地用，不进仓库
+AGENTS.md

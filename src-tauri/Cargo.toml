@@ -1,6 +1,6 @@
 [package]
 name = "vmd"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "VMD - 一个轻量级的 Markdown 查看与编辑工具"
 
@@ -14,13 +14,23 @@ tauri = { version = "2", default-features = false, features = ["wry", "compressi
 tauri-plugin-dialog = "2"
 serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = "1"
+# #[implement(IDropTarget)] 宏展开后写死了 ::windows_core:: 路径，必须直接依赖
+windows-core = "0.62"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "0.39"
 # 只开实际用到的两个模块，避免拉进整个 Win32 API（编译时间和体积都省）
 windows = { version = "0.62", default-features = false, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_Registry",
+    "Win32_System_SystemServices",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
