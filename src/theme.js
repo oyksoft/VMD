@@ -163,11 +163,17 @@ window.VMD_THEMES = {
     },
 };
 
-// ---- 启动：立刻应用主题（必须赶在首帧绘制之前）----
+// ---- 启动：立刻应用主题 + 模式（必须赶在首帧绘制之前）----
 (function applyStartupTheme() {
+    // 启动模式（阅读/编辑）也在这里定：这是 head 里的同步脚本，
+    // document.documentElement 一定存在 → 首帧就是对的，不会闪一下再切。
+    // （不能在 Rust 的注入脚本里设 class —— 那是"文档刚创建"时执行的，DOM 还是空的）
+    const settings = window.__VMD_SETTINGS__ || null;
+    const editMode = !!(settings && settings.mode === 'edit');
+    document.documentElement.classList.toggle('read-mode', !editMode);
+
     // 优先级：用户保存的设置（Rust 启动时读设置文件后注入）→ 系统主题（Rust 读注册表）
-    const saved = window.__VMD_SETTINGS__ || null;
-    const savedTheme = saved && saved.theme ? saved.theme : '';
+    const savedTheme = settings && settings.theme ? settings.theme : '';
     const t = (savedTheme && savedTheme !== 'auto')
         ? savedTheme
         : (window.__VMD_INIT_THEME__

@@ -571,13 +571,8 @@ fn main() {
         "content": startup_content,
     }))
     .unwrap_or_else(|_| "null".to_string());
-    // 启动模式也一起定好：首帧就是阅读模式或编辑模式，不会先显示一种再跳到另一种
-    let start_in_read_mode = saved.get("mode").and_then(|v| v.as_str()) != Some("edit");
-    let mode_js = if start_in_read_mode {
-        "document.documentElement.classList.add('read-mode');"
-    } else {
-        "document.documentElement.classList.remove('read-mode');"
-    };
+    // 注意：注入脚本在"文档刚创建"时执行，那时 document.documentElement 可能还是 null，
+    // 所以这里只做纯赋值，不碰 DOM —— 模式由 src/theme.js 在 head 里同步设置。
     eprintln!(
         "[vmd] 启动主题 = {}（设置里的 theme = {}，系统主题 = {}）",
         startup_theme,
@@ -602,8 +597,8 @@ fn main() {
                         .disable_drag_drop_handler()
                         // 把设置和启动主题告诉前端：前端在首帧绘制前就用它们定配色（见 src/theme.js）
                         .initialization_script(format!(
-                            "window.__VMD_SETTINGS__ = {}; window.__VMD_INIT_THEME__ = \"{}\"; window.__VMD_STARTUP__ = {}; {}",
-                            saved_json, sys_theme, startup_json, mode_js
+                            "window.__VMD_SETTINGS__ = {}; window.__VMD_INIT_THEME__ = \"{}\"; window.__VMD_STARTUP__ = {};",
+                            saved_json, sys_theme, startup_json
                         ))
                         .build()?;
                     // WebView2 首选配色方案：让 prefers-color-scheme 跟系统一致
