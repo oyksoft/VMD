@@ -105,15 +105,15 @@ button:hover { background: var(--bg-elevated); border-color: var(--text-dim); }
 
 
 /* === 阅读模式：隐藏编辑区和 split-preview，保留 split-toc 可拖 === */
-#app.read-mode #editor-wrap,
-#app.read-mode #split-preview {
+html.read-mode #editor-wrap,
+html.read-mode #split-preview {
     display: none;
 }
-#app.read-mode #split-toc {
+html.read-mode #split-toc {
     display: flex;
 }
-#app.read-mode #toc { border-right: none; }
-#app.read-mode #preview-wrap { flex: 1 1 auto; }
+html.read-mode #toc { border-right: none; }
+html.read-mode #preview-wrap { flex: 1 1 auto; }
 
 /* === 分段模式切换（iOS segmented control 风格） === */
 .seg {
@@ -177,20 +177,38 @@ html[data-theme="gray"] .seg {
         0 1px 3px rgba(0, 0, 0, 0.4),
         0 0 12px rgba(120, 110, 240, 0.4);
 }
+/* 启动时 Rust 会把模式写在 <html> 上 —— 这样首帧的按钮高亮就是对的，
+   不用等 JS 跑完再改（那样会看到高亮"跳"一下） */
+html.read-mode #mode-seg .seg-btn[data-mode="read"] {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-strong);
+    box-shadow:
+        0 1px 2px rgba(0, 0, 0, 0.3),
+        0 0 0 1px var(--border);
+    font-weight: 600;
+}
+html:not(.read-mode) #mode-seg .seg-btn[data-mode="edit"] {
+    background: linear-gradient(135deg, #4a5dd1, #8a5bd1);
+    color: #fff;
+    box-shadow:
+        0 1px 3px rgba(0, 0, 0, 0.4),
+        0 0 12px rgba(120, 110, 240, 0.4);
+    font-weight: 600;
+}
 
 .seg-icon { font-size: 13px; line-height: 1; }
 .seg-label { white-space: nowrap; }
 
 /* === 阅读模式：隐藏编辑区和 split-preview，保留 split-toc 可拖 === */
-#app.read-mode #editor-wrap,
-#app.read-mode #split-preview {
+html.read-mode #editor-wrap,
+html.read-mode #split-preview {
     display: none;
 }
-#app.read-mode #split-toc {
+html.read-mode #split-toc {
     display: flex;
 }
-#app.read-mode #toc { border-right: none; }
-#app.read-mode #preview-wrap { flex: 1 1 auto; }
+html.read-mode #toc { border-right: none; }
+html.read-mode #preview-wrap { flex: 1 1 auto; }
 
 
 /* === 下拉菜单（主题选择） === */

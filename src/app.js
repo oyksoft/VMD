@@ -303,7 +303,11 @@ preview.addEventListener('click', async (e) => {
     }
 });
 
-let currentFile = null;
+// 启动文件：用文件关联双击打开时，Rust 端会把路径（和内容）注入进来。
+// 内容直接用注入的 → 首帧就是文件，不会先闪欢迎页再跳到文件。
+const STARTUP = window.__VMD_STARTUP__ || {};
+
+let currentFile = STARTUP.path || null;
 let dirty = false;
 
 const WELCOME = `# 欢迎使用 VMD 👋
@@ -345,7 +349,8 @@ flowchart TD
 \`\`\`
 `;
 
-editor.value = WELCOME;
+// 启动文件的内容（Rust 注入）；没有就用欢迎页
+editor.value = (STARTUP.content != null) ? STARTUP.content : WELCOME;
 
 // ============ 渲染 ============
 
@@ -1090,7 +1095,8 @@ let editMode = false;
 
 function setEditMode(on) {
     editMode = on;
-    document.getElementById('app').classList.toggle('read-mode', !on);
+    // 用 <html> 上的 class（Rust 启动时也会注入同一个 class，首帧就一致）
+    document.documentElement.classList.toggle('read-mode', !on);
     segBtns.forEach(b => b.classList.toggle('is-active', (b.dataset.mode === 'edit') === on));
     applyWidths();
 }
@@ -2004,12 +2010,23 @@ updateThemeButton();
     applyWidths(true);
     refreshEditorLineHeight();
 
-    // 用文件关联双击打开时，命令行里会带文件路径 → 直接打开它
-    invoke('startup_files')
-        .then(files => {
-            if (files && files.length) openPath(files[0]);
-        })
-        .catch(() => { /* 不在 Tauri 里跑时忽略 */ });
+    // 启动文件（用文件关联双击打开）：
+    // Rust 已经把内容注进来了 → 首帧就是它；这里只补一下"大文件"的情况
+    // （超过 512KB 的没注入内容，异步读一次）
+    if (currentFile && STARTUP.content == null) {
+        try {
+            editor.value = await invoke('read_file', { path: currentFile });
+            renderPreview();
+        } catch (e) {
+            editor.value = WELCOME;
+            currentFile = null;
+            renderPreview();
+        }
+    }
+    if (currentFile) {
+        updateFilename();
+        recordStamp();
+    }
 })();
 
 // 外部修改检测：每 3 秒查一次（窗口没焦点时不查，切回来立刻查）

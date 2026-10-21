@@ -245,15 +245,13 @@ fn file_association_status() -> serde_json::Value {
 
 /// 启动时命令行里带的文件路径
 ///
-/// 用文件关联双击 `.md` 打开时，Windows 会把路径作为参数传给 exe（`"exe" "%1"`），
-/// 这个命令把它交给前端去打开。
-#[tauri::command]
-fn startup_files() -> Vec<String> {
+/// 用文件关联双击 `.md` 打开时，Windows 会把路径作为参数传给 exe（`"exe" "%1"`）。
+fn startup_file_path() -> Option<String> {
     let cwd = std::env::current_dir().unwrap_or_default();
     std::env::args()
         .skip(1)
         .filter(|a| !a.starts_with('-'))
-        .filter_map(|a| {
+        .find_map(|a| {
             let p = PathBuf::from(&a);
             let p = if p.is_absolute() { p } else { cwd.join(p) };
             if p.is_file() {
@@ -262,7 +260,12 @@ fn startup_files() -> Vec<String> {
                 None
             }
         })
-        .collect()
+}
+
+/// 启动时命令行里带的文件路径（给前端用）
+#[tauri::command]
+fn startup_files() -> Vec<String> {
+    startup_file_path().into_iter().collect()
 }
 
 /// 设置窗口标题（打开文件后显示"文件名 - VMD"）
@@ -555,6 +558,26 @@ fn main() {
     };
     let bg_color = theme_bg_color(&startup_theme);
     let saved_json = serde_json::to_string(&saved).unwrap_or_else(|_| "null".to_string());
+
+    // 用文件关联双击打开的文件：路径 + 内容一起注入页面。
+    // 内容小的直接塞进去 → **首帧就是文件内容**，不会先闪一下欢迎页再跳到文件。
+    let startup_path = startup_file_path();
+    let startup_content: Option<String> = startup_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .filter(|c| c.len() < 512 * 1024);   // 太大的文件前端再异步读
+    let startup_json = serde_json::to_string(&serde_json::json!({
+        "path": startup_path,
+        "content": startup_content,
+    }))
+    .unwrap_or_else(|_| "null".to_string());
+    // 启动模式也一起定好：首帧就是阅读模式或编辑模式，不会先显示一种再跳到另一种
+    let start_in_read_mode = saved.get("mode").and_then(|v| v.as_str()) != Some("edit");
+    let mode_js = if start_in_read_mode {
+        "document.documentElement.classList.add('read-mode');"
+    } else {
+        "document.documentElement.classList.remove('read-mode');"
+    };
     eprintln!(
         "[vmd] 启动主题 = {}（设置里的 theme = {}，系统主题 = {}）",
         startup_theme,
@@ -579,8 +602,8 @@ fn main() {
                         .disable_drag_drop_handler()
                         // 把设置和启动主题告诉前端：前端在首帧绘制前就用它们定配色（见 src/theme.js）
                         .initialization_script(format!(
-                            "window.__VMD_SETTINGS__ = {}; window.__VMD_INIT_THEME__ = \"{}\";",
-                            saved_json, sys_theme
+                            "window.__VMD_SETTINGS__ = {}; window.__VMD_INIT_THEME__ = \"{}\"; window.__VMD_STARTUP__ = {}; {}",
+                            saved_json, sys_theme, startup_json, mode_js
                         ))
                         .build()?;
                     // WebView2 首选配色方案：让 prefers-color-scheme 跟系统一致
