@@ -1,6 +1,6 @@
 # VMD · 一个轻量的 Markdown 编辑器（带实时预览）
 
-[![version](https://img.shields.io/badge/version-0.2.1-blue)](https://github.com/oyksoft/VMD)
+[![version](https://img.shields.io/badge/version-0.2.2-blue)](https://github.com/oyksoft/VMD)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4?logo=windows)](https://github.com/oyksoft/VMD)
 [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/oyksoft/VMD)
 
@@ -303,7 +303,20 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.1-win64-porta
 
 ## 更新日志
 
-### 0.2.1（当前）
+### 0.2.2（当前）
+
+**修复**
+
+- 💾 **关闭窗口前会问「要保存修改吗？」** —— 之前点 X 直接退出，编辑区里没保存的内容全丢。现在弹「保存 / 不保存 / 取消」三选一，保存成功才关窗；保存失败（取消了"另存为"）窗口会留着
+- 📂 **打开另一个文件前也会问** —— 之前完全没有检查，打开新文件会静默覆盖当前编辑的内容
+- 📝 **新建文件前也会问** —— 原来用的是浏览器原生 `confirm()`，样式跟整体 UI 不搭，现在换成应用内弹窗
+
+**优化**
+
+- ✨ **弹窗样式重做** —— 玻璃质感面板（背后内容能透出来）、标题带单色图标、文件名加粗突出
+- 🎨 **按钮分了三层** —— 「保存」是主题色主按钮，「不保存」是红色描边（丢数据的操作一眼看出不同），「取消」是普通按钮
+
+### 0.2.1
 
 **新增**
 

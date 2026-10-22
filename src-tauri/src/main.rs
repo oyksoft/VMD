@@ -414,6 +414,14 @@ fn set_window_title(window: tauri::WebviewWindow, title: String) {
     let _ = window.set_title(&title);
 }
 
+/// 真正关闭窗口（前端确认过"要不要保存"之后才调）
+#[tauri::command]
+fn close_window(window: tauri::WebviewWindow) {
+    // 用 destroy() 而不是 close()：close() 会再发一次 CloseRequested，
+    // 又被拦截住，窗口就永远关不掉了。
+    let _ = window.destroy();
+}
+
 /// 当前版本号（设置面板里显示）
 #[tauri::command]
 fn app_version(app: tauri::AppHandle) -> String {
@@ -745,6 +753,18 @@ fn main() {
                     let _ = apply_webview_color_scheme(&win, sys_theme);
                     // 自己接管文件拖放（wry 那套在非 shell 来源拖文件时会显示"禁止"光标）
                     crate::drop::install(app.handle(), &win);
+                    // 拦截关闭：先问前端"要不要保存"，前端确认后调 close_window 真正关窗。
+                    // 不拦的话点 X 直接退，编辑区的内容全丢。
+                    {
+                        use tauri::Emitter;
+                        let win2 = win.clone();
+                        win.on_window_event(move |event| {
+                            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                                api.prevent_close();   // 先挡住，别真关
+                                let _ = win2.emit("vmd-close-requested", ());
+                            }
+                        });
+                    }
                 }
 
                 std::thread::spawn(move || {
@@ -765,6 +785,7 @@ fn main() {
             set_webview_color_scheme,
             set_window_background,
             set_window_title,
+            close_window,
             file_stamp,
             set_file_association,
             file_association_status,

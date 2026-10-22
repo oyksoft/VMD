@@ -889,29 +889,76 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     display: none;
     align-items: center;
     justify-content: center;
-    background: rgba(0, 0, 0, 0.45);
+    /* 遮罩也带一点模糊：弹窗像是"浮"在内容上面，而不是贴在上面 */
+    background: rgba(0, 0, 0, 0.38);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
 }
 .modal {
     min-width: 340px;
     max-width: 460px;
-    padding: 20px 22px 16px;
-    background: var(--bg-panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+    padding: 22px 24px 18px;
+    /* 玻璃质感：半透明底 + 高光渐变 + 顶部内高光边（玻璃感主要来自这三处） */
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.14), transparent 60%),
+        color-mix(in srgb, var(--bg-elevated) 88%, transparent);
+    border: 1px solid var(--border-soft);
+    border-radius: 14px;
+    box-shadow:
+        0 18px 48px rgba(0, 0, 0, 0.38),
+        inset 0 1px 0 rgba(255, 255, 255, 0.16);
     color: var(--text);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+/* 浅色主题：白底高光压亮一点，不然整个面板看着发灰、字也不够清楚。
+   主题是用 CSS 变量挂在 :root 上的（没有主题类名），所以靠 --bg-elevated
+   的亮度判断：浅色系的 --bg-elevated 是接近白的浅色。 */
+.modal {
+    background:
+        linear-gradient(180deg,
+            color-mix(in srgb, white 14%, transparent), transparent 60%),
+        color-mix(in srgb, var(--bg-elevated) 88%, transparent);
 }
 .modal-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     font-size: 15px;
     font-weight: 600;
     color: var(--text-strong);
-    margin-bottom: 10px;
+    margin-bottom: 12px;
+}
+.modal-title-text { flex: 1 1 auto; }
+/* 标题图标：圆形底 + 居中字形。用 mask 渲染 → 单色、跟随主题色、任意尺寸都清晰 */
+.modal-title-icon {
+    flex: 0 0 auto;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    color: var(--accent);
+}
+.modal-title-icon svg { width: 14px; height: 14px; display: block; }
+.modal-title-icon.danger {
+    background: color-mix(in srgb, var(--danger) 15%, transparent);
+    border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+    color: var(--danger);
 }
 .modal-body {
     font-size: 13px;
     line-height: 1.7;
     color: var(--text);
     word-break: break-all;
+}
+/* 弹窗里提到的文件名：加重，一眼看出在说哪个文件 */
+.modal-file {
+    color: var(--text-strong);
+    font-weight: 600;
 }
 .modal-warn {
     margin-top: 10px;
@@ -925,7 +972,7 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-top: 18px;
+    margin-top: 20px;
 }
 .modal-btn-text {
     border-color: transparent;
@@ -935,21 +982,38 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
 }
 .modal-btn-text:hover { color: var(--accent); background: transparent; }
 .modal-btn {
-    padding: 5px 14px;
+    padding: 6px 16px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 7px;
     background: transparent;
     color: var(--text);
     font: inherit;
     cursor: pointer;
+    transition: background .12s, border-color .12s, color .12s;
 }
 .modal-btn:hover { background: var(--bg-elevated); }
+.modal-btn:active { transform: translateY(0.5px); }
+.modal-btn:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+    outline-offset: 1px;
+}
 .modal-btn-primary {
     border-color: var(--accent);
     background: var(--accent);
     color: #fff;
+    font-weight: 500;
 }
 .modal-btn-primary:hover { filter: brightness(1.1); background: var(--accent); }
+/* 「不保存」这类会丢数据的操作：红色描边，鼠标移上去才明显 */
+.modal-btn-danger {
+    border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+    color: var(--danger);
+}
+.modal-btn-danger:hover {
+    background: color-mix(in srgb, var(--danger) 16%, transparent);
+    border-color: var(--danger);
+    color: var(--danger);
+}
 
 /* === 拖放文件提示 === */
 #drop-hint {

@@ -190,6 +190,74 @@ if (window.__TAURI__ && window.__TAURI__.event) {
 document.addEventListener('dragover', (e) => { e.preventDefault(); });
 document.addEventListener('drop', (e) => { e.preventDefault(); });
 
+// ============ 关闭窗口前询问是否保存 ============
+// Rust 端拦截了窗口关闭（CloseRequested → prevent_close），
+// 把事件发过来；有未保存的修改就问用户要不要保存。
+if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen('vmd-close-requested', () => { askBeforeClose(); });
+}
+
+// 正在询问中（避免连点 X 弹多个框）
+let closeAskOpen = false;
+
+/**
+ * 有未保存的修改时问用户怎么办。
+ * 返回 'save'（保存）/ 'discard'（丢弃）/ 'cancel'（取消，什么都不做）
+ * 按钮排布跟 Windows 一致：不保存在左，保存在右边（主按钮）。
+ * Esc / 点遮罩 = 取消（不会误丢数据）。
+ */
+async function askSaveChanges() {
+    const name = currentFile ? currentFile.replace(/^.*[\\\/]/, '') : '未保存的内容';
+    const body = document.createElement('div');
+    // 文件名加重：一眼看出是在说哪个文件
+    const file = document.createElement('span');
+    file.className = 'modal-file';
+    file.textContent = '「' + name + '」';
+    body.appendChild(file);
+    const rest = document.createElement('span');
+    rest.textContent = '有未保存的修改。';
+    body.appendChild(rest);
+    const choice = await showDialog({
+        title: '要保存修改吗？',
+        icon: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>',
+        body: body,
+        okText: '保存',
+        cancelText: '取消',
+        alwaysText: '不保存',
+        alwaysDanger: true,
+    });
+    if (choice === true) return 'save';
+    if (choice === 'always') return 'discard';
+    return 'cancel';
+}
+
+async function askBeforeClose() {
+    if (closeAskOpen) return;
+    closeAskOpen = true;
+    try {
+        if (!dirty) { await doClose(); return; }
+        const r = await askSaveChanges();
+        if (r === 'save') {
+            // 保存成功才关；保存失败（用户取消了"另存为"）就留在窗口里
+            if (await saveFile()) await doClose();
+        } else if (r === 'discard') {
+            await doClose();   // 不保存，直接关
+        }
+        // 'cancel' → 什么都不做，窗口留着
+    } finally {
+        closeAskOpen = false;
+    }
+}
+
+/** 真正关窗（Rust 端用 destroy，绕开拦截） */
+async function doClose() {
+    try {
+        await invoke('close_window');
+    } catch (e) {
+        console.warn('close failed:', e);
+    }
+}
+
 // ============ 配置 ============
 
 // 配置 marked
@@ -1351,8 +1419,14 @@ function updateThemeButton() {
     });
 }
 
-document.getElementById('btn-new').addEventListener('click', () => {
-    if (dirty && !confirm('放弃当前修改？')) return;
+document.getElementById('btn-new').addEventListener('click', async () => {
+    // 有未保存的修改时先问 —— 用应用内弹窗，不用浏览器原生 confirm（样式突兀）
+    if (dirty) {
+        const r = await askSaveChanges();
+        if (r === 'cancel') return;
+        if (r === 'save' && !(await saveFile())) return;   // 保存失败 → 不新建
+        // 'discard' → 继续新建，丢弃当前修改
+    }
     editor.value = '';
     currentFile = null;
     dirty = false;
@@ -1412,6 +1486,13 @@ async function openPath(path) {
 }
 
 async function openFile() {
+    // 有未保存的修改时先问一句 —— 否则打开新文件会把当前内容静默丢掉
+    if (dirty) {
+        const r = await askSaveChanges();
+        if (r === 'cancel') return;
+        if (r === 'save' && !(await saveFile())) return;   // 保存失败/取消 → 不打开新文件
+        // 'discard' → 继续打开，丢弃当前修改
+    }
     try {
         console.log('[VMD] openFile() called');
         const path = await open({
@@ -1430,7 +1511,7 @@ async function saveFile() {
     if (!currentFile) return saveAsFile();
     if (editor.readOnly) {           // 自动重载（只读）模式下没有可保存的修改
         showToast('自动重载模式下内容是只读的', 2200);
-        return;
+        return false;
     }
     try {
         await invoke('write_file', { path: currentFile, content: editor.value });
@@ -1440,8 +1521,10 @@ async function saveFile() {
         setExternalChange(false);
         await recordStamp();
         showToast('已保存');
+        return true;
     } catch (e) {
         alert('保存失败：' + e);
+        return false;
     }
 }
 
@@ -1451,7 +1534,7 @@ async function saveAsFile() {
             filters: [{ name: 'Markdown', extensions: ['md', 'markdown'] }],
             defaultPath: currentFile || 'untitled.md',
         });
-        if (!path) return;
+        if (!path) return false;      // 用户取消了"另存为" → 没保存
         await invoke('write_file', { path, content: editor.value });
         currentFile = path;
         dirty = false;
@@ -1459,8 +1542,10 @@ async function saveAsFile() {
         // 另存到新文件：原文件仍然是"被外部改过"的状态，标记要留着
         await recordStamp();
         showToast('已保存');
+        return true;
     } catch (e) {
         alert('保存失败：' + e);
+        return false;
     }
 }
 
@@ -1549,6 +1634,7 @@ async function promptExternalChange() {
     }
     const choice = await showDialog({
         title: '文件已被外部程序修改',
+        icon: '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
         body: body,
         okText: '重新加载',
         cancelText: '保留当前内容',
@@ -1966,7 +2052,23 @@ let modalResolve = null;
 function showDialog(opts) {
     const mask = document.getElementById('modal-mask');
     const bodyEl = document.getElementById('modal-body');
-    document.getElementById('modal-title').textContent = opts.title || '';
+    const titleEl = document.getElementById('modal-title');
+    const titleText = titleEl.querySelector('.modal-title-text');
+    if (titleText) titleText.textContent = opts.title || '';
+    else titleEl.textContent = opts.title || '';
+    // 标题图标：圆形底 + 单色 SVG（stroke=currentColor → 跟随主题色）
+    const icon = titleEl.querySelector('.modal-title-icon');
+    if (icon) {
+        if (opts.icon) {
+            icon.style.display = 'inline-flex';
+            icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+                'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">' + opts.icon + '</svg>';
+            icon.classList.toggle('danger', !!opts.danger);
+        } else {
+            icon.style.display = 'none';
+            icon.innerHTML = '';
+        }
+    }
     // body 可以是 HTML 字符串，也可以是 DOM 节点（文件名这种用节点更安全）
     bodyEl.innerHTML = '';
     if (typeof opts.body === 'string') {
@@ -1986,6 +2088,9 @@ function showDialog(opts) {
     } else {
         alwaysBtn.style.display = 'none';
     }
+    // 「不保存」这类会丢数据的操作 → 红色描边（默认是弱化的文字按钮）
+    alwaysBtn.classList.toggle('modal-btn-danger', !!opts.alwaysDanger);
+    alwaysBtn.classList.toggle('modal-btn-text', !opts.alwaysDanger);
     // 只有一个按钮的面板（设置面板用）
     cancelBtn.style.display = opts.hideCancel ? 'none' : 'inline-block';
     mask.style.display = 'flex';
