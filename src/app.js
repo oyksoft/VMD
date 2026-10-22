@@ -2047,9 +2047,15 @@ document.getElementById('assoc-off').addEventListener('click', async () => {
 
 // ============ 通用模态对话框 ============
 
+// 弹窗只有一套 DOM（#modal-mask + 三个按钮），同一时刻只能显示一个。
+// 后来的请求排队，前一个关掉再弹下一个 —— 否则第二个 showDialog 会覆盖
+// modalResolve，第一个的 Promise 永远不 settle，调用方的 await 悬空，
+// 对应的守卫标志（changeDialogOpen / closeAskOpen）就永久卡住。
 let modalResolve = null;
+let modalQueue = [];
 
-function showDialog(opts) {
+/** 填弹窗内容并显示 */
+function renderDialog(opts) {
     const mask = document.getElementById('modal-mask');
     const bodyEl = document.getElementById('modal-body');
     const titleEl = document.getElementById('modal-title');
@@ -2095,17 +2101,36 @@ function showDialog(opts) {
     cancelBtn.style.display = opts.hideCancel ? 'none' : 'inline-block';
     mask.style.display = 'flex';
     okBtn.focus();
-    return new Promise((resolve) => { modalResolve = resolve; });
+}
+
+/** 弹出队列里的下一个（当前没有弹窗在显示时才会调） */
+function openNextDialog() {
+    if (modalResolve) return;
+    const next = modalQueue.shift();
+    if (!next) return;
+    modalResolve = next.resolve;
+    renderDialog(next.opts);
+}
+
+function showDialog(opts) {
+    return new Promise((resolve) => {
+        modalQueue.push({ opts, resolve });
+        if (!modalResolve) openNextDialog();
+    });
 }
 
 function closeDialog(result) {
-    const mask = document.getElementById('modal-mask');
-    if (mask) mask.style.display = 'none';
-    if (modalResolve) {
-        const r = modalResolve;
-        modalResolve = null;
-        r(result);
+    const r = modalResolve;
+    modalResolve = null;
+    if (!r) return;
+    if (modalQueue.length) {
+        // 直接换内容接着弹下一个，遮罩不隐藏（不闪一下）
+        openNextDialog();
+    } else {
+        const mask = document.getElementById('modal-mask');
+        if (mask) mask.style.display = 'none';
     }
+    r(result);
 }
 
 // ============ 导出 HTML ============
