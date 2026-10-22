@@ -21,6 +21,146 @@ fn write_file(path: String, content: String) -> Result<(), String> {
     fs::write(&path, &content).map_err(|e| format!("write failed: {}", e))
 }
 
+/// 导出 HTML：把正文里的本地图片换成 base64 内嵌，输出自包含的单文件
+/// （不引任何依赖：base64 编码和 img 替换都是自己实现的）
+#[tauri::command]
+fn export_html(path: String, html: String, base_dir: String) -> Result<(), String> {
+    let html = inline_local_images(&html, &base_dir);
+    fs::write(&path, html).map_err(|e| format!("write failed: {}", e))
+}
+
+/// base64 编码（不引 base64 crate，省体积）
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for c in data.chunks(3) {
+        let b0 = c[0] as u32;
+        let b1 = *c.get(1).unwrap_or(&0) as u32;
+        let b2 = *c.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// 按扩展名猜 MIME
+fn mime_of(path: &str) -> &'static str {
+    let p = path.to_ascii_lowercase();
+    if p.ends_with(".png") {
+        "image/png"
+    } else if p.ends_with(".jpg") || p.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if p.ends_with(".gif") {
+        "image/gif"
+    } else if p.ends_with(".webp") {
+        "image/webp"
+    } else if p.ends_with(".svg") {
+        "image/svg+xml"
+    } else if p.ends_with(".bmp") {
+        "image/bmp"
+    } else if p.ends_with(".ico") {
+        "image/x-icon"
+    } else if p.ends_with(".avif") {
+        "image/avif"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// percent 解码（marked 会把图片路径里的中文/空格编码成 %XX，
+/// 直接拿编码后的路径去磁盘读会读不到 —— 中文名图片全中招）
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 取标签里某个属性值在标签中的位置（返回值的起止下标）
+fn attr_span(tag: &str, name: &str) -> Option<(usize, usize)> {
+    for q in ['"', '\''] {
+        let pat = format!("{}={}", name, q);
+        if let Some(i) = tag.find(&pat) {
+            let s = i + pat.len();
+            if let Some(e) = tag[s..].find(q) {
+                return Some((s, s + e));
+            }
+        }
+    }
+    None
+}
+
+/// 读一张本地图片，转成 data URI（相对路径按 markdown 文件所在目录找）
+fn img_to_data_uri(base_dir: &str, src: &str) -> Option<String> {
+    let p = PathBuf::from(src);
+    let full = if p.is_absolute() {
+        p
+    } else {
+        PathBuf::from(base_dir).join(p)
+    };
+    let data = fs::read(&full).ok()?;
+    Some(format!(
+        "data:{};base64,{}",
+        mime_of(&full.to_string_lossy()),
+        base64_encode(&data)
+    ))
+}
+
+/// 把 HTML 里 <img src="本地路径"> 换成 base64 内嵌（远程图片和 data: 原样保留）
+fn inline_local_images(html: &str, base_dir: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(pos) = rest.find("<img") {
+        let (head, tail) = rest.split_at(pos);
+        out.push_str(head);
+        let tag_end = match tail.find('>') {
+            Some(i) => i + 1,
+            None => {
+                out.push_str(tail);
+                return out;
+            }
+        };
+        let tag = &tail[..tag_end];
+        let after = &tail[tag_end..];
+        let mut new_tag = tag.to_string();
+        if let Some((s, e)) = attr_span(tag, "src") {
+            let src = &tag[s..e];
+            let remote = src.starts_with("http://")
+                || src.starts_with("https://")
+                || src.starts_with("data:")
+                || src.starts_with("//");
+            if !remote && !src.is_empty() {
+                if let Some(data) = img_to_data_uri(base_dir, &percent_decode(src)) {
+                    let mut buf = String::with_capacity(tag.len() + data.len());
+                    buf.push_str(&tag[..s]);
+                    buf.push_str(&data);
+                    buf.push_str(&tag[e..]);
+                    new_tag = buf;
+                }
+            }
+        }
+        out.push_str(&new_tag);
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 #[tauri::command]
 fn file_exists(path: String) -> bool {
     PathBuf::from(&path).exists()
@@ -617,6 +757,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             read_file,
             write_file,
+            export_html,
             file_exists,
             export_pdf,
             system_theme,

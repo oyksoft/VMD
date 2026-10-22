@@ -20,13 +20,26 @@ const THEME_ORDER = ['auto', 'dark', 'gray', 'light', 'sepia', 'bamboo', 'mist',
 let currentTheme = 'auto';   // 用户选的（可能是 auto）
 let activeTheme = 'dark';    // 实际生效的（auto 时是系统决定的）
 let currentAppTheme = 'dark'; // 供 Mermaid 选择配色用
+let systemTheme = 'dark';    // 系统当前是亮还是暗（"自动"主题的悬停预览要用）
+
+/** 读系统当前是亮还是暗（读不到就退回 matchMedia） */
+async function fetchSystemTheme() {
+    let sys;
+    try {
+        sys = await invoke('system_theme');
+    } catch (e) {
+        sys = systemPrefersDark() ? 'dark' : 'light';
+    }
+    systemTheme = sys;
+    return sys;
+}
 
 /** 读系统当前是亮还是暗 */
 function systemPrefersDark() {
     return !(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
 }
 
-/** 把某个具体主题的 CSS 变量和 hljs 样式应用上去 */
+/** 把某个具体主题的 CSS 变量和 hljs 样式应用上去（瞬间换，不做渐变过渡） */
 function applyConcreteTheme(key) {
     const t = THEMES[key];
     const root = document.documentElement;
@@ -55,13 +68,7 @@ async function applyTheme(key) {
     if (key === 'auto') {
         // Tauri 2 在窗口主题为 Auto 时会把 WebView2 强制设成 Light，
         // 所以 matchMedia 读不到真实系统主题 —— 改从 Rust 读注册表。
-        let sys = 'light';
-        try {
-            sys = await invoke('system_theme');
-        } catch (e) {
-            sys = systemPrefersDark() ? 'dark' : 'light';
-        }
-        activeTheme = sys;
+        activeTheme = await fetchSystemTheme();
     } else {
         activeTheme = key;
     }
@@ -80,6 +87,45 @@ async function applyTheme(key) {
     applyConcreteTheme(activeTheme);
     renderPreview();
     updateThemeButton();
+}
+// ---- 悬停预览主题（设置面板的色块 + 工具栏的主题菜单共用） ----
+// 鼠标停在某个主题上 → 整个窗体渲染成那个主题；移开 → 恢复当前生效的主题。
+// 只改"当前显示"：不写设置文件、不动 currentTheme / activeTheme。
+// 延迟一点再切：鼠标扫过一排色块时不会一路闪过去。
+// 切换本身是瞬间的 —— 试过"淡出→换→淡入"和"颜色渐变"，用户都觉得难受，不要再加过渡。
+const PREVIEW_DELAY = 140;
+let previewTimer = null;
+let previewing = false;
+
+function schedulePreview(key) {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => {
+        previewTimer = null;
+        applyPreview(key);
+    }, PREVIEW_DELAY);
+}
+
+/** 离开预览区：恢复当前生效的主题 */
+function endPreview() {
+    // 取消还没触发的预览（鼠标只是扫过）
+    if (previewTimer) {
+        clearTimeout(previewTimer);
+        previewTimer = null;
+    }
+    // 注意：即使还有/刚取消定时器，也可能早就预览过了（比如扫过上一个色块）——
+    // 这里必须照样恢复，不能因为"有定时器"就早退，否则颜色会卡在某个主题上。
+    if (!previewing) return;
+    previewing = false;
+    applyConcreteTheme(activeTheme);
+}
+
+function applyPreview(key) {
+    if (key === 'auto') key = systemTheme;   // "自动" = 系统当前主题
+    const t = THEMES[key];
+    if (!t || !t.vars) return;
+    if (!previewing && key === activeTheme) return;   // 已经是这个主题了
+    previewing = true;
+    applyConcreteTheme(key);
 }
 
 // 跟随系统时，系统主题变化要实时响应
@@ -286,7 +332,25 @@ const editor = document.getElementById('editor');
 const preview = document.getElementById('preview');
 const tocList = document.getElementById('toc-list');
 const filenameEl = document.getElementById('filename');
-const statusEl = document.getElementById('status');
+const toolbarEl = document.getElementById('toolbar');
+const toastEl = document.getElementById('toast');
+
+// ============ 浮动提示条 ============
+// 临时消息（已保存 / 已导出 / 自动重载已关闭…）浮在窗口上方居中，不占工具栏的位置。
+let toastTimer = null;
+
+/** 显示一条提示；ms <= 0 表示常驻，等下一条提示替换 */
+function showToast(msg, ms = 2000) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+    if (ms > 0) toastTimer = setTimeout(hideToast, ms);
+}
+
+function hideToast() {
+    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+    toastEl.classList.remove('show');
+}
 
 // 预览中的链接点击 → 外部调系统浏览器打开，避免 WebView 被跳走
 preview.addEventListener('click', async (e) => {
@@ -312,14 +376,19 @@ let dirty = false;
 
 const WELCOME = `# 欢迎使用 VMD 👋
 
-一个用 Tauri + 系统 WebView 写的 markdown viewer。
+一个用 Tauri + 系统 WebView 写的 **Markdown 编辑器**：左边写，右边实时看。
 
 ## 主要特性
 
 - ✨ 实时预览，所见即所得
-- 🎨 彩色 emoji (Twemoji)
+- 💾 保存 / 另存为，还能导出 PDF、HTML
 - 🖱️ 左侧目录，点击跳转
-- ⌨️ 快捷键：Ctrl+O 打开 · Ctrl+S 保存 · Ctrl+Shift+S 另存为
+- 📥 把 .md 文件拖进窗口直接打开
+- ⌨️ 快捷键：Ctrl+N 新建 · Ctrl+O 打开 · Ctrl+S 保存 · Ctrl+Shift+S 另存为
+
+## Emoji 短代码
+
+输入 \`:smile:\` 这样的短代码，会自动变成表情：:smile: :rocket: :+1: :tada:
 
 ## 代码高亮
 
@@ -329,12 +398,22 @@ fn main() {
 }
 \`\`\`
 
+## 数学公式
+
+行内公式：$E = mc^2$
+
+块级公式（KaTeX）：
+
+$$
+\\frac{\\partial u}{\\partial t} = h^2 \\nabla^2 u
+$$
+
 ## 表格
 
 | 名称 | 描述 |
 |------|------|
 | Rust | 🦀 系统编程 |
-| VMD  | markdown viewer |
+| VMD  | Markdown 编辑器 |
 
 ## 流程图
 
@@ -418,12 +497,58 @@ function renderPreview() {
     renderMermaidBlocks();    // 必须在 highlightCodeBlocks 前——后者会冲掉 language-* class
     highlightCodeBlocks();
     highlightUnmatchedDelimiters(text);   // 从源文本扫描错误写法，映射到 DOM 文本节点标黄
+    replaceEmojiShortcodes();             // :smile: → 😄（代码块/行内代码里的不动）
     wrapTables();
     if (tocCount > 0) renderInlineToc(tocTypes);
     renderMath();
     mapHeadingLines(text);   // 把预览区的标题和源码行号对应起来（目录跳转要精确落行）
     renderToc();
     updateFilename();
+}
+
+// ============ Emoji 短代码（:smile: → 😄）============
+// 只在预览里替换，源码保持原样（和 GitHub 一致）。
+// 用「渲染后处理」而不是 marked 扩展 —— 扩展会先于行内代码匹配，
+// 把 `` `:smile:` `` 里的也换掉。
+function replaceEmojiShortcodes() {
+    const table = window.VMD_EMOJI;
+    if (!table) return;
+    const has = (name) => Object.prototype.hasOwnProperty.call(table, name);
+    const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            const p = node.parentElement;
+            if (!p) return NodeFilter.FILTER_REJECT;
+            const tag = p.tagName;
+            // 代码块 / 行内代码 / 脚本 / 样式里的不动
+            if (tag === 'CODE' || tag === 'PRE' || tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
+            if (p.closest('.code-block-header')) return NodeFilter.FILTER_REJECT;
+            if (node.nodeValue.indexOf(':') < 0) return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+        },
+    });
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    for (const node of nodes) {
+        const text = node.nodeValue;
+        let hit = false;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        text.replace(/:([a-zA-Z0-9_+-]+):/g, (m, name, idx) => {
+            if (!has(name)) return m;
+            hit = true;
+            frag.appendChild(document.createTextNode(text.slice(last, idx)));
+            const span = document.createElement('span');
+            span.className = 'emoji-char';
+            span.title = m;
+            span.textContent = table[name];
+            frag.appendChild(span);
+            last = idx + m.length;
+            return m;
+        });
+        if (!hit) continue;
+        frag.appendChild(document.createTextNode(text.slice(last)));
+        node.parentNode.replaceChild(frag, node);
+    }
 }
 
 // 找出文本中所有“代码区域”的字符范围：[围栏代码块] + [行内代码]
@@ -771,28 +896,32 @@ function rerenderMermaid() {
         });
     });
 }
+// 已知关键字：跳过这些的都是"无头"的代码块
+const MERMAID_KNOWN_KEYWORDS = /^\s*(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|stateDiagram-v2|gantt|pie|erDiagram|journey|gitGraph|timeline|sankey-beta|quadrantChart|requirementDiagram|C4Context|mindmap|zenuml)/i;
+// 老式 flowchart 语法检测（id=>type: text）
+const MERMAID_OLD_FLOW_SYNTAX = /^\s*\w+\s*=>\s*(start|end|operation|inputoutput|condition|subroutine)\s*:/im;
+
+/** 把 mermaid 源码整理成能渲染的样子（预览和导出共用，保证两边一致） */
+function normalizeMermaidSource(source) {
+    source = source.replace(/\\n/g, '<br/>').replace(/\\t/g, '\t').replace(/\\"/g, '"');
+    if (MERMAID_OLD_FLOW_SYNTAX.test(source)) {
+        source = convertOldFlowchart(source);
+    } else if (!MERMAID_KNOWN_KEYWORDS.test(source)) {
+        // 检测序列图特征：-> / -> / --> / -- / Note
+        if (/^\s*\w+\s*(->|-->|->>|-->>|--)\s*\w+/m.test(source) || /^\s*Note\b/m.test(source)) {
+            source = 'sequenceDiagram\n' + source.trim();
+        }
+    }
+    return source;
+}
+
 function renderMermaidBlocks() {
     if (!window.mermaid) return;
     // 支持 mermaid、seq、flow、sequence、diagram 作为代码块语言别名
     const codes = preview.querySelectorAll('pre code.language-mermaid, pre code.language-seq, pre code.language-flow, pre code.language-sequence, pre code.language-diagram');
-    // 已知关键字：跳过这些的都是“无头”的代码块
-    const KNOWN_KEYWORDS = /^\s*(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|stateDiagram-v2|gantt|pie|erDiagram|journey|gitGraph|timeline|sankey-beta|quadrantChart|requirementDiagram|C4Context|mindmap|zenuml)/i;
-    // 老式 flowchart 语法检测（id=>type: text）
-    const OLD_FLOW_SYNTAX = /^\s*\w+\s*=>\s*(start|end|operation|inputoutput|condition|subroutine)\s*:/im;
     codes.forEach(code => {
         if (code.dataset.mermaidRendered) return;
-        let source = code.textContent;
-        // 用户友好的转义：\n → <br/>（Mermaid 多行 Note 语法）、\t → tab、\" → "
-        source = source.replace(/\\n/g, '<br/>').replace(/\\t/g, '\t').replace(/\\"/g, '"');
-        // 自动补 sequenceDiagram 关键字 + 老式 flowchart 语法转新语法
-        if (OLD_FLOW_SYNTAX.test(source)) {
-            source = convertOldFlowchart(source);
-        } else if (!KNOWN_KEYWORDS.test(source)) {
-            // 检测序列图特征：-> / -> / --> / -- / Note
-            if (/^\s*\w+\s*(->|-->|->>|-->>|--)\s*\w+/m.test(source) || /^\s*Note\b/m.test(source)) {
-                source = 'sequenceDiagram\n' + source.trim();
-            }
-        }
+        const source = normalizeMermaidSource(code.textContent);
         const pre = code.parentNode;
         const id = 'mermaid-' + (++mermaidCounter);
         const container = document.createElement('div');
@@ -1069,9 +1198,78 @@ function slugify(s) {
 // 上一次设置过的窗口标题（变了才通知后端，避免每次输入都发 IPC）
 let lastWindowTitle = '';
 
+// ============ 文件名超长时中间省略 ============
+// 纯 CSS 的 direction:rtl 方案在中文/带括号的文件名上会 bidi 乱序，所以用 JS 量宽度。
+// 目标宽度 = 工具栏里真正留给文件名的空间（固定项和间隔占掉的不算），与文件名内容无关，
+// 所以不会出现「全文 → 省略 → 全文」来回抖。
+const FILENAME_MAX_W = 320;      // 文件名最多占多宽
+const FILENAME_TAIL_KEEP = 10;   // 尾部保留几个字（够放下扩展名）
+const measureCtx = document.createElement('canvas').getContext('2d');
+let measureFont = '';
+
+function measureText(s) {
+    if (!measureFont) {
+        const cs = getComputedStyle(filenameEl);
+        measureFont = `${cs.fontStyle} ${cs.fontVariant} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+        measureCtx.font = measureFont;
+    }
+    return measureCtx.measureText(s).width;
+}
+
+/** 工具栏里留给文件名的空间 */
+function filenameTargetWidth() {
+    const cs = getComputedStyle(toolbarEl);
+    const gap = parseFloat(cs.columnGap) || 0;
+    const kids = Array.from(toolbarEl.children);
+    let w = toolbarEl.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)
+        - (kids.length - 1) * gap;
+    for (const k of kids) {
+        if (k === filenameEl) continue;
+        const ks = getComputedStyle(k);
+        // spacer 会被挤到 min-width，给文件名留的空间按这个最小值算
+        const width = k.classList.contains('spacer')
+            ? (parseFloat(ks.minWidth) || 0)
+            : k.getBoundingClientRect().width;
+        w -= width + (parseFloat(ks.marginLeft) || 0) + (parseFloat(ks.marginRight) || 0);
+    }
+    return Math.min(FILENAME_MAX_W, w);
+}
+
+/** 把文件名裁成「头部…尾部」，扩展名始终保留 */
+function fitFilename() {
+    const full = filenameEl.dataset.full || '';
+    if (!full) { filenameEl.textContent = ''; return; }
+    const target = filenameTargetWidth();
+    if (target <= 0) { filenameEl.textContent = full; return; }
+    if (measureText(full) <= target + 0.5) { filenameEl.textContent = full; return; }
+
+    const chars = Array.from(full);
+    const tail = (t) => chars.slice(chars.length - t).join('');
+    // 尾部优先保留（扩展名在最后）
+    let t = Math.min(chars.length - 1, FILENAME_TAIL_KEEP);
+    while (t > 0 && measureText('…' + tail(t)) > target) t--;
+    const tailStr = tail(t);
+    // 二分：头部最多能留几个字
+    let lo = 0, hi = chars.length - t;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (measureText(chars.slice(0, mid).join('') + '…' + tailStr) <= target) lo = mid;
+        else hi = mid - 1;
+    }
+    filenameEl.textContent = chars.slice(0, lo).join('') + '…' + tailStr;
+}
+
 function updateFilename() {
     const name = currentFile ? currentFile.replace(/^.*[\\\/]/, '') : '(未保存)';
-    filenameEl.textContent = dirty ? name + ' ●' : name;
+    const text = dirty ? name + ' ●' : name;
+    const path = currentFile || '';
+    // 名字没变就不用重新量宽度（每次输入都会走到这里）
+    if (filenameEl.dataset.full !== text || filenameEl.dataset.path !== path) {
+        filenameEl.dataset.full = text;
+        filenameEl.dataset.path = path;
+        filenameEl.title = path;      // 悬停显示完整路径
+        fitFilename();
+    }
     // 窗口标题也带上文件名，方便多文档时区分
     const title = (currentFile ? name + (dirty ? ' ●' : '') : '未命名') + ' - VMD';
     document.title = title;
@@ -1121,28 +1319,32 @@ themeToggle.addEventListener('click', (e) => {
 
 // 点击菜单项
 themeMenu.querySelectorAll('.dropdown-item').forEach(item => {
+    // 悬停 = 整个窗体即时预览这个主题
+    item.addEventListener('mouseenter', () => schedulePreview(item.dataset.theme));
     item.addEventListener('click', (e) => {
         e.stopPropagation();
         applyTheme(item.dataset.theme);
         updateThemeButton();
         themeDropdown.classList.remove('open');
-        // 注意：这里只改"当前主题"，不覆盖设置里的"默认主题"（那是下次启动用的）
+        endPreview();   // 菜单关掉了，预览也恢复
     });
 });
+// 鼠标移出菜单 → 恢复当前主题
+themeMenu.addEventListener('mouseleave', endPreview);
 
 // 点击其他地方关闭
 document.addEventListener('click', () => {
     themeDropdown.classList.remove('open');
+    endPreview();   // 菜单被关掉时不会触发 mouseleave，预览要在这里恢复
 });
 
 function updateThemeButton() {
     const t = THEMES[currentTheme];
-    // auto 显示"跟随系统"，tooltip 里提示当前实际生效的是哪个
-    const label = t.icon + ' ' + t.name;
-    themeLabel.textContent = label;
+    // 按钮只留图标（省工具栏宽度），完整名字放 tooltip
+    themeLabel.textContent = t.icon;
     themeToggle.title = currentTheme === 'auto'
         ? '跟随系统（当前：' + THEMES[activeTheme].name + '）'
-        : t.name;
+        : '主题：' + t.name;
     // 高亮当前选中项
     themeMenu.querySelectorAll('.dropdown-item').forEach(item => {
         item.classList.toggle('active', item.dataset.theme === currentTheme);
@@ -1164,7 +1366,6 @@ document.getElementById('btn-new').addEventListener('click', () => {
 document.getElementById('btn-open').addEventListener('click', openFile);
 document.getElementById('btn-save').addEventListener('click', saveFile);
 document.getElementById('btn-save-as').addEventListener('click', saveAsFile);
-document.getElementById('btn-export-pdf').addEventListener('click', exportPdf);
 
 // 外部修改徽章：点一下重新问一下要不要加载
 document.getElementById('ext-badge').addEventListener('click', () => {
@@ -1207,8 +1408,7 @@ async function openPath(path) {
     setExternalChange(false);       // 换了文件，之前的"外部已修改"标记作废
     await recordStamp();
     applyReadOnly();                // 自动重载开着 → 只读
-    statusEl.textContent = '已打开';
-    setTimeout(() => statusEl.textContent = '', 1500);
+    showToast('已打开');
 }
 
 async function openFile() {
@@ -1229,8 +1429,7 @@ async function openFile() {
 async function saveFile() {
     if (!currentFile) return saveAsFile();
     if (editor.readOnly) {           // 自动重载（只读）模式下没有可保存的修改
-        statusEl.textContent = '自动重载模式下内容是只读的';
-        setTimeout(() => statusEl.textContent = '', 2000);
+        showToast('自动重载模式下内容是只读的', 2200);
         return;
     }
     try {
@@ -1240,8 +1439,7 @@ async function saveFile() {
         // 存回去的内容就是当前内容了，外部修改的问题随之解决
         setExternalChange(false);
         await recordStamp();
-        statusEl.textContent = '已保存';
-        setTimeout(() => statusEl.textContent = '', 1500);
+        showToast('已保存');
     } catch (e) {
         alert('保存失败：' + e);
     }
@@ -1260,8 +1458,7 @@ async function saveAsFile() {
         updateFilename();
         // 另存到新文件：原文件仍然是"被外部改过"的状态，标记要留着
         await recordStamp();
-        statusEl.textContent = '已保存';
-        setTimeout(() => statusEl.textContent = '', 1500);
+        showToast('已保存');
     } catch (e) {
         alert('保存失败：' + e);
     }
@@ -1314,8 +1511,7 @@ async function checkExternalChange() {
         // 文件被删了：连续两轮都不在才算真删了（有些编辑器保存是"先删后写"）
         deleteRounds++;
         if (deleteRounds >= 2) {
-            statusEl.textContent = '文件已被删除';
-            setTimeout(() => statusEl.textContent = '', 3000);
+            showToast('文件已被删除', 3200);
         }
         return;
     }
@@ -1408,7 +1604,9 @@ async function autoReloadFromDisk() {
     // 读的过程中还在变 → 这轮放弃，等下一个周期
     if (!after || after.mtime !== before.mtime || after.size !== before.size) return;
     if (currentFile !== path) return;
-    applyExternalContent(content, '已自动重新加载');
+    // 自动重载是后台行为，不弹提示 —— 内容自己变了就够明显，
+    // 外部工具反复保存文件的话，每次都弹会变成提示轰炸
+    applyExternalContent(content, null);
 }
 
 /** 把外部的内容灌进编辑器（保持光标和滚动位置） */
@@ -1426,8 +1624,7 @@ function applyExternalContent(content, tip) {
     updateFilename();
     setExternalChange(false);
     recordStamp();
-    statusEl.textContent = tip;
-    setTimeout(() => statusEl.textContent = '', 1500);
+    if (tip) showToast(tip);
 }
 
 // ============ 自动重载开关 ============
@@ -1442,10 +1639,12 @@ async function toggleAutoReload() {
         return;
     }
     if (dirty) {
-        // 有未保存的修改 → 开启会切成只读，这些修改就没了 → 确认一下
+        // 有未保存的修改 → 开启会切成只读（内容还在，但改不了也存不了）→ 确认一下
         const ok = await showDialog({
             title: '开启自动重载？',
-            body: '<div>当前编辑区里有未保存的修改。</div><div class="modal-warn">开启自动重载后编辑器会变成只读，这些修改会被丢弃。</div>',
+            body: '<div>当前编辑区里有未保存的修改。</div>'
+                + '<div class="modal-warn">开启自动重载后编辑器会变成只读：不能再编辑，也不能保存。'
+                + '当前内容会留在屏幕上，但文件一旦被外部程序修改，这些修改就会被磁盘上的内容覆盖。</div>',
             okText: '仍然开启',
             cancelText: '取消',
         });
@@ -1465,8 +1664,7 @@ function setAutoReload(on) {
             : '自动重载：文件被外部修改时自动更新内容（开启后编辑器为只读）';
     }
     applyReadOnly();
-    statusEl.textContent = autoReload ? '自动重载已开启（只读）' : '自动重载已关闭';
-    setTimeout(() => statusEl.textContent = '', 2000);
+    showToast(autoReload ? '自动重载已开启（只读）' : '自动重载已关闭', 2200);
 }
 
 /** 自动重载开着时，编辑器变只读（防的是自动重载把用户正在写的内容冲掉） */
@@ -1653,8 +1851,11 @@ function buildThemeChips() {
         const name = document.createElement('span');
         name.textContent = t.short || t.name;
         btn.appendChild(name);
+        // 悬停 = 整个窗体即时预览这个主题；移开色块区恢复
+        btn.addEventListener('mouseenter', () => schedulePreview(key));
         grid.appendChild(btn);
     }
+    grid.addEventListener('mouseleave', endPreview);
 }
 
 function openSettingsPanel() {
@@ -1674,6 +1875,7 @@ function openSettingsPanel() {
 
 function closeSettingsPanel() {
     document.getElementById('settings-panel').classList.remove('show');
+    endPreview();   // 面板关了，预览也得恢复
 }
 
 // VMD 自己的右键菜单开关（设置项：只保存，下次启动生效）
@@ -1684,21 +1886,19 @@ document.querySelectorAll('#set-ctx .seg-btn').forEach(b => {
 document.getElementById('menu-on').addEventListener('click', async () => {
     try {
         await invoke('set_shell_menu', { enable: true });
-        statusEl.textContent = '已添加「用 VMD 打开」菜单项';
+        showToast('已添加「用 VMD 打开」菜单项', 2500);
     } catch (e) {
         alert('添加失败：' + (e && e.message ? e.message : e));
     }
-    setTimeout(() => statusEl.textContent = '', 2500);
     refreshShellMenuState();
 });
 document.getElementById('menu-off').addEventListener('click', async () => {
     try {
         await invoke('set_shell_menu', { enable: false });
-        statusEl.textContent = '已移除右键菜单项';
+        showToast('已移除右键菜单项', 2500);
     } catch (e) {
         alert('移除失败：' + (e && e.message ? e.message : e));
     }
-    setTimeout(() => statusEl.textContent = '', 2500);
     refreshShellMenuState();
 });
 async function refreshShellMenuState() {
@@ -1745,20 +1945,18 @@ document.querySelectorAll('#set-mode .seg-btn').forEach(b => {
 document.getElementById('assoc-on').addEventListener('click', async () => {
     try {
         await invoke('set_file_association', { enable: true });
-        statusEl.textContent = '已关联 .md / .markdown';
+        showToast('已关联 .md / .markdown', 2500);
     } catch (e) {
         alert('关联失败：' + (e && e.message ? e.message : e));
     }
-    setTimeout(() => statusEl.textContent = '', 2500);
 });
 document.getElementById('assoc-off').addEventListener('click', async () => {
     try {
         await invoke('set_file_association', { enable: false });
-        statusEl.textContent = '已取消文件关联';
+        showToast('已取消文件关联', 2500);
     } catch (e) {
         alert('取消失败：' + (e && e.message ? e.message : e));
     }
-    setTimeout(() => statusEl.textContent = '', 2500);
 });
 
 // ============ 通用模态对话框 ============
@@ -1805,7 +2003,169 @@ function closeDialog(result) {
     }
 }
 
+// ============ 导出 HTML ============
+
+/** 取内嵌资源的文本（vendor 里的 css 走自定义协议，直接 fetch 就行） */
+async function fetchText(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('读取失败：' + url);
+    return r.text();
+}
+
+/** 二进制 → base64（btoa 只吃 latin1，要先转成二进制字符串） */
+function bytesToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+}
+
+/** 资源 → data URI */
+async function fetchDataUri(url, mime) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('读取失败：' + url);
+    const buf = await r.arrayBuffer();
+    return 'data:' + mime + ';base64,' + bytesToBase64(buf);
+}
+
+/**
+ * KaTeX 的 CSS：公式要自包含，字体得内嵌。
+ * 只内嵌正文里真正用到的字体（getComputedStyle 能拿到实际用的 font-family），
+ * 用不到的 @font-face 整个丢掉 —— 否则浏览器会去请求不存在的相对路径。
+ */
+async function buildKatexCss(roots) {
+    const list = roots || Array.from(preview.querySelectorAll('.katex'));
+    if (!list.length) return '';
+    const used = new Set();
+    const collect = (el) => {
+        const ff = getComputedStyle(el).fontFamily || '';
+        ff.split(',').forEach(f => used.add(f.trim().replace(/^["']|["']$/g, '')));
+    };
+    list.forEach(r => {
+        collect(r);
+        r.querySelectorAll('*').forEach(collect);
+    });
+    let css;
+    try {
+        css = await fetchText('vendor/katex/katex.min.css');
+    } catch (e) {
+        return '';
+    }
+    const blocks = css.match(/@font-face\{[^}]*\}/g) || [];
+    for (const block of blocks) {
+        const fam = (block.match(/font-family:([^;}]+)/) || [])[1];
+        const url = (block.match(/url\(([^)]+)\)/) || [])[1];
+        if (!fam || !url) continue;
+        const name = fam.trim().replace(/^["']|["']$/g, '');
+        if (!used.has(name)) {
+            css = css.replace(block, '');
+            continue;
+        }
+        const file = url.replace(/^["']|["']$/g, '');
+        try {
+            const data = await fetchDataUri('vendor/katex/' + file, 'font/woff2');
+            css = css.replace(block, block.replace(url, 'url(' + data + ')'));
+        } catch (e) {
+            console.warn('字体内嵌失败：' + file, e);
+        }
+    }
+    return css;
+}
+
+function escapeText(s) {
+    // 手写转义：仓库里 HTML 实体字面量不可靠（现有的 escapeHtml 就是个空操作），用码点绕开
+    const map = {
+        '&': String.fromCharCode(38),
+        '<': String.fromCharCode(60),
+        '>': String.fromCharCode(62),
+        '"': String.fromCharCode(34),
+        "'": String.fromCharCode(39),
+    };
+    return String(s).replace(/[&<>"']/g, c => map[c]);
+}
+
+/** 组装导出的 HTML（自包含单文件：图片 base64、公式字体内嵌、配色用当前主题） */
+async function buildExportHtml() {
+    const theme = THEMES[activeTheme];
+    const [exportCss, hljsCss, katexCss] = await Promise.all([
+        fetchText('./export.css'),
+        fetchText(theme.css).catch(() => ''),
+        buildKatexCss(),
+    ]);
+    const themeVars = Object.entries(theme.vars).map(([k, v]) => `${k}:${v}`).join(';');
+    const title = currentFile ? currentFile.replace(/^.*[\\\/]/, '') : '未命名';
+    // 剔掉应用自己的 UI（代码块的语言标签 + 复制按钮），文档里不该有
+    const clone = preview.cloneNode(true);
+    clone.querySelectorAll('.code-block-header').forEach(el => el.remove());
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>${escapeText(title)}</title>
+<style>
+:root{${themeVars}}
+${exportCss}
+${hljsCss}
+${katexCss}
+</style>
+</head>
+<body>
+<article class="doc">
+${clone.innerHTML}
+</article>
+</body>
+</html>`;
+}
+
+/** 导出成自包含的单文件 HTML（图片转 base64、公式字体内嵌） */
+async function exportHtml() {
+    try {
+        const baseName = currentFile
+            ? currentFile.replace(/^.*[\\\/]/, '').replace(/\.[^.]+$/, '')
+            : 'untitled';
+        const path = await save({
+            filters: [{ name: 'HTML', extensions: ['html'] }],
+            defaultPath: baseName + '.html',
+        });
+        if (!path) return;
+
+        showToast('正在导出 HTML…', 0);
+        const html = await buildExportHtml();
+        // 本地图片按 markdown 文件所在目录解析，Rust 侧转成 base64 内嵌
+        const baseDir = currentFile ? currentFile.replace(/[^\\\/]+$/, '') : '';
+        await invoke('export_html', { path, html, baseDir });
+        showToast('HTML 已导出', 2500);
+    } catch (e) {
+        console.error(e);
+        hideToast();
+        alert('导出 HTML 失败：' + (e && e.message ? e.message : e));
+    }
+}
+
+// 导出下拉菜单（PDF / HTML）
+const exportDropdown = document.getElementById('export-dropdown');
+const exportMenu = document.getElementById('export-menu');
+exportDropdown.querySelector('.dropdown-toggle').addEventListener('click', (e) => {
+    e.stopPropagation();
+    exportDropdown.classList.toggle('open');
+});
+exportMenu.querySelectorAll('.dropdown-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        exportDropdown.classList.remove('open');
+        if (item.dataset.fmt === 'pdf') exportPdf();
+        else if (item.dataset.fmt === 'html') exportHtml();
+    });
+});
+document.addEventListener('click', () => {
+    exportDropdown.classList.remove('open');
+});
+
 // ============ 导出 PDF ============
+
 async function exportPdf() {
     try {
         const baseName = currentFile
@@ -1817,7 +2177,7 @@ async function exportPdf() {
         });
         if (!path) return;
 
-        statusEl.textContent = '正在导出 PDF…';
+        showToast('正在导出 PDF…', 0);
         // 临时切到打印模式：只保留预览内容（隐藏工具栏/目录/编辑区）+ 浅色配色
         const prevHljs = document.querySelector('link[data-hljs]')?.href || null;
         document.querySelectorAll('link[data-hljs]').forEach(l => l.remove());
@@ -1832,11 +2192,11 @@ async function exportPdf() {
         await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
         try {
             await invoke('export_pdf', { path });
-            statusEl.textContent = 'PDF 已导出';
+            showToast('PDF 已导出', 2500);
         } catch (e) {
             console.error(e);
             alert('导出 PDF 失败：' + (e && e.message ? e.message : e));
-            statusEl.textContent = '';
+            hideToast();
         } finally {
             document.body.classList.remove('print-mode');
             document.documentElement.classList.remove('print-mode');
@@ -1850,7 +2210,6 @@ async function exportPdf() {
                 document.head.appendChild(back);
             }
         }
-        setTimeout(() => statusEl.textContent = '', 2500);
     } catch (e) {
         alert('导出 PDF 失败：' + e);
     }
@@ -1986,6 +2345,8 @@ window.addEventListener('resize', () => {
     if (editorW > 0) editorEl.style.width = editorW + 'px';
     tocEl.style.width = tocW + 'px';
     // 不调 applyWidths（它会清空 editor width）
+    // 窗口宽度变了 → 文件名可用的宽度也变了 → 重新省略
+    fitFilename();
 });
 
 // ============ 启动 ============
@@ -2001,6 +2362,7 @@ updateThemeButton();
     initZoom();
     // 主题：默认跟随系统，用户在设置里改过就用他选的
     await applyTheme(settings.theme);
+    fetchSystemTheme();   // 预热系统主题（"自动"色块的悬停预览要用）
     updateThemeButton();
     // 模式：默认阅读模式
     setEditMode(settings.mode === 'edit');
@@ -2090,26 +2452,36 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         return '<div class="ctx-separator"></div>';
     }
 
+    // 会改编辑器内容的操作。
+    // 注意：textarea 的 readOnly 只拦键盘输入，程序直接改 value 照样能改 ——
+    // 所以只读模式下这些项必须单独挡住，否则"只读却能改"。
+    const EDIT_ACTIONS = new Set([
+        'undo', 'redo', 'cut', 'paste',
+        'fmt-bold', 'fmt-italic', 'fmt-code',
+        'insert-link', 'insert-codeblock', 'insert-table',
+    ]);
+
     function editorMenu() {
         const sel = editor.value.substring(editor.selectionStart, editor.selectionEnd);
         const hasSel = sel.length > 0;
+        const ro = editor.readOnly;   // 自动重载开着 = 只读
         return [
-            item('撤销',  { act: 'undo',  icon: '↶', shortcut: 'Ctrl+Z' }),
-            item('重做',  { act: 'redo',  icon: '↷', shortcut: 'Ctrl+Y' }),
+            item('撤销',  { act: 'undo',  icon: '↶', shortcut: 'Ctrl+Z', disabled: ro }),
+            item('重做',  { act: 'redo',  icon: '↷', shortcut: 'Ctrl+Y', disabled: ro }),
             sep(),
-            item('剪切', { act: 'cut', icon: '✂', shortcut: 'Ctrl+X' }),
+            item('剪切', { act: 'cut', icon: '✂', shortcut: 'Ctrl+X', disabled: ro }),
             item('复制', { act: 'copy', icon: '📋', shortcut: 'Ctrl+C' }),
-            item('粘贴', { act: 'paste', icon: '📥', shortcut: 'Ctrl+V' }),
+            item('粘贴', { act: 'paste', icon: '📥', shortcut: 'Ctrl+V', disabled: ro }),
             sep(),
             item('全选', { act: 'selectAll', icon: '🔲', shortcut: 'Ctrl+A' }),
             sep(),
-            item('加粗 **',    { act: 'fmt-bold',   icon: 'B', disabled: !hasSel }),
-            item('斜体 *',     { act: 'fmt-italic', icon: 'I', disabled: !hasSel }),
-            item('行内代码 `', { act: 'fmt-code',   icon: '<>', disabled: !hasSel }),
+            item('加粗 **',    { act: 'fmt-bold',   icon: 'B', disabled: ro || !hasSel }),
+            item('斜体 *',     { act: 'fmt-italic', icon: 'I', disabled: ro || !hasSel }),
+            item('行内代码 `', { act: 'fmt-code',   icon: '<>', disabled: ro || !hasSel }),
             sep(),
-            item('链接 [文字](url)', { act: 'insert-link', icon: '🔗' }),
-            item('代码块 ```',       { act: 'insert-codeblock', icon: '{ }' }),
-            item('表格',             { act: 'insert-table', icon: '⊞' }),
+            item('链接 [文字](url)', { act: 'insert-link', icon: '🔗', disabled: ro }),
+            item('代码块 ```',       { act: 'insert-codeblock', icon: '{ }', disabled: ro }),
+            item('表格',             { act: 'insert-table', icon: '⊞', disabled: ro }),
         ].join('');
     }
 
@@ -2204,6 +2576,13 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         const act = row.dataset.act;
         const sel = editor.value.substring(editor.selectionStart, editor.selectionEnd);
 
+        // 只读（自动重载）模式下不许改内容 —— 菜单项已经置灰，这里再挡一道（菜单可能是只读前打开的）
+        if (menuTarget === 'editor' && editor.readOnly && EDIT_ACTIONS.has(act)) {
+            showToast('自动重载模式下内容是只读的');
+            closeMenu();
+            return;
+        }
+
         // ----- textarea 操作 -----
         if (menuTarget === 'editor') {
             if (act === 'undo')        document.execCommand('undo');
@@ -2240,6 +2619,13 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         closeMenu();
     });
 
+    // 直接改 editor.value 不会触发 input 事件 → dirty 标记要手动打，
+    // 否则标题栏不显示 ●，用户以为没改就关窗口，改动静默丢失
+    function markEdited() {
+        dirty = true;
+        updateFilename();
+    }
+
     // textarea 工具函数
     function wrapSelection(text) {
         const s = editor.selectionStart, e = editor.selectionEnd;
@@ -2247,6 +2633,7 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         editor.selectionStart = s;
         editor.selectionEnd = s + text.length;
         editor.focus();
+        markEdited();
     }
 
     function insertAtCursor(text) {
@@ -2254,6 +2641,7 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         const s = editor.selectionStart, e = editor.selectionEnd;
         editor.value = editor.value.slice(0, s) + text + editor.value.slice(e);
         editor.selectionStart = editor.selectionEnd = s + text.length;
+        markEdited();
     }
 
     function copyPreviewSelection() {

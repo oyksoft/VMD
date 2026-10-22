@@ -1,6 +1,8 @@
 /* === 重置 === */
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+/* 页面底色跟着主题走（画布铺满窗口，避免露出 WebView2 的默认底色） */
+html { background: var(--bg); }
 
 :root {
     /* 等宽字体栈：西文用 Cascadia/Consolas，中文用无衬线（避免落到宋体） */
@@ -32,7 +34,6 @@ body {
     color: var(--text);
     background: var(--bg);
     user-select: none;
-    transition: background 0.15s, color 0.15s;
 }
 button {
     font: inherit; color: inherit; background: transparent;
@@ -91,14 +92,67 @@ button:hover { background: var(--bg-elevated); border-color: var(--text-dim); }
 #toolbar button,
 #toolbar .seg,
 #toolbar .seg-btn,
+#toolbar .dropdown,
 #toolbar .dropdown-toggle {
     white-space: nowrap;
     flex: 0 0 auto;
 }
 #toolbar .sep { width: 1px; height: 18px; background: var(--border); margin: 0 6px; }
 #toolbar .spacer { flex: 1 1 auto; min-width: 8px; }
-#toolbar #filename { color: var(--text-dim); font-size: 13px; white-space: nowrap; }
-#toolbar #status { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+/* 文件名是唯一允许被压缩的元素：窗口不够宽时先压它（中间省略），
+   而不是把整条工具栏撑宽、把右边的按钮挤出可视区 */
+#toolbar #filename {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 320px;
+    overflow: hidden;
+    color: var(--text-dim);
+    font-size: 13px;
+    white-space: nowrap;
+    text-overflow: ellipsis;   /* JS 省略之前的兜底 */
+}
+/* === 浮动提示条（临时消息，浮在窗口上方居中，不占工具栏的位置） === */
+#toast {
+    position: fixed;
+    top: 58px;
+    left: 50%;
+    transform: translate(-50%, -12px);
+    max-width: min(560px, calc(100vw - 48px));
+    padding: 10px 22px;
+    border-radius: 12px;
+    /* 底色用「文字色」掺出来的半透明层：浅色主题得到暗色玻璃，深色主题得到亮色玻璃，
+       跟页面底色永远拉得开。含量只有 14% —— 背后的内容必须透得出来。 */
+    background: color-mix(in srgb, var(--text) 14%, transparent);
+    /* 模糊只能一点点（3px）：再大就把背后的文字抹成一片匀色，反而像块实心板子。
+       玻璃感来自"透出内容"，不是来自"更糊"。 */
+    backdrop-filter: blur(3px) saturate(140%);
+    -webkit-backdrop-filter: blur(3px) saturate(140%);
+    /* 提示文字压在正文上会看不清 —— 用页面底色给它描一圈光晕，保证可读 */
+    text-shadow: 0 1px 3px var(--bg), 0 0 6px var(--bg);
+    border: 1px solid color-mix(in srgb, var(--text) 26%, transparent);
+    box-shadow:
+        0 8px 26px rgba(0, 0, 0, 0.22),
+        inset 0 1px 0 rgba(255, 255, 255, 0.22);   /* 顶部高光边 */
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+    text-align: center;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    z-index: 9000;
+}
+#toast.show {
+    opacity: 1;
+    transform: translate(-50%, 0);
+}
+/* 不支持 backdrop-filter 的环境：加深底色，保证文字看得清 */
+@supports not (backdrop-filter: blur(4px)) {
+    #toast { background: var(--bg-elevated); }
+}
+body.print-mode #toast { display: none !important; }
 
 /* === 阅读/编辑模式开关（Material chip 风格） === */
 
@@ -214,15 +268,34 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
 /* === 下拉菜单（主题选择） === */
 .dropdown { position: relative; }
 
+/* 主题按钮：只留图标，点开菜单选（省工具栏宽度） */
 .dropdown-toggle {
     display: flex;
     align-items: center;
-    gap: 8px;
-    min-width: 92px;
-    justify-content: space-between;
-}
-.dropdown-arrow {
+    gap: 3px;
+    padding: 4px 6px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-dim);
     font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+}
+.dropdown-toggle:hover { background: var(--bg-elevated); color: var(--text); }
+/* 带文字的下拉按钮（导出）：保持普通按钮的样子 */
+.dropdown-toggle.text-toggle {
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    gap: 6px;
+}
+.dropdown-toggle.text-toggle:hover { background: var(--bg-elevated); color: inherit; }
+.dropdown-arrow {
+    font-size: 9px;
     line-height: 1;
     opacity: 0.7;
     transition: transform 0.15s;
@@ -487,6 +560,11 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     display: inline-block;
     margin: 0 0.05em;
 }
+/* Emoji 短代码渲染出来的字符（字体栈继承自 body，里面有 Segoe UI Emoji） */
+#preview .emoji-char {
+    font-size: 1.05em;
+    vertical-align: -0.08em;
+}
 #preview img:not(.emoji) {
     max-width: 100%;
     border-radius: 4px;
@@ -642,6 +720,16 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     font-weight: 600;
     color: var(--text-strong);
 }
+/* 标题后面的小提示（"下次启动生效"）—— auto 边距加在它身上，
+   这样标题+提示抱在左边，版本号/GitHub/关闭被顶到最右 */
+.settings-hint {
+    margin-right: auto;
+    font-size: 11.5px;
+    font-weight: 400;
+    color: var(--text-dim);
+    opacity: 0.9;
+    letter-spacing: 0.2px;
+}
 .settings-meta {
     display: flex;
     align-items: center;
@@ -656,11 +744,6 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
 }
 .settings-link:hover { text-decoration: underline; }
 .settings-body { padding: 4px 14px 14px; }
-.settings-note {
-    margin: 10px 0 2px;
-    font-size: 11.5px;
-    color: var(--text-dim);
-}
 .settings-foot {
     margin-top: 10px;
     padding-top: 10px;
@@ -785,7 +868,6 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     align-items: center;
     gap: 4px;
     padding: 1px 8px;
-    margin-left: 8px;
     border: 1px solid #d29922;
     border-radius: 10px;
     background: rgba(210, 153, 34, 0.12);

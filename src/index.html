@@ -18,6 +18,8 @@
     <script src="vendor/katex/contrib/auto-render.min.js"></script>
     <!-- Mermaid (流程图/序列图/类图等) -->
     <script src="vendor/mermaid.min.js"></script>
+    <!-- Emoji 短代码表（:smile: → 😄，来自 GitHub 的 gemoji 数据集） -->
+    <script src="vendor/emoji.js"></script>
 </head>
 <body>
     <div id="app">
@@ -26,13 +28,19 @@
             <button id="btn-open" title="打开 (Ctrl+O)">打开</button>
             <button id="btn-save" title="保存 (Ctrl+S)">保存</button>
             <button id="btn-save-as" title="另存为 (Ctrl+Shift+S)">另存为</button>
-            <button id="btn-export-pdf" title="导出 PDF">导出 PDF</button>
+            <div class="dropdown" id="export-dropdown">
+                <button id="btn-export" class="dropdown-toggle text-toggle" title="导出">导出 <span class="dropdown-arrow">▼</span></button>
+                <div class="dropdown-menu" id="export-menu">
+                    <div class="dropdown-item" data-fmt="pdf">📄 导出 PDF</div>
+                    <div class="dropdown-item" data-fmt="html">🌐 导出 HTML</div>
+                </div>
+            </div>
             <span class="sep"></span>
             <span id="filename">未保存</span>
             <span id="ext-badge" class="ext-badge" title="文件已被外部程序修改，点击可重新加载">⚠ 外部已修改</span>
+            <span class="spacer"></span>
             <button id="btn-auto-reload" class="toggle-btn" title="自动重载：文件被外部修改时自动更新内容（开启后编辑器为只读）">⟳ 自动重载</button>
             <button id="btn-zoom" class="toolbar-icon-btn" title="文字缩放（Ctrl + / - / 0）">🔍 100%</button>
-            <span class="spacer"></span>            <span id="status"></span>
             <div class="seg" id="mode-seg" role="group" aria-label="模式切换">
                 <button class="seg-btn read-mode is-active" data-mode="read">
                     <span class="seg-icon">📖</span><span class="seg-label">阅读</span>
@@ -43,7 +51,7 @@
             </div>
             <div class="dropdown" id="theme-dropdown">
                 <button id="btn-theme" class="dropdown-toggle" title="切换主题">
-                    <span id="theme-label">🖥️ 跟随系统</span>
+                    <span id="theme-label">🖥️</span>
                     <span class="dropdown-arrow">▼</span>
                 </button>
                 <div class="dropdown-menu" id="theme-menu">
@@ -86,6 +94,9 @@
         <!-- 拖放文件时的提示 -->
         <div id="drop-hint">松开鼠标打开文件</div>
 
+        <!-- 浮动提示条（临时消息，浮在窗口上方居中） -->
+        <div id="toast"></div>
+
         <!-- 通用模态对话框 -->
         <div id="modal-mask" class="modal-mask">
             <div class="modal">
@@ -118,6 +129,7 @@
         <div id="settings-panel" class="settings-panel">
             <div class="settings-head">
                 <div class="settings-title">设置</div>
+                <span class="settings-hint">默认项下次启动生效</span>
                 <div class="settings-meta">
                     <span id="app-version"></span>
                     <a id="app-github" href="https://github.com/oyksoft/VMD" target="_blank" rel="noreferrer"
@@ -127,8 +139,6 @@
             </div>
 
             <div class="settings-body">
-                <div class="settings-note">下次启动生效</div>
-
                 <div class="settings-item">
                     <div class="settings-label">默认主题</div>
                     <div class="theme-grid" id="set-theme"></div>

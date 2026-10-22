@@ -1,6 +1,6 @@
 # VMD · 一个轻量的 Markdown 编辑器（带实时预览）
 
-[![version](https://img.shields.io/badge/version-0.2.0-blue)](https://github.com/oyksoft/VMD)
+[![version](https://img.shields.io/badge/version-0.2.1-blue)](https://github.com/oyksoft/VMD)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4?logo=windows)](https://github.com/oyksoft/VMD)
 [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/oyksoft/VMD)
 
@@ -263,7 +263,7 @@ def fibonacci(n: int) -> int:
 
 - ❌ macOS / Linux 用户（当前 Windows 专属，依赖 WebView2；移植需要小改但还没做）
 - ❌ 需要协同 / 云同步的人（VMD 是纯本地工具）
-- ❌ 需要导出 Word / PPT / EPUB 的人（当前只支持导出 PDF）
+- ❌ 需要导出 Word / PPT / EPUB 的人（当前支持导出 PDF 和 HTML）
 - ❌ 需要"所见即所得"的富文本编辑器的人（VMD 写的是纯 Markdown 源码，不是 Word 那种所见即所得）
 
 ---
@@ -292,7 +292,7 @@ cargo build --release
 mkdir ..\release -Force | Out-Null
 copy /y target\release\vmd.exe ..\release\VMD.exe
 cd ..\release
-Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.0-win64-portable.zip -Force
+Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.1-win64-portable.zip -Force
 ```
 
 > touch `tauri.conf.json` 这步别漏 —— `tauri-build` 只监听配置文件的变化，
@@ -302,7 +302,24 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.0-win64-porta
 
 ## 更新日志
 
-### 0.2.0（当前）
+### 0.2.1（当前）
+
+**新增**
+
+- 🌐 **导出 HTML** —— 工具栏「导出 ▾ → 导出 HTML」，输出一个**自包含的单文件**：图片转成 base64 内嵌、公式用的字体一起打包，双击就能在浏览器打开，也能直接发给别人
+- 🎨 **主题悬停即时预览** —— 在设置面板的主题色块上悬停，整个窗口立刻换成那个主题；移开恢复当前生效的主题
+- 🧭 **工具栏重新分组** —— 文件操作靠左、文件名居中当标题、视图控制（自动重载 / 缩放 / 阅读编辑 / 主题 / 设置）靠右
+
+**优化**
+
+- 📏 **文件名太长不再撑宽工具栏** —— 超长文件名中间省略（`很长的文件…名称.md`），鼠标悬停显示完整路径
+- 🔘 **主题按钮改成图标** —— 只留一个图标 + 下拉箭头，点开选主题，完整名称放 tooltip，省下约 70px 宽度
+- 💬 **临时提示改成浮层** —— 「已保存 / 已导出 / 自动重载已关闭」这类提示浮在窗口上方居中，不再占工具栏的位置，也不怕长提示把按钮顶走
+- 📋 **设置面板的说明改成标题旁的小字** —— 「默认项下次启动生效」写在「设置」标题后面，并且说准了适用范围（只有默认主题 / 默认模式是下次生效，文件关联和右键菜单是立即生效）
+- 🐛 开启「自动重载」后编辑区是只读的，但右键菜单的「加粗 / 斜体 / 粘贴 / 撤销」居然还能改内容 —— 现在这些项正确置灰
+- 🐛 弹窗文案说「这些修改会被丢弃」，实际内容并不会丢（只是不能再编辑）—— 已改成说真实后果
+
+### 0.2.0
 
 **新增**
 

@@ -1,0 +1,125 @@
+/* ============================================================
+   导出 HTML 用的文档样式
+   —— 只在导出时内联进导出的文件，不参与应用本身的界面
+   —— 颜色全部走 CSS 变量，导出时由 JS 填入当前主题的值
+   ============================================================ */
+
+:root {
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI",
+                 "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC",
+                 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
+    --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo,
+                 "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
+    /* 兜底值（导出时会被当前主题覆盖） */
+    --bg: #ffffff;
+    --bg-panel: #f6f8fa;
+    --bg-elevated: #eaeef2;
+    --bg-code: #f6f8fa;
+    --border: #d0d7de;
+    --border-soft: rgba(27, 31, 36, 0.12);
+    --text: #1f2328;
+    --text-strong: #0d1117;
+    --text-dim: #57606a;
+    --link: #0969da;
+    --quote-bar: #d0d7de;
+    --quote-text: #57606a;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+    margin: 0;
+    padding: 48px 24px 96px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 1.78;
+    overflow-wrap: break-word;
+}
+
+.doc { max-width: 860px; margin: 0 auto; }
+
+/* ---- 标题 ---- */
+.doc h1, .doc h2, .doc h3, .doc h4, .doc h5, .doc h6 {
+    color: var(--text-strong);
+    font-weight: 600;
+    line-height: 1.32;
+    margin: 1.7em 0 .65em;
+}
+.doc > h1:first-child, .doc > h2:first-child { margin-top: 0; }
+.doc h1 { font-size: 1.9em; border-bottom: 1px solid var(--border); padding-bottom: .32em; }
+.doc h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: .28em; }
+.doc h3 { font-size: 1.24em; }
+.doc h4 { font-size: 1.08em; }
+.doc h5, .doc h6 { font-size: 1em; color: var(--text-dim); }
+
+/* ---- 段落 / 列表 ---- */
+.doc p { margin: 0 0 1em; }
+.doc ul, .doc ol { margin: 0 0 1em; padding-left: 1.7em; }
+.doc li { margin: .28em 0; }
+.doc li > ul, .doc li > ol { margin: .28em 0; }
+.doc li > p { margin: .3em 0; }
+.doc dl { margin: 0 0 1em; }
+.doc dt { font-weight: 600; }
+.doc dd { margin: 0 0 .5em 1.6em; }
+
+/* ---- 引用 ---- */
+.doc blockquote {
+    margin: 1.1em 0;
+    padding: .15em 0 .15em 1.1em;
+    border-left: 4px solid var(--quote-bar);
+    color: var(--quote-text);
+}
+.doc blockquote > :last-child { margin-bottom: 0; }
+
+/* ---- 代码 ---- */
+.doc code {
+    font-family: var(--font-mono);
+    font-size: .88em;
+    background: var(--bg-code);
+    border: 1px solid var(--border-soft);
+    border-radius: 4px;
+    padding: .12em .38em;
+}
+.doc pre {
+    margin: 1.1em 0;
+    padding: 14px 16px;
+    background: var(--bg-code);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    overflow-x: auto;
+    line-height: 1.6;
+}
+.doc pre code { background: none; border: 0; padding: 0; font-size: .86em; }
+
+/* ---- 表格 ---- */
+.doc table {
+    border-collapse: collapse;
+    margin: 1.2em 0;
+    width: 100%;
+    font-size: .95em;
+}
+.doc th, .doc td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+.doc th { background: var(--bg-elevated); font-weight: 600; }
+.doc tbody tr:nth-child(2n) { background: color-mix(in srgb, var(--text) 4%, transparent); }
+
+/* ---- 链接 / 图片 / 分隔线 ---- */
+.doc a { color: var(--link); text-decoration: none; }
+.doc a:hover { text-decoration: underline; }
+.doc img { max-width: 100%; height: auto; border-radius: 6px; }
+.doc hr { border: 0; border-top: 1px solid var(--border); margin: 2.2em 0; }
+
+/* ---- 任务列表 / Mermaid ---- */
+.doc input[type="checkbox"] { margin-right: .4em; }
+.doc .mermaid-block { text-align: center; }
+.doc .mermaid-block, .doc svg { max-width: 100%; }
+
+/* ---- 打印 ---- */
+@media print {
+    body { padding: 0; }
+    .doc { max-width: none; }
+    pre, table, img, svg, blockquote { break-inside: avoid; }
+}
