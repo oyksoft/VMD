@@ -355,6 +355,82 @@ fn file_stamp(path: String) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "mtime": mtime, "size": meta.len() }))
 }
 
+/// 屏蔽 F5 刷新 + 接管 Ctrl+F / Ctrl+H / Ctrl+R / Ctrl+P
+///
+/// **F5**：WebView2 里的"浏览器加速键"，默认行为是刷新整个页面 ——
+/// 编辑区里没保存的内容直接没了（连"要不要保存"都不问）。
+///
+/// **Ctrl+F / Ctrl+H / Ctrl+R / Ctrl+P**：这些是**浏览器保留快捷键**，
+/// Chromium 会在把按键交给渲染器之前就自己处理掉（Ctrl+H = 历史记录），
+/// 所以前端的 keydown 压根收不到 → 必须在这一层拦。
+///
+/// ⚠️ SetHandled(true) 的副作用：**渲染器收不到这个按键**，
+///    所以拦掉之后得自己 emit 一下，通知前端该做什么。
+///
+/// ⚠️ 修饰键状态用 `GetAsyncKeyState` 直接问系统 —— 不要自己跟踪按下/抬起：
+///    keyup 万一没上报，状态就卡住 → 之后这个窗口的快捷键全被吞
+///    （双开时特别明显：其中一个窗口的 Ctrl+F 死活不出现）。
+#[cfg(target_os = "windows")]
+fn install_reload_blocker(window: &tauri::WebviewWindow) {
+    use webview2_com::AcceleratorKeyPressedEventHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2AcceleratorKeyPressedEventArgs;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    const VK_CONTROL: i32 = 0x11;
+    const VK_F: i32 = 0x46;
+    const VK_H: i32 = 0x48;
+    const VK_P: i32 = 0x50;
+    const VK_R: i32 = 0x52;
+    const VK_F5: u32 = 0x74;   // F5 的虚拟键码
+
+    let win_emit = window.clone();
+
+    let _ = window.with_webview(move |webview| {
+        let handler = AcceleratorKeyPressedEventHandler::create(Box::new(
+            move |_sender: Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller>,
+                  args: Option<ICoreWebView2AcceleratorKeyPressedEventArgs>| {
+                let Some(args) = args else {
+                    return Ok(());
+                };
+                let mut vk: u32 = 0;
+                unsafe { args.VirtualKey(&mut vk)?; }
+
+                // F5：屏蔽刷新
+                if vk == VK_F5 {
+                    unsafe { args.SetHandled(true)?; }
+                    return Ok(());
+                }
+
+                // Ctrl 按着吗？（GetAsyncKeyState 读的是全局状态，任何线程都准）
+                let ctrl = unsafe { (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0 };
+                if !ctrl {
+                    return Ok(());
+                }
+                let key = vk as i32;
+                if key != VK_F && key != VK_H && key != VK_R && key != VK_P {
+                    return Ok(());
+                }
+                // 拦下浏览器保留键 → 渲染器收不到了，得自己通知前端
+                unsafe { args.SetHandled(true)?; }
+                if key == VK_F || key == VK_H {
+                    // 查找 / 替换：payload = 是否带替换框
+                    use tauri::Emitter;
+                    let _ = win_emit.emit("vmd-find", key == VK_H);
+                }
+                // Ctrl+R（刷新）/ Ctrl+P（打印）就是单纯要拦掉，不用通知前端
+                Ok(())
+            },
+        ));
+        unsafe {
+            let controller = webview.controller();
+            let mut token: i64 = 0;
+            if let Err(e) = controller.add_AcceleratorKeyPressed(&handler, &mut token) {
+                eprintln!("[vmd] add_AcceleratorKeyPressed 失败：{e}");
+            }
+        }
+    });
+}
+
 /// 注册 / 取消文件关联（.md / .markdown 用 VMD 打开）
 #[tauri::command]
 fn set_file_association(enable: bool) -> Result<(), String> {
@@ -419,6 +495,7 @@ fn set_window_title(window: tauri::WebviewWindow, title: String) {
 fn close_window(window: tauri::WebviewWindow) {
     // 用 destroy() 而不是 close()：close() 会再发一次 CloseRequested，
     // 又被拦截住，窗口就永远关不掉了。
+    eprintln!("[vmd] close_window → destroy");
     let _ = window.destroy();
 }
 
@@ -502,6 +579,54 @@ fn shell_menu_status() -> bool {
     {
         false
     }
+}
+
+/// 给当前实例抢一个"槽位"（0 = 第一个实例，1 = 第二个，以此类推）
+///
+/// **为什么需要槽位**：WebView2 的用户数据目录（UDF）不能跨进程共用 ——
+/// 共用时 WebView2 会把两个实例挂到**同一个 browser process** 上，
+/// 后启动的那个实例收不到键盘输入（症状：进编辑模式打不了字）。
+/// 所以每个实例必须用自己的 UDF，槽位就是用来区分的。
+///
+/// 用命名互斥体实现：进程退出（哪怕是崩溃）时系统自动关闭句柄 → 名字消失 →
+/// 下次启动又能拿到 0 号槽，不会像"PID 命名目录"那样每次留一堆垃圾。
+#[cfg(target_os = "windows")]
+fn claim_instance_slot() -> u32 {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::{HSTRING, PCWSTR};
+
+    const MAX_SLOTS: u32 = 64;
+    for i in 0..MAX_SLOTS {
+        let name = HSTRING::from(format!("Local\\VMD.instance.{i}"));
+        let handle = match unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) } {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            // 这个槽位被别人占了 → 试下一个
+            unsafe { let _ = CloseHandle(handle); };
+            continue;
+        }
+        // 抢到了。句柄**故意不关**：进程活着它就在，进程死了系统会收走
+        // （这样别的实例才知道这个槽位还占着）。
+        return i;
+    }
+    0
+}
+
+/// 当前实例用的 WebView2 用户数据目录
+///
+/// 每个实例一个目录 —— 见 `claim_instance_slot()` 的说明。
+/// 放在 `%LOCALAPPDATA%\vmd\<槽位>\\` 下面（而不是默认的
+/// `%LOCALAPPDATA%\com.vmd.app\`），免得跟别的程序撞车，也跟 identifier 解耦。
+///
+/// ⚠️ 注意：Tauri 传下去的是**根目录**，Chromium 会在里面再自己建一层 `EBWebView`
+/// —— 所以真正用到的 UDF 是 `%LOCALAPPDATA%\vmd\<槽位>\EBWebView`。
+#[cfg(target_os = "windows")]
+fn instance_data_directory(slot: u32) -> Option<std::path::PathBuf> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    Some(std::path::PathBuf::from(base).join("vmd").join((slot + 1).to_string()))
 }
 
 /// 设置窗口 + WebView2 的背景色（消除启动白闪；主题切换时也要跟着变，否则会有色差）
@@ -689,6 +814,12 @@ mod tests {
     }
 }
 
+/// 最近一次“放行”的导航 URL
+///
+/// 用来识别“刷新”：刷新（F5 / Ctrl+R）也是一次导航，而且 URL 和当前页面一模一样。
+/// 页内锚点跳转（#xxx）URL 不一样，不会被误伤。
+static LAST_NAV_URL: Mutex<String> = Mutex::new(String::new());
+
 fn main() {
     // 启动时读设置：窗口底色、WebView2 背景色、前端首帧配色都要用它，必须在建窗口之前就知道。
     // 设置的是"跟随系统"时，才退回读注册表的系统主题。
@@ -734,15 +865,36 @@ fn main() {
             #[cfg(target_os = "windows")]
             {
                 let h = app.handle().clone();
+                // 抢一个实例槽位 —— 每个实例必须用自己的 WebView2 UDF，
+                // 共用会挂到同一个 browser process 上，后启动的那个就收不到键盘输入
+                let slot = claim_instance_slot();
                 // 自己创建主窗口（tauri.conf.json 里是 "create": false）：
                 // 这样窗口底色和 WebView2 的 DefaultBackgroundColor 能在创建的那一刻
                 // 就设成用户设置的主题色 —— 否则会先闪一下别的颜色再切过来。
                 if let Some(cfg) = app.config().app.windows.iter().find(|w| w.label == "main").cloned() {
-                    let win = tauri::WebviewWindowBuilder::from_config(app.handle(), &cfg)?
+                    let mut builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &cfg)?
                         .background_color(bg_color)
                         // 关掉 wry 自带的拖放处理：它注册在 WebView2 的子窗口上，
                         // 拿不到 CF_HDROP 时会显示"禁止"光标。我们自己接管（见 drop.rs）。
-                        .disable_drag_drop_handler()
+                        .disable_drag_drop_handler();
+                    // 每个实例用自己的 WebView2 UDF —— 共用会挂到同一个 browser process 上，
+                    // 后启动的那个实例就收不到键盘输入（进编辑模式打不了字）
+                    if let Some(dir) = instance_data_directory(slot) {
+                        builder = builder.data_directory(dir);
+                    }
+                    let win = builder
+                        // 拦掉“刷新”：刷新 = 整个页面重新加载 = 编辑区里没保存的内容全丢，
+                        // 而且不会问用户。判断方式：导航目标和当前页面完全同址 → 那就是刷新。
+                        .on_navigation(|url| {
+                            let mut last = LAST_NAV_URL.lock().unwrap();
+                            let target = url.as_str().to_string();
+                            if !last.is_empty() && *last == target {
+                                eprintln!("[vmd] 已拦截刷新：{target}");
+                                return false;
+                            }
+                            *last = target;
+                            true
+                        })
                         // 把设置和启动主题告诉前端：前端在首帧绘制前就用它们定配色（见 src/theme.js）
                         .initialization_script(format!(
                             "window.__VMD_SETTINGS__ = {}; window.__VMD_INIT_THEME__ = \"{}\"; window.__VMD_STARTUP__ = {};",
@@ -751,6 +903,8 @@ fn main() {
                         .build()?;
                     // WebView2 首选配色方案：让 prefers-color-scheme 跟系统一致
                     let _ = apply_webview_color_scheme(&win, sys_theme);
+                    // 屏蔽 F5 刷新（页面上没保存的内容不能因为一下 F5 就没了）
+                    install_reload_blocker(&win);
                     // 自己接管文件拖放（wry 那套在非 shell 来源拖文件时会显示"禁止"光标）
                     crate::drop::install(app.handle(), &win);
                     // 拦截关闭：先问前端"要不要保存"，前端确认后调 close_window 真正关窗。
@@ -761,6 +915,7 @@ fn main() {
                         win.on_window_event(move |event| {
                             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                                 api.prevent_close();   // 先挡住，别真关
+                                eprintln!("[vmd] CloseRequested → 通知前端询问是否保存");
                                 let _ = win2.emit("vmd-close-requested", ());
                             }
                         });

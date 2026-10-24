@@ -507,6 +507,97 @@ editor.addEventListener('input', () => {
     updateFilename();
     if (renderTimer) clearTimeout(renderTimer);
     renderTimer = setTimeout(renderPreview, 100);
+    // 查找栏开着时文本变了 → 匹配位置也跟着变，重算 + 重画高亮
+    if (findBar && findBar.classList.contains('open')) {
+        collectMatches();
+        renderFindHighlights();
+    }
+});
+
+// ============ 编辑区：Tab 键插入缩进 ============
+
+/**
+ * 手动标记"内容被改过了"。
+ *
+ * 直接改 `editor.value` 不会触发 input 事件 → `dirty` 不会置位、标题栏不显示 ●，
+ * 所以程序改完内容（右键菜单的加粗/插入链接、Tab 缩进）都要手动叫一下，
+ * 否则关窗口时静默丢改动。
+ */
+function markEdited() {
+    dirty = true;
+    updateFilename();
+}
+
+// textarea 的默认行为是"按 Tab 把焦点移走" —— 写 markdown 嵌套列表时想按 Tab
+// 缩进，结果焦点跳到工具栏按钮上去了。这里改成插缩进（Shift+Tab 反缩进）。
+const TAB_SIZE = 2;   // markdown 嵌套列表用 2 空格（4 空格会被 CommonMark 当成代码块）
+
+/**
+ * 替换选区里的内容，并且**保住原生撤销栈**（一次 Ctrl+Z 能整体撤销这次缩进）。
+ *
+ * 关键：用 `document.execCommand('insertText')` 而不是直接改 `editor.value` ——
+ * 直接改 value 会把浏览器的撤销历史冲掉（一下要按十几次 Ctrl+Z 才回得去）。
+ * 这个 API 虽然废弃了，但目前是唯一能保留 textarea 撤销栈的办法。
+ */
+function replaceSelectionKeepingUndo(text, selStart, selEnd) {
+    editor.focus();
+    editor.setSelectionRange(selStart, selEnd);
+    const before = editor.value;
+    let ok = false;
+    try {
+        ok = document.execCommand('insertText', false, text);
+    } catch (e) {
+        ok = false;
+    }
+    if (ok && editor.value !== before) {
+        // execCommand 一般会触发 input 事件（dirty / 预览刷新自动搞定）；
+        // 万一没触发就手动补一下 —— 宁可重复调用也不能漏掉 dirty
+        markEdited();
+        return;
+    }
+    // 回退：直接改 value（撤销栈断了，但功能得能用）
+    const after = editor.value.slice(0, selStart) + text + editor.value.slice(selEnd);
+    if (after === editor.value) return;      // 什么都没变（比如反缩进时行首没空白）
+    editor.value = after;
+    editor.setSelectionRange(selStart, selStart + text.length);
+    markEdited();
+}
+
+editor.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab' || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (editor.readOnly) return;              // 只读模式不改内容（让 Tab 正常移焦点）
+    e.preventDefault();
+
+    const value = editor.value;
+    const start = editor.selectionStart;
+    const end = editor.selectionEnd;
+    const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+    const outdent = e.shiftKey;
+
+    if (value.slice(start, end).includes('\n')) {
+        // 选区跨多行 → 整行缩进 / 反缩进
+        const nl = value.indexOf('\n', end);
+        const blockEnd = nl === -1 ? value.length : nl;
+        const block = value.slice(lineStart, blockEnd);
+        const out = block.split('\n').map(line => {
+            if (!outdent) return ' '.repeat(TAB_SIZE) + line;
+            const m = line.match(/^[ \t]+/);
+            if (!m) return line;
+            if (m[0][0] === '\t') return line.slice(1);
+            return line.slice(Math.min(TAB_SIZE, m[0].length));
+        }).join('\n');
+        replaceSelectionKeepingUndo(out, lineStart, blockEnd);
+        editor.setSelectionRange(lineStart, lineStart + out.length);   // 缩完仍然整块选中
+    } else if (outdent) {
+        // 单行反缩进：删掉光标前面（且在行首之后）连续的空白
+        const m = value.slice(lineStart, start).match(/[ \t]+$/);
+        if (!m) return;
+        const cut = m[0][0] === '\t' ? 1 : Math.min(TAB_SIZE, m[0].length);
+        replaceSelectionKeepingUndo('', start - cut, start);
+    } else {
+        // 光标处插缩进（选中了文字就替换掉）
+        replaceSelectionKeepingUndo(' '.repeat(TAB_SIZE), start, end);
+    }
 });
 
 // 编辑区滚动 → 同步到预览区
@@ -545,6 +636,9 @@ function syncPreviewToEditor() {
 }
 
 editor.addEventListener('scroll', () => {
+    // 高亮层要跟着滚（单独一个 listener：上面的滚动同步有 syncing 锁，
+    // 锁住的时候高亮也得跟）
+    syncHlScroll();
     if (syncing || !previewScroll) return;
     lockSync();
     syncPreviewToEditor();
@@ -1257,6 +1351,8 @@ function renderToc() {
         tocList.appendChild(div);
         lastId = h.id;
     });
+    // 目录刚重建（内联高亮样式没了）→ 把当前章节的高亮补回来
+    updateTocHighlight();
 }
 
 function slugify(s) {
@@ -1346,6 +1442,11 @@ function updateFilename() {
         lastWindowTitle = title;
         invoke('set_window_title', { title }).catch(() => { /* 不在 Tauri 里跑时忽略 */ });
     }
+    // 自动重载按钮的可用状态跟着"文件在不在磁盘上 / 有没有未保存的修改"走
+    // （dirty、currentFile 的每次变化都会走到这里）
+    updateAutoReloadBtn();
+    // 右下角的光标位置 / 行数 / 字数
+    scheduleEditorStatus();
 }
 
 function escapeHtml(s) {
@@ -1365,6 +1466,11 @@ function setEditMode(on) {
     document.documentElement.classList.toggle('read-mode', !on);
     segBtns.forEach(b => b.classList.toggle('is-active', (b.dataset.mode === 'edit') === on));
     applyWidths();
+    // 查找栏开着时，目标区域跟着模式变（编辑→查源码，阅读→查正文）
+    const fb = document.getElementById('find-bar');
+    if (fb && fb.classList.contains('open')) {
+        openFindBar(findMode === 'replace');
+    }
 }
 
 segBtns.forEach(btn => {
@@ -1431,11 +1537,16 @@ document.getElementById('btn-new').addEventListener('click', async () => {
     currentFile = null;
     dirty = false;
     fileStamp = null;
+    fileMissing = false;
     setExternalChange(false);
-    // 新建是要写字的 → 自动重载（只读）没意义，顺手关掉
+    // 新建的文件还没保存 → 自动重载没有可盯的磁盘版本，直接关掉（按钮也会变成置灰）
     if (autoReload) setAutoReload(false);
+    // 新建文件是要写字的 → 阅读模式里没法写，自动切到编辑模式
+    // （只改"当前模式"，不覆盖设置里的"默认模式"）
+    if (!editMode) setEditMode(true);
     renderPreview();
     updateFilename();
+    editor.focus();   // 光标直接落在编辑区，接着就能打字
 });
 document.getElementById('btn-open').addEventListener('click', openFile);
 document.getElementById('btn-save').addEventListener('click', saveFile);
@@ -1457,6 +1568,24 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && modalResolve) closeDialog(false);
 });
 
+// 光标移动 → 更新编辑区右下角的状态（行号 / 字数）
+document.addEventListener('selectionchange', () => {
+    if (document.activeElement === editor) scheduleEditorStatus();
+});
+
+// 屏蔽刷新键：F5 / Ctrl+R / Ctrl+Shift+R
+//
+// 刷新页面 = 整个 WebView 重新加载 → 编辑区里没保存的内容直接没了，
+// 而且没有"要不要保存"的询问。属于数据丢失级别的操作，直接拦掉。
+// （Rust 侧还有一道 WebView2 的拦截，这里是双保险。）
+document.addEventListener('keydown', (e) => {
+    const k = e.key;
+    if (k === 'F5' || ((e.ctrlKey || e.metaKey) && (k === 'r' || k === 'R'))) {
+        e.preventDefault();
+        e.stopPropagation();
+    }
+}, true);   // 捕获阶段：抢在别的处理前面
+
 // 文字缩放快捷键（跟浏览器一样）：Ctrl + / - / 0
 document.addEventListener('keydown', (e) => {
     if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
@@ -1477,6 +1606,7 @@ async function openPath(path) {
     editor.value = content;
     currentFile = path;
     dirty = false;
+    fileMissing = false;
     renderPreview();
     updateFilename();
     setExternalChange(false);       // 换了文件，之前的"外部已修改"标记作废
@@ -1516,6 +1646,7 @@ async function saveFile() {
     try {
         await invoke('write_file', { path: currentFile, content: editor.value });
         dirty = false;
+        fileMissing = false;
         updateFilename();
         // 存回去的内容就是当前内容了，外部修改的问题随之解决
         setExternalChange(false);
@@ -1538,6 +1669,7 @@ async function saveAsFile() {
         await invoke('write_file', { path, content: editor.value });
         currentFile = path;
         dirty = false;
+        fileMissing = false;
         updateFilename();
         // 另存到新文件：原文件仍然是"被外部改过"的状态，标记要留着
         await recordStamp();
@@ -1547,6 +1679,459 @@ async function saveAsFile() {
         alert('保存失败：' + e);
         return false;
     }
+}
+
+// ============ 查找 / 替换（Ctrl+F / Ctrl+H）============
+//
+// **按区域分开**（这是关键）：
+//   - 编辑模式 → 查**源码**（编辑区），可以替换
+//   - 阅读模式 → 查**正文**（预览区），只查不换（正文没有"源码"可改）
+// 查找栏会挪到当前目标区域里，位置永远跟着区域走。
+//
+// 不用浏览器自带的查找栏：它搜的是整个 DOM（源码 + 渲染结果混一起），结果全是噪音。
+
+const findBar = document.getElementById('find-bar');
+const findInput = document.getElementById('find-input');
+const replaceInput = document.getElementById('replace-input');
+const findCountEl = document.getElementById('find-count');
+const findPrevBtn = document.getElementById('find-prev');
+const findNextBtn = document.getElementById('find-next');
+const replaceOneBtn = document.getElementById('replace-one');
+const replaceAllBtn = document.getElementById('replace-all');
+const findCloseBtn = document.getElementById('find-close');
+const findTabFind = document.getElementById('find-tab-find');
+const findTabReplace = document.getElementById('find-tab-replace');
+const editorWrap = document.getElementById('editor-wrap');
+
+// 目标区域：'editor' = 源码（可替换）｜ 'preview' = 正文（只查）
+let findTarget = 'editor';
+// 查找栏内的模式：'find' = 只查找 ｜ 'replace' = 带替换
+let findMode = 'find';
+let findMatches = [];    // editor: 匹配位置；preview: mark 元素
+let findIndex = -1;      // 当前是第几个
+let findTimer = 0;
+
+// ---- 编辑区高亮层（textarea 下面那层）----
+// textarea 未聚焦时**选区是不显示的** → 光靠 setSelectionRange 用户根本看不见匹配在哪。
+// 所以在 textarea 下面叠一层"镜像文本"，只把匹配片段标上背景色。
+const editorHl = document.getElementById('editor-hl');
+
+function escHl(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** 编辑区：重建高亮层（文字跟编辑区完全一致，只把匹配片段包上 <mark>） */
+function renderEditorHighlights() {
+    if (!editorHl) return;
+    const q = findInput ? findInput.value : '';
+    if (!q || !findBar || !findBar.classList.contains('open')) {
+        editorHl.innerHTML = '';
+        return;
+    }
+    const text = editor.value;
+    let html = '';
+    let i = 0;
+    let n = 0;
+    while (true) {
+        const p = text.indexOf(q, i);
+        if (p === -1) break;
+        html += escHl(text.slice(i, p));
+        html += '<mark' + (n === findIndex ? ' class="current"' : '') + '>' + escHl(q) + '</mark>';
+        i = p + q.length;
+        n++;
+    }
+    html += escHl(text.slice(i));
+    editorHl.innerHTML = html;
+    syncHlScroll();
+}
+
+/** 高亮层跟着编辑区滚动 */
+function syncHlScroll() {
+    if (!editorHl) return;
+    editorHl.scrollTop = editor.scrollTop;
+    editorHl.scrollLeft = editor.scrollLeft;
+}
+
+// ---- 预览区高亮：直接改 DOM，把匹配包成 <mark> ----
+
+/** 清掉预览区里所有查找标记（还原成普通文本） */
+function clearPreviewMarks() {
+    const marks = preview.querySelectorAll('mark.vmd-find');
+    for (const m of marks) {
+        const parent = m.parentNode;
+        if (!parent) continue;
+        parent.replaceChild(document.createTextNode(m.textContent), m);
+        parent.normalize();   // 把拆开的文本节点合并回去
+    }
+}
+
+/** 预览区：找出所有匹配并包成 <mark class="vmd-find"> */
+function collectPreviewMatches() {
+    clearPreviewMarks();
+    const q = findInput.value;
+    const hits = [];
+    if (!q) return hits;
+    // 1. 先收集含关键词的文本节点
+    const nodes = [];
+    const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT, {
+        acceptNode: function (node) {
+            if (!node.nodeValue || node.nodeValue.indexOf(q) === -1) return NodeFilter.FILTER_REJECT;
+            let p = node.parentNode;
+            while (p && p !== preview) {
+                const t = p.nodeName;
+                if (t === 'SCRIPT' || t === 'STYLE' || t === 'TEXTAREA') return NodeFilter.FILTER_REJECT;
+                p = p.parentNode;
+            }
+            return NodeFilter.FILTER_ACCEPT;
+        }
+    });
+    let n;
+    while ((n = walker.nextNode())) nodes.push(n);
+    // 2. 逐个切分并包 mark
+    //    ⚠️ 这里必须用 let：循环体里要把 node 换成切分后的尾节点。
+    //       用 const 会抛 “Assignment to constant variable”，而这个异常在
+    //       事件回调里是静默的 → 表现为“明明有匹配，计数却是 0/0”。
+    for (let node of nodes) {
+        let text = node.nodeValue;
+        let i = 0;
+        while (true) {
+            const p = text.indexOf(q, i);
+            if (p === -1) break;
+            const rest = node.splitText(p);          // rest = 匹配那一段
+            const tail = rest.splitText(q.length);   // tail = 后面的内容
+            const mark = document.createElement('mark');
+            mark.className = 'vmd-find';
+            mark.textContent = q;
+            rest.parentNode.replaceChild(mark, rest);
+            hits.push(mark);
+            node = tail;
+            text = tail.nodeValue;
+            i = q.length;
+        }
+    }
+    return hits;
+}
+
+/** 统一入口：按目标区域收集匹配 */
+function collectMatches() {
+    if (findTarget === 'preview') {
+        findMatches = collectPreviewMatches();
+        findIndex = -1;
+        updateFindCount();
+        return;
+    }
+    const q = findInput ? findInput.value : '';
+    findMatches = [];
+    findIndex = -1;
+    if (q) {
+        const text = editor.value;
+        let i = 0;
+        while (true) {
+            const p = text.indexOf(q, i);
+            if (p === -1) break;
+            findMatches.push(p);
+            i = p + q.length;
+            if (findMatches.length >= 50000) break;   // 超大文件别把内存吃光
+        }
+    }
+    updateFindCount();
+}
+
+/** 更新计数显示 */
+function updateFindCount() {
+    const n = findMatches.length;
+    // 还没选中任何一个时也显示 1/N（别显示 0/N，看着像没找到）
+    const cur = findIndex >= 0 ? findIndex + 1 : (n ? 1 : 0);
+    findCountEl.textContent = n ? cur + '/' + n : '0/0';
+    findCountEl.classList.toggle('hit', n > 0);
+}
+
+/**
+ * 跳到第 dir 个匹配（dir=1 下一个，dir=-1 上一个），到头了就循环。
+ *
+ * ⚠️ **不要在这里 focus 编辑区** —— 查找框开着的时候焦点必须留在查找框，
+ * 否则用户刚打一个字焦点就被抢走，后面的话全打不进搜索框了。
+ * 选区可以设（setSelectionRange 不依赖焦点），滚动我们自己来（scrollEditorToPos）。
+ */
+function gotoMatch(dir) {
+    if (!findMatches.length) collectMatches();
+    if (!findMatches.length) return;
+    if (findTarget === 'preview') { gotoPreviewMatch(dir); return; }
+    const start = editor.selectionStart;
+    let idx;
+    if (dir > 0) {
+        idx = findMatches.findIndex(p => p >= start);
+        if (idx === -1) idx = 0;
+    } else {
+        idx = -1;
+        for (let i = findMatches.length - 1; i >= 0; i--) {
+            if (findMatches[i] < start) { idx = i; break; }
+        }
+        if (idx === -1) idx = findMatches.length - 1;
+    }
+    findIndex = idx;
+    const p = findMatches[idx];
+    const q = findInput.value;
+    editor.setSelectionRange(p, p + q.length);
+    updateFindCount();
+    scrollEditorToPos(p);
+    renderEditorHighlights();   // 当前匹配换了个颜色
+}
+
+/** 预览区：跳到第 dir 个匹配 */
+function gotoPreviewMatch(dir) {
+    if (!findMatches.length) return;
+    let idx = findIndex;
+    if (idx < 0) idx = dir > 0 ? 0 : findMatches.length - 1;
+    else idx = (idx + dir + findMatches.length) % findMatches.length;
+    findIndex = idx;
+    for (let i = 0; i < findMatches.length; i++) {
+        findMatches[i].classList.toggle('current', i === idx);
+    }
+    updateFindCount();
+    const m = findMatches[idx];
+    if (m && m.scrollIntoView) m.scrollIntoView({ block: 'center' });
+}
+
+/** 把某个字符位置滚到编辑区可视区域（行高固定，不折行） */
+function scrollEditorToPos(pos) {
+    if (!editorLineHeight) refreshEditorLineHeight();
+    const cs = getComputedStyle(editor);
+    const padTop = parseFloat(cs.paddingTop) || 0;
+    // 光标前的换行数 = 行号
+    let line = 0;
+    for (let i = 0; i < pos; i++) {
+        if (editor.value.charCodeAt(i) === 10) line++;
+    }
+    const y = line * editorLineHeight + padTop;
+    const h = editor.clientHeight;
+    // 不在中间区域就滚过去（已经在眼前就别动）
+    if (y < editor.scrollTop + h * 0.3 || y > editor.scrollTop + h * 0.75) {
+        editor.scrollTop = Math.max(0, y - h * 0.4);
+    }
+}
+
+/** 替换当前这一个匹配（只有源码区能替换） */
+function replaceCurrentMatch() {
+    if (findTarget !== 'editor') return;
+    const q = findInput.value;
+    const rep = replaceInput.value;
+    if (!q) { showToast('先输入要查找的内容', 2200); return; }
+    // 先重算：文本可能已经被改过，findMatches 是旧的
+    collectMatches();
+    if (!findMatches.length) { showToast('没有找到匹配项', 2200); return; }
+    const s = editor.selectionStart, e = editor.selectionEnd;
+    if (editor.value.slice(s, e) !== q) {
+        gotoMatch(1);
+        return;
+    }
+    replaceSelectionKeepingUndo(rep, s, e);
+    collectMatches();
+    if (findMatches.length) gotoMatch(1);
+}
+
+/** 全部替换：算好新全文一次换掉（一次 Ctrl+Z 能整体撤销） */
+function replaceAllMatches() {
+    if (findTarget !== 'editor') return;
+    const q = findInput.value;
+    const rep = replaceInput.value;
+    if (!q) { showToast('先输入要查找的内容', 2200); return; }
+    // 先重算：文本可能已经被改过，findMatches 是旧的
+    collectMatches();
+    // ⚠️ 一个都没匹配上时**不能**往下走 ——
+    //    split(q).join(rep) 会把全文原样写回去，白白污染一次撤销栈，
+    //    而且还会报“已替换 1 处”（之前 findMatches.length || 1 那个兜底搞的）。
+    if (!findMatches.length) { showToast('没有找到匹配项', 2200); return; }
+    const n = findMatches.length;
+    const text = editor.value;
+    const out = text.split(q).join(rep);   // split/join 不把 $& 当特殊字符
+    replaceSelectionKeepingUndo(out, 0, text.length);
+    collectMatches();
+    showToast('已替换 ' + n + ' 处');
+}
+
+/** 查找栏模式：查找 / 替换（同一个栏里切换） */
+function setFindMode(mode) {
+    findMode = mode;
+    if (!findBar) return;
+    findBar.classList.toggle('replace-mode', mode === 'replace');
+    if (findTabFind) findTabFind.classList.toggle('is-active', mode === 'find');
+    if (findTabReplace) findTabReplace.classList.toggle('is-active', mode === 'replace');
+    // 查正文（阅读模式）时没有"源码"可改 → 替换页签禁用
+    const canReplace = findTarget === 'editor';
+    if (findTabReplace) {
+        findTabReplace.disabled = !canReplace;
+        findTabReplace.title = canReplace ? '切换到替换' : '阅读模式下只能查找，不能替换';
+    }
+    if (findInput) {
+        findInput.placeholder = findTarget === 'editor' ? '查找源码' : '查找正文';
+    }
+}
+
+/**
+ * 把查找栏定位到当前目标区域上方。
+ *
+ * ⚠️ 查找栏**不能**直接放进目标区域里 —— 预览区（#preview-wrap）自己就是滚动容器，
+ *    放进去的话查找栏会跟着正文一起滚走，滚到后面就看不见了。
+ * 所以它固定放在 #content（不滚动）里，位置按目标区域算。
+ */
+function placeFindBar() {
+    if (!findBar) return;
+    const base = document.getElementById('content');
+    const host = findTarget === 'preview' ? previewScroll : editorWrap;
+    if (!base || !host) return;
+    if (findBar.parentNode !== base) base.appendChild(findBar);
+    // offsetLeft / offsetWidth 是相对 offsetParent（#content 是 relative）算的
+    findBar.style.left = (host.offsetLeft + 8) + 'px';
+    findBar.style.width = Math.max(120, host.offsetWidth - 16) + 'px';
+}
+
+/** 打开查找栏（withReplace=true 时直接进替换模式） */
+function openFindBar(withReplace) {
+    if (!findBar) return;
+    // 目标跟着当前模式走：编辑模式查源码，阅读模式查正文
+    findTarget = editMode ? 'editor' : 'preview';
+    placeFindBar();
+    setFindMode(withReplace && findTarget === 'editor' ? 'replace' : 'find');
+    findBar.classList.add('open');
+    placeFindBar();   // 位置得跟着目标区域（拖分隔条改了宽度也要跟上）
+    // 选中了文字就拿来当搜索词（VS Code 的行为）
+    if (findTarget === 'editor') {
+        const sel = editor.value.slice(editor.selectionStart, editor.selectionEnd);
+        if (sel && !sel.includes('\n') && document.activeElement !== findInput) {
+            findInput.value = sel;
+        }
+    }
+    collectMatches();
+    if (findTarget === 'preview') {
+        if (findMatches.length) gotoPreviewMatch(1);
+    } else {
+        renderEditorHighlights();
+    }
+    // 焦点：替换模式进替换框，否则进查找框
+    if (findMode === 'replace' && replaceInput) {
+        replaceInput.focus();
+        replaceInput.select();
+    } else {
+        findInput.focus();
+        findInput.select();
+    }
+}
+
+/** 关闭查找栏 */
+function closeFindBar() {
+    if (!findBar) return;
+    findBar.classList.remove('open');
+    if (editorHl) editorHl.innerHTML = '';
+    clearPreviewMarks();
+    if (editMode) editor.focus();
+}
+
+if (findBar) {
+    // Rust 层拦下了 Ctrl+F / Ctrl+H（它们是**浏览器保留键**，Chromium 会在把按键
+    // 交给渲染器之前就自己处理掉 → 前端的 keydown 压根收不到）。
+    // 拦掉之后由它发事件过来，通知我们打开查找栏（payload = 是否带替换框）。
+    if (window.__TAURI__ && window.__TAURI__.event) {
+        window.__TAURI__.event.listen('vmd-find', (e) => {
+            openFindBar(!!(e && e.payload));
+        });
+    }
+    // 页签：查找 ↔ 替换（同一个栏里切）
+    if (findTabFind) {
+        findTabFind.addEventListener('click', () => {
+            setFindMode('find');
+            findInput.focus();
+        });
+    }
+    if (findTabReplace) {
+        findTabReplace.addEventListener('click', () => {
+            if (findTabReplace.disabled) return;
+            setFindMode('replace');
+            replaceInput.focus();
+        });
+    }
+    findInput.addEventListener('input', () => {
+        clearTimeout(findTimer);
+        findTimer = setTimeout(() => {
+            collectMatches();
+            if (findMatches.length) gotoMatch(1);
+            else if (findTarget === 'editor') renderEditorHighlights();
+            // 保险：焦点别跑。查找的时候焦点必须留在查找框里，
+            // 否则用户刚打一个字，后面的话全打不进去。
+            if (document.activeElement !== findInput && document.activeElement !== replaceInput) {
+                findInput.focus();
+            }
+        }, 120);
+    });
+    findInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            gotoMatch(e.shiftKey ? -1 : 1);
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            closeFindBar();
+        }
+    });
+    replaceInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            if (e.ctrlKey || e.altKey) replaceAllMatches();
+            else replaceCurrentMatch();
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            closeFindBar();
+        }
+    });
+    findPrevBtn.addEventListener('click', () => gotoMatch(-1));
+    findNextBtn.addEventListener('click', () => gotoMatch(1));
+    replaceOneBtn.addEventListener('click', replaceCurrentMatch);
+    replaceAllBtn.addEventListener('click', replaceAllMatches);
+    findCloseBtn.addEventListener('click', closeFindBar);
+    // 点按钮不要抢走查找框的焦点（mousedown 默认会把焦点移到按钮上）
+    [findPrevBtn, findNextBtn, replaceOneBtn, replaceAllBtn, findCloseBtn, findTabFind, findTabReplace].forEach(b => {
+        b.addEventListener('mousedown', (e) => e.preventDefault());
+    });
+}
+
+// ============ 编辑区状态（光标行 / 总行数 / 字数）============
+// 浮在编辑区右下角，不占工具栏宽度（工具栏的宽度预算很紧）。
+let statusRaf = 0;
+let docStatsCache = { text: null, lines: 1, chars: 0 };
+
+function getDocStats(text) {
+    if (docStatsCache.text === text) return docStatsCache;
+    let lines = 1, chars = 0;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        if (c === 10) lines++;
+        else if (c !== 32 && c !== 9 && c !== 13) chars++;   // 空白不算字数
+    }
+    docStatsCache = { text, lines, chars };
+    return docStatsCache;
+}
+
+function updateEditorStatus() {
+    const el = document.getElementById('editor-status');
+    if (!el) return;
+    const text = editor.value;
+    const stats = getDocStats(text);
+    const pos = editor.selectionStart;
+    let line = 1;
+    for (let i = 0; i < pos; i++) {
+        if (text.charCodeAt(i) === 10) line++;
+    }
+    el.textContent = '行 ' + line + '/' + stats.lines + ' · ' + stats.chars + ' 字';
+}
+
+/** 光标一动就更新状态栏（rAF 节流，不然拖选会卡） */
+function scheduleEditorStatus() {
+    if (statusRaf) return;
+    statusRaf = requestAnimationFrame(() => {
+        statusRaf = 0;
+        updateEditorStatus();
+    });
 }
 
 // ============ 外部修改检测 ============
@@ -1595,12 +2180,21 @@ async function checkExternalChange() {
     if (!now) {
         // 文件被删了：连续两轮都不在才算真删了（有些编辑器保存是"先删后写"）
         deleteRounds++;
-        if (deleteRounds >= 2) {
+        if (deleteRounds >= 2 && !fileMissing) {
+            fileMissing = true;
+            // 文件都没了 → 自动重载没东西可盯，关掉（编辑器恢复可编辑，别卡在只读）
+            if (autoReload) setAutoReload(false);
+            updateAutoReloadBtn();
             showToast('文件已被删除', 3200);
         }
         return;
     }
     deleteRounds = 0;
+    // 文件又回来了（比如用户自己存回去了）
+    if (fileMissing) {
+        fileMissing = false;
+        updateAutoReloadBtn();
+    }
     if (now.mtime === fileStamp.mtime && now.size === fileStamp.size) return;
 
     // 有变化了
@@ -1703,6 +2297,7 @@ function applyExternalContent(content, tip) {
     const pvScroll = previewScroll ? previewScroll.scrollTop : 0;
     editor.value = content;
     dirty = false;
+    fileMissing = false;
     try { editor.setSelectionRange(selStart, selEnd); } catch (e) { /* 忽略 */ }
     editor.scrollTop = edScroll;
     if (previewScroll) previewScroll.scrollTop = pvScroll;
@@ -1717,24 +2312,69 @@ function applyExternalContent(content, tip) {
 
 // 自动重载总开关
 let autoReload = false;
+// 当前文件在磁盘上已经不存在了（被外部删掉）—— 这种状态下自动重载没意义
+let fileMissing = false;
 
-/** 开关切换。开启时如果编辑器里有未保存的修改，先问一句 */
+/**
+ * 自动重载现在能不能用？
+ *
+ * 自动重载的本质是"盯着磁盘上那个文件，有变化就把编辑区内容换掉"，
+ * 所以前提有两个：
+ *   1. 文件已经保存在磁盘上（新建的、还没保存的文件没有磁盘版本可盯）
+ *   2. 编辑区里没有未保存的修改（有的话，一次刷新就把这些改动冲掉了）
+ * 这两种情况下自动重载都是伪命题 → 按钮置灰，不给开。
+ */
+function autoReloadUsable() {
+    return !!currentFile && !dirty && !fileMissing;
+}
+
+/** 自动重载不可用的原因（短句，给 tooltip 用） */
+function autoReloadBlockedReason() {
+    if (!currentFile) return '当前没有打开的文件';
+    if (fileMissing) return '当前文件已被删除';
+    if (dirty) return '编辑区里有未保存的修改';
+    return '';
+}
+
+/** 点按钮时弹的完整提示（告诉用户接下来该干什么） */
+function autoReloadBlockedTip() {
+    if (!currentFile) return '当前没有打开的文件，保存后才能用自动重载';
+    if (fileMissing) return '当前文件已被删除，自动重载暂时不可用';
+    if (dirty) return '编辑区里有未保存的修改，保存后才能用自动重载';
+    return '自动重载暂时不可用';
+}
+
+/** 同步自动重载按钮的可用状态（不可用时置灰，tooltip 说明为什么） */
+function updateAutoReloadBtn() {
+    const btn = document.getElementById('btn-auto-reload');
+    if (!btn) return;
+    // 状态已经不成立了还开着 → 关掉（否则文件没了，编辑器会一直卡在只读）
+    if (autoReload && !autoReloadUsable()) autoReload = false;
+    const usable = autoReloadUsable();
+    btn.classList.toggle('disabled', !usable);
+    btn.classList.toggle('on', autoReload);
+    let title;
+    if (autoReload) {
+        title = '自动重载已开启：文件被外部修改时自动更新内容（编辑器为只读，点此关闭）';
+    } else if (!usable) {
+        title = '自动重载：文件被外部修改时自动更新内容（' + autoReloadBlockedReason() + '，暂时不可用）';
+    } else {
+        title = '自动重载：文件被外部修改时自动更新内容（开启后编辑器为只读）';
+    }
+    if (btn.title !== title) btn.title = title;
+    applyReadOnly();
+}
+
+/** 开关切换 */
 async function toggleAutoReload() {
     if (autoReload) {
         setAutoReload(false);
         return;
     }
-    if (dirty) {
-        // 有未保存的修改 → 开启会切成只读（内容还在，但改不了也存不了）→ 确认一下
-        const ok = await showDialog({
-            title: '开启自动重载？',
-            body: '<div>当前编辑区里有未保存的修改。</div>'
-                + '<div class="modal-warn">开启自动重载后编辑器会变成只读：不能再编辑，也不能保存。'
-                + '当前内容会留在屏幕上，但文件一旦被外部程序修改，这些修改就会被磁盘上的内容覆盖。</div>',
-            okText: '仍然开启',
-            cancelText: '取消',
-        });
-        if (!ok) return;
+    if (!autoReloadUsable()) {
+        // 按钮虽然置灰了，点一下还是给个说法（比默默不响应好）
+        showToast(autoReloadBlockedTip(), 2600);
+        return;
     }
     setAutoReload(true);
 }
@@ -1742,21 +2382,20 @@ async function toggleAutoReload() {
 /** 设置自动重载状态（并同步界面） */
 function setAutoReload(on) {
     autoReload = !!on;
-    const btn = document.getElementById('btn-auto-reload');
-    if (btn) {
-        btn.classList.toggle('on', autoReload);
-        btn.title = autoReload
-            ? '自动重载已开启：文件被外部修改时自动更新内容（编辑器为只读，点此关闭）'
-            : '自动重载：文件被外部修改时自动更新内容（开启后编辑器为只读）';
-    }
-    applyReadOnly();
+    updateAutoReloadBtn();
     showToast(autoReload ? '自动重载已开启（只读）' : '自动重载已关闭', 2200);
 }
 
 /** 自动重载开着时，编辑器变只读（防的是自动重载把用户正在写的内容冲掉） */
 function applyReadOnly() {
     const readOnly = autoReload && !!currentFile;
-    editor.readOnly = readOnly;
+    // 值没变就别写 DOM（updateFilename 每次输入都会走到这里）
+    if (editor.readOnly !== readOnly) editor.readOnly = readOnly;
+    // 只读时「保存 / 另存为」置灰（点了也存不了）
+    ['btn-save', 'btn-save-as'].forEach(id => {
+        const b = document.getElementById(id);
+        if (b) b.classList.toggle('disabled', readOnly);
+    });
 }
 
 // ============ 文字缩放 ============
@@ -2349,28 +2988,55 @@ async function exportPdf() {
 
 document.addEventListener('keydown', (e) => {
     const ctrl = e.ctrlKey || e.metaKey;
-    if (ctrl && e.key === 'o') { e.preventDefault(); openFile(); }
-    else if (ctrl && e.shiftKey && e.key === 's') { e.preventDefault(); saveAsFile(); }
-    else if (ctrl && e.shiftKey && e.key === 'e') { e.preventDefault(); exportPdf(); }
-    else if (ctrl && !e.shiftKey && e.key === 's') { e.preventDefault(); saveFile(); }
-    else if (ctrl && e.key === 'n') { e.preventDefault(); document.getElementById('btn-new').click(); }
+    // ⚠️ 按住 Shift 时 e.key 是**大写字母**（Ctrl+Shift+S 的 key 是 'S' 不是 's'），
+    //    所以这里必须统一转小写再比 —— 不然 Ctrl+Shift+S / Ctrl+Shift+E / Ctrl+Shift+H
+    //    一个都触发不了。
+    const k = (e.key || '').toLowerCase();
+    if (ctrl && k === 'o') { e.preventDefault(); openFile(); }
+    else if (ctrl && e.shiftKey && k === 's') { e.preventDefault(); saveAsFile(); }
+    else if (ctrl && e.shiftKey && k === 'e') { e.preventDefault(); exportPdf(); }
+    else if (ctrl && !e.shiftKey && k === 's') { e.preventDefault(); saveFile(); }
+    else if (ctrl && k === 'n') { e.preventDefault(); document.getElementById('btn-new').click(); }
+    else if (ctrl && !e.shiftKey && k === 'f') { e.preventDefault(); openFindBar(false); }
+    else if (ctrl && e.shiftKey && k === 'h') { e.preventDefault(); openFindBar(true); }
 });
 
 // ============ TOC 高亮 ============
+//
+// ⚠️ 滚动的是 **#preview-wrap**，#preview 那个 article 高度自适应、自己不滚动 ——
+//    scroll 事件必须挂在 previewScroll 上（挂到 preview 上等于永远不触发）。
+let tocHighlightPending = false;
 
-preview.addEventListener('scroll', () => {
+/** 标出当前读到的章节（预览区滚到哪个标题下面了） */
+function updateTocHighlight() {
+    if (!previewScroll) return;
     const headings = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
+    if (headings.length === 0) return;
+    const boxTop = previewScroll.getBoundingClientRect().top;
     let current = null;
     headings.forEach(h => {
-        if (h.getBoundingClientRect().top < 200) current = h;
+        // 标题线滚到容器顶部往下 100px 以内 → 就算读到这个章节了
+        if (h.getBoundingClientRect().top - boxTop < 100) current = h;
     });
-    if (!current) return;
+    if (!current) return;   // 还没到第一个标题 → 保持原来的高亮
     tocList.querySelectorAll('.toc-item').forEach(el => {
         const active = el.dataset.id === current.id;
         el.style.background = active ? 'var(--bg-elevated)' : 'transparent';
         el.style.color = active ? 'var(--link)' : '';
     });
-});
+}
+
+/** 滚动时刷新高亮：一帧最多算一次（编辑区滚动会带着预览区滚，事件很密） */
+function scheduleTocHighlight() {
+    if (tocHighlightPending) return;
+    tocHighlightPending = true;
+    requestAnimationFrame(() => {
+        tocHighlightPending = false;
+        updateTocHighlight();
+    });
+}
+
+if (previewScroll) previewScroll.addEventListener('scroll', scheduleTocHighlight, { passive: true });
 
 // ============ 面板拖拽调整宽度 ============
 // 用 pointer capture + 不调 preventDefault，这样既不丢事件，浏览器也不阻塞默认行为。
@@ -2399,7 +3065,9 @@ function applyWidths(clearEditor) {
         editorEl.style.width = '';
         editorW = 0;
     }
-
+    // 查找栏开着时，位置/宽度要跟着目标区域走
+    const fb = document.getElementById('find-bar');
+    if (fb && fb.classList.contains('open')) placeFindBar();
 }
 
 function setupSplitter(splitter, onMove) {
@@ -2471,6 +3139,9 @@ splitPreview.addEventListener('dblclick', () => {
 });
 
 window.addEventListener('resize', () => {
+    // 窗口大小变了 → 查找栏的位置/宽度也得重算
+    const fb = document.getElementById('find-bar');
+    if (fb && fb.classList.contains('open')) placeFindBar();
     // 窗口缩放时保持 tocW 和 editorW，只让 preview 自适应
     if (editorW > 0) editorEl.style.width = editorW + 'px';
     tocEl.style.width = tocW + 'px';
@@ -2751,10 +3422,7 @@ if (window.__TAURI__ && window.__TAURI__.event) {
 
     // 直接改 editor.value 不会触发 input 事件 → dirty 标记要手动打，
     // 否则标题栏不显示 ●，用户以为没改就关窗口，改动静默丢失
-    function markEdited() {
-        dirty = true;
-        updateFilename();
-    }
+    // （markEdited 现在是模块级的函数，见上方定义）
 
     // textarea 工具函数
     function wrapSelection(text) {

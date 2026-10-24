@@ -78,7 +78,12 @@
             <div class="splitter" id="split-toc" title="拖动调整宽度（双击重置）"></div>
 
             <main id="editor-wrap">
+                <!-- 查找高亮层：在 textarea 下面，内容跟 textarea 完全一样，
+                     只把匹配片段标成背景色（textarea 未聚焦时选区不显示，只能靠它） -->
+                <div id="editor-hl" aria-hidden="true"></div>
                 <textarea id="editor" spellcheck="false" wrap="off" placeholder="在此输入 Markdown..."></textarea>
+                <!-- 编辑区右下角：光标位置 / 行数 / 字数 -->
+                <div id="editor-status" class="editor-status"></div>
             </main>
 
             <div class="splitter" id="split-preview" title="拖动调整宽度（双击重置）"></div>
@@ -86,6 +91,28 @@
             <section id="preview-wrap">
                 <article id="preview"></article>
             </section>
+
+            <!-- 查找 / 替换浮层（Ctrl+F / Ctrl+H）
+                 运行时会被挪到当前目标区域里（编辑区 or 预览区），
+                 所以两个区域都能用，且位置永远跟着目标区。 -->
+            <div id="find-bar" class="find-bar">
+                <div class="find-row">
+                    <div class="find-tabs">
+                        <button id="find-tab-find" class="find-tab is-active" title="查找">查找</button>
+                        <button id="find-tab-replace" class="find-tab" title="替换">替换</button>
+                    </div>
+                    <input id="find-input" type="text" placeholder="查找源码" spellcheck="false">
+                    <span id="find-count" class="find-count">0/0</span>
+                    <button id="find-prev" class="find-btn" title="上一个 (Shift+Enter)">↑</button>
+                    <button id="find-next" class="find-btn" title="下一个 (Enter)">↓</button>
+                    <button id="find-close" class="find-btn" title="关闭 (Esc)">✕</button>
+                </div>
+                <div class="find-row find-row-replace">
+                    <input id="replace-input" type="text" placeholder="替换为" spellcheck="false">
+                    <button id="replace-one" class="find-btn find-btn-wide" title="替换 (Enter)">替换</button>
+                    <button id="replace-all" class="find-btn find-btn-wide" title="全部替换 (Ctrl+Enter)">全部</button>
+                </div>
+            </div>
         </div>
 
         <!-- 自定义右键菜单 -->
@@ -177,6 +204,22 @@
                     <div class="seg settings-seg" id="set-ctx">
                         <button class="seg-btn" data-v="1">启用</button>
                         <button class="seg-btn" data-v="0">停用</button>
+                    </div>
+                </div>
+
+                <div class="settings-item">
+                    <div class="settings-label">快捷键</div>
+                    <div class="kbd-list">
+                        <div><kbd>Ctrl</kbd>+<kbd>N</kbd> 新建</div>
+                        <div><kbd>Ctrl</kbd>+<kbd>O</kbd> 打开</div>
+                        <div><kbd>Ctrl</kbd>+<kbd>S</kbd> 保存</div>
+                        <div><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> 另存为</div>
+                        <div><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> 导出 PDF</div>
+                        <div><kbd>Ctrl</kbd>+<kbd>F</kbd> 查找</div>
+                        <div><kbd>Ctrl</kbd>+<kbd>H</kbd> 查找并替换</div>
+                        <div><kbd>Tab</kbd> 缩进（<kbd>Shift</kbd>+<kbd>Tab</kbd> 反缩进）</div>
+                        <div><kbd>Ctrl</kbd>+<kbd>+</kbd>/<kbd>-</kbd>/<kbd>0</kbd> 文字缩放</div>
+                        <div><kbd>Esc</kbd> 关闭弹窗</div>
                     </div>
                 </div>
 

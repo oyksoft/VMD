@@ -1,6 +1,6 @@
 [package]
 name = "vmd"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "VMD - 一个轻量级的 Markdown 查看与编辑工具"
 
@@ -31,6 +31,8 @@ windows = { version = "0.62", default-features = false, features = [
     "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

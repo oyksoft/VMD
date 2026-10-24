@@ -54,6 +54,7 @@ button:hover { background: var(--bg-elevated); border-color: var(--text-dim); }
     display: flex;
     min-height: 0;   /* 关键：允许子项收缩 */
     overflow: hidden;
+    position: relative;   /* 查找栏的初始定位祖先（运行时它会挪到具体区域里） */
 }
 
 /* === 拖拽分隔条 === */
@@ -381,13 +382,16 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     border-right: 1px solid var(--border);
     display: flex;
     overflow: hidden;
+    position: relative;       /* 查找栏 / 状态栏浮在里面 */
+    /* 编辑区底色搬到容器上：textarea 自己要透明，不然下层的高亮透不上来 */
+    background: rgba(255, 255, 255, 0.04);
 }
 #editor {
     flex: 1;
     width: 100%;
     height: 100%;
     padding: 16px;
-    background: rgba(255, 255, 255, 0.04);
+    background: transparent;   /* 高亮层在下面，背景得透明才能透上来 */
     color: var(--text);
     border: none;
     outline: none;
@@ -403,6 +407,39 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     white-space: pre;
     overflow-wrap: normal;
     overflow-x: auto;
+    position: relative;
+    z-index: 1;          /* 浮在高亮层上面 */
+}
+/* 高亮层：在 textarea 下面，尺寸/字体/内边距跟 textarea 完全一致，
+   只有背景色可见（文字透明）—— 这样匹配位置跟真实文字严丝合缝对得上 */
+#editor-hl {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 0;
+    padding: 16px;
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    line-height: 1.7;
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "calt" 0;
+    tab-size: 4;
+    white-space: pre;
+    overflow-wrap: normal;
+    overflow: hidden;
+    color: transparent;
+    pointer-events: none;
+}
+#editor-hl mark {
+    background: color-mix(in srgb, var(--accent) 32%, transparent);
+    color: transparent;
+    border-radius: 2px;
+}
+#editor-hl mark.current {
+    background: color-mix(in srgb, var(--accent) 70%, transparent);
+    outline: 1px solid var(--accent);
 }
 
 /* === 预览 === */
@@ -412,6 +449,7 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     overflow-y: auto;
     overflow-x: hidden;
     background: rgba(255, 255, 255, 0.04);
+    position: relative;   /* 查找栏浮在它里面（阅读模式） */
 }
 #preview {
     padding: 24px 32px 80px;
@@ -812,6 +850,28 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
 }
 .set-actions { margin-bottom: 4px; }
 
+/* === 快捷键速查表 === */
+.kbd-list {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 16px;
+    font-size: 12px;
+    color: var(--text-dim);
+}
+.kbd-list kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    margin: 0 1px;
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
 /* === 自动重载开关 === */
 .toggle-btn {
     padding: 4px 10px;
@@ -825,6 +885,9 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     white-space: nowrap;
 }
 .toggle-btn:hover { background: var(--bg-elevated); color: var(--text); }
+/* 状态不成立时（没打开的文件 / 有未保存的修改 / 文件被删了）→ 置灰 */
+.toggle-btn.disabled { opacity: 0.4; cursor: not-allowed; }
+.toggle-btn.disabled:hover { background: transparent; color: var(--text-dim); }
 .toggle-btn.on {
     border-color: var(--accent);
     background: rgba(88, 166, 255, 0.14);
@@ -836,6 +899,133 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     color: var(--text);
     cursor: default;
     background: var(--bg);
+}
+
+/* === 查找 / 替换浮层（Ctrl+F / Ctrl+H） === */
+/* 固定放在 #content 里（不跟着内容滚动），位置/宽度由 JS 按目标区域算 ——
+   所以预览区滚动时查找栏一直浮在顶部，不会被卷走。 */
+.find-bar {
+    position: absolute;
+    top: 6px;
+    left: 8px;
+    width: 300px;          /* JS 会按目标区域宽度覆盖 */
+    z-index: 40;
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: 10px;
+    /* 玻璃质感：底色只掺 14%，模糊只 3px（跟 toast 一个路子） */
+    background: color-mix(in srgb, var(--text) 14%, transparent);
+    backdrop-filter: blur(3px) saturate(140%);
+    -webkit-backdrop-filter: blur(3px) saturate(140%);
+    border: 1px solid color-mix(in srgb, var(--text) 26%, transparent);
+    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.22);
+    font-size: 12.5px;
+    color: var(--text);
+}
+.find-bar.open { display: flex; }
+.find-row { display: flex; align-items: center; gap: 4px; }
+.find-row-replace { display: none; }
+.find-bar.replace-mode .find-row-replace { display: flex; }
+.find-bar input {
+    flex: 1 1 0;
+    min-width: 48px;
+    width: auto;
+    padding: 3px 7px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 12.5px;
+    outline: none;
+}
+.find-bar input:focus { border-color: var(--accent); }
+.find-tabs {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 7px;
+    background: var(--bg-elevated);
+}
+.find-tab {
+    padding: 2px 8px;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.find-tab.is-active {
+    background: var(--bg);
+    border-color: var(--border);
+    color: var(--text);
+}
+.find-tab:disabled { opacity: 0.4; cursor: not-allowed; }
+.find-count {
+    flex: 0 0 auto;
+    min-width: 42px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+}
+.find-count.hit { color: var(--accent); }
+.find-sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+.find-btn {
+    flex: 0 0 auto;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+.find-btn-wide { padding: 0 8px; }
+.find-btn:hover { background: var(--bg-elevated); color: var(--text); }
+
+/* 预览区（阅读模式）里的查找高亮 */
+#preview mark.vmd-find {
+    background: color-mix(in srgb, var(--accent) 32%, transparent);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+}
+#preview mark.vmd-find.current {
+    background: color-mix(in srgb, var(--accent) 70%, transparent);
+    outline: 1px solid var(--accent);
+}
+
+/* === 编辑区右下角：光标位置 / 行数 / 字数 === */
+.editor-status {
+    position: absolute;
+    right: 10px;
+    bottom: 4px;
+    z-index: 5;
+    pointer-events: none;      /* 不挡鼠标 */
+    color: var(--text-dim);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 3px var(--bg), 0 0 6px var(--bg);
+    white-space: nowrap;
+}
+
+/* 查找/替换选中的文字要给个醒目的颜色（textarea 里唯一的“高亮”手段） */
+#editor::selection { background: color-mix(in srgb, var(--accent) 45%, transparent); }
+
+/* 工具栏按钮不可用（只读模式等） */
+#toolbar button.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
 }
 
 /* === 滚动条（颜色从主题变量自动派生，所有主题都适配） === */
