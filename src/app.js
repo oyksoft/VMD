@@ -960,7 +960,7 @@ function renderLatexBlocks() {
         try {
             window.katex.render(source, container, { displayMode: true, throwOnError: false, errorColor: '#cc0000' });
         } catch (e) {
-            container.innerHTML = '<pre style="color:#cc0000;background:#fff5f5;padding:10px;">KaTeX 渲染失败：' + e.message + '\n\n' + source + '</pre>';
+            container.replaceChildren(renderErrorBox('KaTeX', e.message, source));
         }
         pre.parentNode.replaceChild(container, pre);
         code.dataset.latexRendered = '1';
@@ -1094,7 +1094,10 @@ function ensureMermaid(theme) {
             startOnLoad: false,
             theme: 'base',                 // base 主题不覆盖 themeVariables
             themeVariables: mermaidThemeVars(),
-            securityLevel: 'loose',
+            // strict：禁掉图里的 click 事件和 HTML 标签。md 文件可能来自别人，
+            // loose 下 `click A href "..."` 能把链接塞进预览，而预览 DOM 已经过消毒，
+            // 这里再插入的内容 DOMPurify 不会再管。代价：节点文本里的 <br> 会显示成字面量。
+            securityLevel: 'strict',
             fontFamily: 'inherit',
         });
     } catch (e) {
@@ -1118,7 +1121,7 @@ function rerenderMermaid() {
             window.mermaid.render(id + '-svg', source)
                 .then(({ svg }) => { container.innerHTML = svg; })
                 .catch(e => {
-                    container.innerHTML = '<pre style="color:#cc0000;background:#fff5f5;padding:10px;">Mermaid 渲染失败：' + e.message + '</pre>';
+                    container.replaceChildren(renderErrorBox('Mermaid', e.message, ''));
                 });
         });
     });
@@ -1142,6 +1145,20 @@ function normalizeMermaidSource(source) {
     return source;
 }
 
+/**
+ * KaTeX / Mermaid 渲染失败的提示块。
+ *
+ * 错误信息和图/公式源码**都可能包含用户写的 HTML** —— 必须用 textContent 插，
+ * 用 `innerHTML = '...' + e.message + source` 会让 `<img src=x onerror=...>`
+ * 真的执行（这些是消毒之后的 DOM，DOMPurify 不会再过滤一遍）。
+ */
+function renderErrorBox(what, msg, source) {
+    const pre = document.createElement('pre');
+    pre.className = 'render-error';
+    pre.textContent = what + ' 渲染失败：' + (msg || '') + (source ? '\n\n' + source : '');
+    return pre;
+}
+
 function renderMermaidBlocks() {
     if (!window.mermaid) return;
     // 支持 mermaid、seq、flow、sequence、diagram 作为代码块语言别名
@@ -1163,7 +1180,7 @@ function renderMermaidBlocks() {
             container.innerHTML = svg;
             container.dataset.mermaidRendered = '1';
         }).catch(e => {
-            container.innerHTML = '<pre style="color:#cc0000;background:#fff5f5;padding:10px;">Mermaid 渲染失败：' + e.message + '\n\n' + source + '</pre>';
+            container.replaceChildren(renderErrorBox('Mermaid', e.message, source));
             container.dataset.mermaidRendered = '1';
         });
     });
@@ -1368,33 +1385,70 @@ function scrollEditorToLine(line) {
     editor.scrollTop = line * editorLineHeight + padTop;
 }
 
+// 上一次渲染目录时的「标题结构」签名。每次输入都会重跑 renderPreview()，
+// 但大多数时候标题根本没变（只是正文多了几个字）—— 这时重建 #toc 的 DOM
+// 只会带来闪烁和滚动位置丢失，也就是打字时目录"抖"的原因。
+let tocSignature = null;   // null 而非 ''：空文档的签名也是 ''，得能区分「还没渲染过」
+// 当前高亮的目录项 id（updateTocHighlight 用，定义在文件末尾）
+let tocActiveId = '';
+
 function renderToc() {
-    tocList.innerHTML = '';
     const headings = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
-    if (headings.length === 0) {
-        tocList.innerHTML = '<div style="padding: 12px; color: #6e7681; font-size: 12px;">(无标题)</div>';
+
+    // 先补 id：签名要用，点击跳转也依赖它
+    headings.forEach((h, i) => {
+        if (!h.id) h.id = 'h-' + i + '-' + slugify(h.textContent);
+    });
+
+    const items = Array.prototype.map.call(headings, h => ({
+        h,
+        level: parseInt(h.tagName.charAt(1)),   // H4 → 4
+        id: h.id,
+        text: h.textContent,
+        line: headingLines.get(h),
+    }));
+
+    // 签名只看「结构」= 级别 + id + 文本。行号故意不参与：
+    // 在前面插一段正文会让后面所有标题行号 +1，但那不值得重建整个目录。
+    const sig = items.map(it => it.level + '\u0001' + it.id + '\u0001' + it.text).join('\u0000');
+
+    if (sig === tocSignature) {
+        // 结构没变 → 只同步行号（改 dataset 不触发重排）和高亮，DOM 原样留着
+        syncTocLines(items);
+        updateTocHighlight();
         return;
     }
-    let lastId = '';
-    headings.forEach((h, i) => {
-        if (!h.id) {
-            h.id = 'h-' + i + '-' + slugify(h.textContent);
-        }
-        const level = parseInt(h.tagName.charAt(1));   // H4 → 4
+    tocSignature = sig;
+
+    const keepScroll = tocList.scrollTop;   // 重建会把 scrollTop 归零，先记下来
+    const frag = document.createDocumentFragment();
+
+    if (items.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'toc-empty';
+        empty.textContent = '(无标题)';
+        frag.appendChild(empty);
+    }
+
+    for (const it of items) {
         const div = document.createElement('div');
-        div.className = `toc-item lvl${level}`;
-        div.textContent = h.textContent;
-        div.dataset.id = h.id;
-        const srcLine = headingLines.get(h);
-        if (srcLine !== undefined) div.dataset.line = String(srcLine);
+        div.className = `toc-item lvl${it.level}`;
+        div.textContent = it.text;
+        div.dataset.id = it.id;
+        if (it.line !== undefined) div.dataset.line = String(it.line);
         div.addEventListener('click', () => {
             const previewWrap = document.getElementById('preview-wrap');
             if (!previewWrap) return;
+            // ⚠️ 目录可能**没有跟着重建**（标题没变时被跳过了），此时闭包里捕获的 it.h
+            //    已经被 renderPreview() 换成了全新的节点 —— 拿旧节点算 rect 全是 0，
+            //    表现就是“点了跳不动 / 跳得不准”。必须按 id 从当前预览里重新查。
+            const target = document.getElementById(it.id);
+            if (!target) return;
             // 锁住自动同步，防止 smooth scroll 的中间帧把编辑区拽回原位
             syncing = true;
-            const top = h.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top + previewWrap.scrollTop - 12;
+            const top = target.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top + previewWrap.scrollTop - 12;
             previewWrap.scrollTo({ top, behavior: 'smooth' });
-            // 编辑区精确落到对应的那一行（不折行时 scrollTop = 行号 × 行高）
+            // 编辑区精确落到对应的那一行（行号由 syncTocLines() 维护，从 dataset 读最新的）
             const line = parseInt(div.dataset.line, 10);
             if (!isNaN(line)) {
                 scrollEditorToLine(line);
@@ -1412,12 +1466,33 @@ function renderToc() {
             previewWrap.addEventListener('scrollend', done);
             // 兜底：位置没变（不会触发 scrollend）或动画被打断
             const fallback = setTimeout(done, 1200);
+            // 已经在目标位置（手指比对没变化）→ 根本不会有 scroll 事件，直接解锁，
+            // 否则 syncing 锁会白白挂满 1.2 秒，这期间点目录/滚动都没反应。
+            if (Math.abs(previewWrap.scrollTop - top) < 2) done();
         });
-        tocList.appendChild(div);
-        lastId = h.id;
-    });
-    // 目录刚重建（内联高亮样式没了）→ 把当前章节的高亮补回来
+        frag.appendChild(div);
+    }
+
+    tocList.replaceChildren(frag);
+    // 重建后恢复滚动位置（超出新内容高度时浏览器自己 clamp）
+    tocList.scrollTop = keepScroll;
+    tocActiveId = '';        // 内联高亮样式随着旧节点一起没了
     updateTocHighlight();
+}
+
+/** 目录结构没变时，只把行号同步到现有节点上（改 dataset 不会触发重排） */
+function syncTocLines(items) {
+    const nodes = tocList.querySelectorAll('.toc-item');
+    if (nodes.length !== items.length) return;   // 理论上不会走到，保险
+    for (let i = 0; i < items.length; i++) {
+        const el = nodes[i];
+        const line = items[i].line;
+        if (line === undefined) {
+            if (el.dataset.line) delete el.dataset.line;
+        } else if (el.dataset.line !== String(line)) {
+            el.dataset.line = String(line);
+        }
+    }
 }
 
 function slugify(s) {
@@ -2599,11 +2674,13 @@ function applyReadOnly() {
 // 缩放范围：80% ~ 150%
 // 上限压到 150% 是因为字号放大而宽度不变时，每行能装的字会少一半，
 // 字再大就"观感翻倍"、一行只剩几个字，很难读。
-const ZOOM_MIN = 80, ZOOM_MAX = 150, ZOOM_STEP = 10;
+const ZOOM_MIN = 80, ZOOM_MAX = 150, ZOOM_STEP = 5;   // 5% 一档，10% 太粗
 
 /** 应用缩放（只影响内容区：目录 / 编辑区 / 预览区） */
 function applyZoom(percent) {
-    const z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(percent)));
+    // 吸附到 5% 的整数档：设置文件里可能存着旧的 10% 档以外的值，range 也会吸附，
+    // 这里先统一，免得按钮文字和滑块位置对不上。
+    const z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(percent / ZOOM_STEP) * ZOOM_STEP));
     document.documentElement.style.setProperty('--ui-zoom', z / 100);
     const btn = document.getElementById('btn-zoom');
     if (btn) btn.textContent = '🔍 ' + z + '%';
@@ -2646,7 +2723,10 @@ function initZoom() {
         }
     });
 
-    range.addEventListener('input', () => setZoom(Number(range.value)));
+    // 拖动时只改样式，松手（change）才落盘 —— input 事件很密，
+    // 每动一下就写一次 settings.json（还是 fsync 的原子写）没必要。
+    range.addEventListener('input', () => applyZoom(Number(range.value)));
+    range.addEventListener('change', () => setZoom(Number(range.value)));
 
     popup.querySelectorAll('.zoom-btn[data-zoom]').forEach(b => {
         b.addEventListener('click', () => {
@@ -3241,6 +3321,8 @@ function updateTocHighlight() {
         if (h.getBoundingClientRect().top - boxTop < 100) current = h;
     });
     if (!current) return;   // 还没到第一个标题 → 保持原来的高亮
+    if (current.id === tocActiveId) return;   // 章节没变就别动 DOM（滚动时一帧一次）
+    tocActiveId = current.id;
     tocList.querySelectorAll('.toc-item').forEach(el => {
         const active = el.dataset.id === current.id;
         el.style.background = active ? 'var(--bg-elevated)' : 'transparent';

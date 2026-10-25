@@ -8,6 +8,7 @@
 | `encoding-gbk.txt` | GBK 编码的中文 `.txt`（无 BOM）。打开应正常显示；改一个字保存后**必须仍是 GBK**，不能被悄悄转成 UTF-8。 |
 | `encoding-utf8-bom.md` | 带 UTF-8 BOM。打开后正文第一行不能出现乱码/不可见字符，保存后 BOM 应保留。 |
 | `encoding-utf16le.md` | UTF-16LE 带 BOM。能正确打开，保存后仍是 UTF-16LE。 |
+| `mermaid-check.md` | Mermaid `securityLevel: strict` 回归：click 不生效、`<br>` 变字面量、渲染失败的提示块不执行源码里的 HTML。 |
 
 编码相关的判断办法：
 
