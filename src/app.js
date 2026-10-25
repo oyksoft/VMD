@@ -277,9 +277,9 @@ marked.setOptions({
 // 改为渲染后 post-process 高亮（详见 highlightCodeBlocks）
 
 // 渲染后高亮代码块
-function highlightCodeBlocks() {
+function highlightCodeBlocks(root = preview) {
     if (!window.hljs) return;
-    const pres = Array.from(preview.querySelectorAll('pre'));
+    const pres = sel(root, 'pre');
     pres.forEach(pre => {
         if (pre.dataset.codeBlockDone) return;   // 避免重复处理
         const code = pre.querySelector('code');
@@ -313,8 +313,8 @@ const ICON_COPY = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" s
 const ICON_CHECK = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
 
 // 表格外套一个可横向滚动的容器（table 本身保持 table 布局，border-collapse 才生效）
-function wrapTables() {
-    const tables = Array.from(preview.querySelectorAll('table'));
+function wrapTables(root = preview) {
+    const tables = sel(root, 'table');
     tables.forEach(table => {
         if (table.parentNode && table.parentNode.classList.contains('table-wrap')) return;
         const wrap = document.createElement('div');
@@ -404,6 +404,8 @@ function legacyCopy(text) {
 const editor = document.getElementById('editor');
 const preview = document.getElementById('preview');
 const tocList = document.getElementById('toc-list');
+// 目录项点击走事件委托（目录可能有上万个节点，逐个 addEventListener 太贵）
+tocList.addEventListener('click', onTocItemClick);
 const filenameEl = document.getElementById('filename');
 const toolbarEl = document.getElementById('toolbar');
 const toastEl = document.getElementById('toast');
@@ -510,11 +512,22 @@ editor.value = (STARTUP.content != null) ? STARTUP.content : WELCOME;
 // ============ 渲染 ============
 
 let renderTimer = null;
+// 打字 → 预览的防抖延迟按文档大小分级。
+// 长文档每次渲染要几百毫秒，固定 100ms 会让连续输入时渲染背靠背地跑，打字明显发滞。
+const RENDER_DELAY_SHORT = 100;    // < 5 万字符
+const RENDER_DELAY_MID = 200;      // < 20 万字符
+const RENDER_DELAY_LONG = 450;     // >= 20 万字符（约 300KB 以上）
+function renderDelayFor(text) {
+    const n = text.length;
+    if (n >= 200000) return RENDER_DELAY_LONG;
+    if (n >= 50000) return RENDER_DELAY_MID;
+    return RENDER_DELAY_SHORT;
+}
 editor.addEventListener('input', () => {
     dirty = true;
     updateFilename();
     if (renderTimer) clearTimeout(renderTimer);
-    renderTimer = setTimeout(renderPreview, 100);
+    renderTimer = setTimeout(renderPreview, renderDelayFor(editor.value));
     // 查找栏开着时文本变了 → 匹配位置也跟着变，重算 + 重画高亮
     if (findBar && findBar.classList.contains('open')) {
         collectMatches();
@@ -715,33 +728,117 @@ function fallbackSanitize(html) {
     return frag;
 }
 
+// 上一次渲染的顶层块签名（type + 原始源码）。null = 还没渲染过。
+let previewBlockKeys = null;
+// 上一次渲染用的源码，没变就什么都不用干
+let previewRenderedSource = null;
+
+/**
+ * 在 root 子树里查选择器，root 自己是元素且匹配时也算一个。
+ * 增量渲染时 root 可能就是那个块本身（比如一个 <pre>）。
+ */
+function sel(root, selector) {
+    const out = Array.from(root.querySelectorAll(selector));
+    if (root.nodeType === 1 && root.matches(selector)) out.unshift(root);
+    return out;
+}
+
 function renderPreview() {
     const text = editor.value;
+    if (text === previewRenderedSource && previewBlockKeys) { updateFilename(); return; }
     // [TOC] / [TOCM] 是目录占位符。代码块/行内代码里的不算（应该原样显示）。
     const { text: workText, types: tocTypes, count: tocCount } = replaceTocPlaceholders(text);
-    const html = marked.parse(workText);
-    preview.replaceChildren(sanitizePreview(html));
-    renderMermaidBlocks();    // 必须在 highlightCodeBlocks 前——后者会冲掉 language-* class
-    highlightCodeBlocks();
-    highlightUnmatchedDelimiters(text);   // 从源文本扫描错误写法，映射到 DOM 文本节点标黄
-    replaceEmojiShortcodes();             // :smile: → 😄（代码块/行内代码里的不动）
-    wrapTables();
+
+    // 先按顶层 token 算"块签名"。这份 tokens 直接喂给 parser，不重复 lexer 一遍。
+    const tokens = marked.lexer(workText);
+    // 链接引用定义（[a]: url）不产生 DOM，还可能影响别的块的解析 —— 有它就整篇重渲染
+    const hasDef = tokens.some(t => t.type === 'def');
+    const body = tokens.filter(t => t.type !== 'space' && t.type !== 'def');
+    const keys = body.map(t => t.type + '\u0001' + t.raw);
+
+    // 从两头夹逼，找出真正变了的块区间。尾部的对齐要带上索引偏移 ——
+    // 插入/删除一块时，后面的块只是位置挪了，内容并没变。
+    const prevKeys = previewBlockKeys;
+    const nk = keys.length;
+    const pk = prevKeys ? prevKeys.length : 0;
+    let a = 0, pb = nk - 1, qb = pk - 1;   // new 用 [a, pb]，old 用 [a, qb]
+    if (prevKeys && !hasDef) {
+        while (a < nk && a < pk && prevKeys[a] === keys[a]) a++;
+        while (pb >= a && qb >= a && prevKeys[qb] === keys[pb]) { pb--; qb--; }
+    }
+    // 旧 DOM 必须还是上次那批块，才敢按索引局部替换
+    const canPatch = !!prevKeys && !hasDef && preview.children.length === prevKeys.length;
+
+    if (canPatch && pb < a) {
+        // 一个字都没改到结构：连重排都省了
+        previewBlockKeys = keys;
+        previewRenderedSource = text;
+        updateFilename();
+        return;
+    }
+
+    // 只把变了的几块交给 marked / DOMPurify —— 1MB 文档全量解析+消毒要 ~250ms，
+    // 改一个字时实际上只需要处理一个块。（marked 顶层 token 之间无上下文依赖，
+    // 逐块 parser 拼起来和整篇 parse 完全一致，已验证。）
+    let changed = null;
+    if (canPatch) {
+        const frag = sanitizePreview(marked.parser(body.slice(a, pb + 1)));
+        changed = [];
+        for (let n = frag.firstChild; n; n = n.nextSibling) {
+            if (n.nodeType === 1) changed.push(n);
+        }
+        // 块数对不上（顶级原始 HTML 展开成多节点）就不敢乱插，回退整篇
+        if (changed.length !== pb - a + 1) changed = null;
+    }
+
+    if (changed) {
+        // 先记下插入位置的下一个兄弟，再删旧块（children 会边删边变）
+        const ref = preview.children[qb + 1] ? preview.children[qb + 1] : null;
+        for (let i = a; i <= qb; i++) {
+            const el = preview.children[a];
+            if (el) el.remove();
+        }
+        const insert = document.createDocumentFragment();
+        for (const n of changed) insert.appendChild(n);
+        preview.insertBefore(insert, ref);
+    } else {
+        const frag = sanitizePreview(marked.parser(tokens));
+        // 只留元素节点：marked 输出里的空白文本节点没有意义，丢掉之后
+        // "顶层元素" 才和 "顶层 token" 一一对应（增量替换靠这个索引对齐）。
+        changed = [];
+        for (let n = frag.firstChild; n; n = n.nextSibling) {
+            if (n.nodeType === 1) changed.push(n);
+        }
+        preview.replaceChildren(...changed);
+    }
+
+    // 后处理只跑变化的那几个块（各函数内部都有 dataset 防重复处理标记，
+    // 但 1MB 文档里几千个代码块/文本节点全扫一遍要几百毫秒，没必要）。
+    for (const root of changed) {
+        renderMermaidBlocks(root);       // 必须在 highlightCodeBlocks 之前——后者会冲掉 language-* class
+        highlightCodeBlocks(root);
+        replaceEmojiShortcodes(root);
+        wrapTables(root);
+    }
+    highlightUnmatchedDelimiters(text);   // 从源文本扫描错误写法，映射到 DOM 文本节点标黄（内部先清旧的）
     if (tocCount > 0) renderInlineToc(tocTypes);
-    renderMath();
+    queueMath(changed);
     mapHeadingLines(text);   // 把预览区的标题和源码行号对应起来（目录跳转要精确落行）
     renderToc();
     updateFilename();
+    previewBlockKeys = keys;
+    previewRenderedSource = text;
 }
 
 // ============ Emoji 短代码（:smile: → 😄）============
 // 只在预览里替换，源码保持原样（和 GitHub 一致）。
 // 用「渲染后处理」而不是 marked 扩展 —— 扩展会先于行内代码匹配，
 // 把 `` `:smile:` `` 里的也换掉。
-function replaceEmojiShortcodes() {
+function replaceEmojiShortcodes(root = preview) {
     const table = window.VMD_EMOJI;
     if (!table) return;
     const has = (name) => Object.prototype.hasOwnProperty.call(table, name);
-    const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT, {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
             const p = node.parentElement;
             if (!p) return NodeFilter.FILTER_REJECT;
@@ -911,9 +1008,29 @@ function escHTML(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/** 属性值转义（拼 HTML 字符串时用，比 escHTML 多处理引号） */
+function escAttr(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // ============ KaTeX 数学公式 ============
 let katexReady = false;
-let renderMathScheduled = false;
+// 待渲染 KaTeX 的顶层块。增量渲染下只需要处理变动的块，
+// 1MB 文档全量跑一次 auto-render 要 ~600ms。
+let mathQueue = [];
+let mathRafPending = false;
+const KATEX_AUTO_OPTS = {
+    delimiters: [
+        { left: '$$', right: '$$', display: true },
+        { left: '$', right: '$', display: false },
+        { left: '\\(', right: '\\)', display: false },
+        { left: '\\[', right: '\\]', display: true },
+    ],
+    throwOnError: false,
+    errorColor: '#cc0000',
+    ignoredClasses: ['md-unmatched'],
+};
 function ensureKatex() {
     if (katexReady) return Promise.resolve();
     if (!window.renderMathInElement) return Promise.reject('katex not loaded');
@@ -921,24 +1038,34 @@ function ensureKatex() {
     katexReady = true;
     return Promise.resolve();
 }
-function renderMath() {
+// 没有公式定界符就整段跳过。KaTeX 的 auto-render 要把预览里所有文本节点
+// 走一遍，长文档白跑一次就是几百毫秒（1MB 文档实测多花约 600ms）。
+const MATH_FENCE_RE = /^[ 	]*(?:```|~~~)[ 	]*(?:latex|math|tex|katex)/m;
+function hasMathSyntax(src) {
+    if (src.indexOf('$') >= 0 || src.indexOf('\(') >= 0 || src.indexOf('\[') >= 0) return true;
+    return MATH_FENCE_RE.test(src);
+}
+
+// roots = 这次重新渲染的顶层块；不传就是整篇预览
+function queueMath(roots) {
     if (!window.renderMathInElement || !preview) return;
-    if (renderMathScheduled) return;
-    renderMathScheduled = true;
+    if (!hasMathSyntax(editor.value)) {
+        mathQueue = [];
+        return;
+    }
+    for (const n of (roots && roots.length ? roots : [preview])) mathQueue.push(n);
+    if (mathRafPending) return;
+    mathRafPending = true;
     requestAnimationFrame(() => {
-        renderMathScheduled = false;
+        mathRafPending = false;
+        const list = mathQueue;
+        mathQueue = [];
         try {
-            window.renderMathInElement(preview, {
-                delimiters: [
-                    { left: '$$', right: '$$', display: true },
-                    { left: '$', right: '$', display: false },
-                    { left: '\\(', right: '\\)', display: false },
-                    { left: '\\[', right: '\\]', display: true },
-                ],
-                throwOnError: false,
-                errorColor: '#cc0000',
-                ignoredClasses: ['md-unmatched'],
-            });
+            for (const root of list) {
+                // 排队期间又被替换掉的块直接跳过（新块会被重新排队）
+                if (!root.isConnected) continue;
+                window.renderMathInElement(root, KATEX_AUTO_OPTS);
+            }
             // 处理 ```latex / ```math / ```tex 代码块：当作块级数学公式渲染
             renderLatexBlocks();
         } catch (e) {
@@ -1159,10 +1286,10 @@ function renderErrorBox(what, msg, source) {
     return pre;
 }
 
-function renderMermaidBlocks() {
+function renderMermaidBlocks(root = preview) {
     if (!window.mermaid) return;
     // 支持 mermaid、seq、flow、sequence、diagram 作为代码块语言别名
-    const codes = preview.querySelectorAll('pre code.language-mermaid, pre code.language-seq, pre code.language-flow, pre code.language-sequence, pre code.language-diagram');
+    const codes = sel(root, 'pre code.language-mermaid, pre code.language-seq, pre code.language-flow, pre code.language-sequence, pre code.language-diagram');
     codes.forEach(code => {
         if (code.dataset.mermaidRendered) return;
         const source = normalizeMermaidSource(code.textContent);
@@ -1392,6 +1519,42 @@ let tocSignature = null;   // null 而非 ''：空文档的签名也是 ''，得
 // 当前高亮的目录项 id（updateTocHighlight 用，定义在文件末尾）
 let tocActiveId = '';
 
+/** 目录最多列这么多项（再多就没法看了，而且建 DOM 的时间会大到影响手速） */
+const TOC_MAX_ITEMS = 2000;
+
+/** 目录项点击 —— 事件委托（目录可能有上万个节点，逐个 addEventListener 太贵） */
+function onTocItemClick(e) {
+    const div = e.target && e.target.closest ? e.target.closest('.toc-item') : null;
+    if (!div) return;
+    const previewWrap = document.getElementById('preview-wrap');
+    if (!previewWrap) return;
+    // ⚠️ 目录可能没有跟着重建（标题没变时被跳过），而预览 DOM 每次都是新的 ——
+    //    必须按 id 从当前预览里重新查，不能依赖任何捕获的元素。
+    const target = document.getElementById(div.dataset.id);
+    if (!target) return;
+    // 锁住自动同步，防止 smooth scroll 的中间帧把编辑区拽回原位
+    syncing = true;
+    const top = target.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top + previewWrap.scrollTop - 12;
+    previewWrap.scrollTo({ top, behavior: 'smooth' });
+    // 编辑区精确落到对应的那一行（行号由 syncTocLines() 维护，从 dataset 读最新的）
+    const line = parseInt(div.dataset.line, 10);
+    if (!isNaN(line)) scrollEditorToLine(line);
+    // 跳转结束后解锁。这里不能再按比例同步一次 —— 那会把精确位置冲掉。
+    let finished = false;
+    const done = () => {
+        if (finished) return;
+        finished = true;
+        previewWrap.removeEventListener('scrollend', done);
+        clearTimeout(fallback);
+        syncing = false;
+    };
+    previewWrap.addEventListener('scrollend', done);
+    // 兜底：位置没变（不会触发 scrollend）或动画被打断
+    const fallback = setTimeout(done, 1200);
+    // 已经在目标位置 → 不会有 scroll 事件，直接解锁
+    if (Math.abs(previewWrap.scrollTop - top) < 2) done();
+}
+
 function renderToc() {
     const headings = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
 
@@ -1421,70 +1584,61 @@ function renderToc() {
     tocSignature = sig;
 
     const keepScroll = tocList.scrollTop;   // 重建会把 scrollTop 归零，先记下来
-    const frag = document.createDocumentFragment();
+
+    // 极端文档（1MB、1.4 万个标题）光建目录就要近 1 秒，滚动和高亮也跟着变慢。
+    // 超过上限只列前 N 项，并在末尾说明还有多少（真实文档几乎碰不到）。
+    const truncated = items.length > TOC_MAX_ITEMS;
+    const shown = truncated ? items.slice(0, TOC_MAX_ITEMS) : items;
+
+    // 项数对得上就逐项改，别整段重建 —— 重建 2000 个目录项要重排整个目录，
+    // 1MB 文档实测 1 秒以上（改一个标题字就要付这个代价）。
+    const nodes = tocList.querySelectorAll('.toc-item');
+    if (!truncated && items.length > 0 && nodes.length === shown.length) {
+        for (let i = 0; i < shown.length; i++) {
+            const el = nodes[i], it = shown[i];
+            const cls = 'toc-item lvl' + it.level;
+            if (el.className !== cls) el.className = cls;
+            if (el.dataset.id !== it.id) el.dataset.id = it.id;
+            if (el.textContent !== it.text) el.textContent = it.text;
+            if (it.line === undefined) {
+                if (el.dataset.line) delete el.dataset.line;
+            } else if (el.dataset.line !== String(it.line)) {
+                el.dataset.line = String(it.line);
+            }
+        }
+        tocList.scrollTop = keepScroll;   // 没重建，scrollTop 本来就没动，保险起见还是写回
+        updateTocHighlight();
+        return;
+    }
 
     if (items.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'toc-empty';
-        empty.textContent = '(无标题)';
-        frag.appendChild(empty);
+        tocList.innerHTML = '<div class="toc-empty">(无标题)</div>';
+    } else {
+        // 一次 innerHTML 批量建 + 点击靠事件委托（onTocItemClick）。
+        // 别改回逐个 createElement + addEventListener：那样每次重建都要多花几百毫秒
+        // （1MB 文档实测 800ms 以上，这里是同样的量级，主要成本在整页重排）。
+        const parts = [];
+        for (const it of shown) {
+            const lineAttr = it.line !== undefined ? ' data-line="' + it.line + '"' : '';
+            parts.push('<div class="toc-item lvl' + it.level + '" data-id="' + escAttr(it.id) + '"' +
+                lineAttr + '>' + escHTML(it.text) + '</div>');
+        }
+        if (truncated) {
+            parts.push('<div class="toc-empty">…还有 ' + (items.length - TOC_MAX_ITEMS) + ' 个标题未列出</div>');
+        }
+        tocList.innerHTML = parts.join('');
     }
-
-    for (const it of items) {
-        const div = document.createElement('div');
-        div.className = `toc-item lvl${it.level}`;
-        div.textContent = it.text;
-        div.dataset.id = it.id;
-        if (it.line !== undefined) div.dataset.line = String(it.line);
-        div.addEventListener('click', () => {
-            const previewWrap = document.getElementById('preview-wrap');
-            if (!previewWrap) return;
-            // ⚠️ 目录可能**没有跟着重建**（标题没变时被跳过了），此时闭包里捕获的 it.h
-            //    已经被 renderPreview() 换成了全新的节点 —— 拿旧节点算 rect 全是 0，
-            //    表现就是“点了跳不动 / 跳得不准”。必须按 id 从当前预览里重新查。
-            const target = document.getElementById(it.id);
-            if (!target) return;
-            // 锁住自动同步，防止 smooth scroll 的中间帧把编辑区拽回原位
-            syncing = true;
-            const top = target.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top + previewWrap.scrollTop - 12;
-            previewWrap.scrollTo({ top, behavior: 'smooth' });
-            // 编辑区精确落到对应的那一行（行号由 syncTocLines() 维护，从 dataset 读最新的）
-            const line = parseInt(div.dataset.line, 10);
-            if (!isNaN(line)) {
-                scrollEditorToLine(line);
-            }
-            // 跳转结束后解锁。
-            // 注意：这里**不能**再按比例同步一次 —— 那样会把精确位置冲掉。
-            let finished = false;
-            const done = () => {
-                if (finished) return;
-                finished = true;
-                previewWrap.removeEventListener('scrollend', done);
-                clearTimeout(fallback);
-                syncing = false;
-            };
-            previewWrap.addEventListener('scrollend', done);
-            // 兜底：位置没变（不会触发 scrollend）或动画被打断
-            const fallback = setTimeout(done, 1200);
-            // 已经在目标位置（手指比对没变化）→ 根本不会有 scroll 事件，直接解锁，
-            // 否则 syncing 锁会白白挂满 1.2 秒，这期间点目录/滚动都没反应。
-            if (Math.abs(previewWrap.scrollTop - top) < 2) done();
-        });
-        frag.appendChild(div);
-    }
-
-    tocList.replaceChildren(frag);
-    // 重建后恢复滚动位置（超出新内容高度时浏览器自己 clamp）
     tocList.scrollTop = keepScroll;
-    tocActiveId = '';        // 内联高亮样式随着旧节点一起没了
+    tocActiveId = '';        // 节点是全新的一批，高亮状态跟着清空
     updateTocHighlight();
 }
 
 /** 目录结构没变时，只把行号同步到现有节点上（改 dataset 不会触发重排） */
 function syncTocLines(items) {
     const nodes = tocList.querySelectorAll('.toc-item');
-    if (nodes.length !== items.length) return;   // 理论上不会走到，保险
-    for (let i = 0; i < items.length; i++) {
+    // 目录被 TOC_MAX_ITEMS 截断时节点比标题少，按少的那个同步
+    const n = Math.min(nodes.length, items.length);
+    for (let i = 0; i < n; i++) {
         const el = nodes[i];
         const line = items[i].line;
         if (line === undefined) {
@@ -3315,19 +3469,24 @@ function updateTocHighlight() {
     const headings = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
     if (headings.length === 0) return;
     const boxTop = previewScroll.getBoundingClientRect().top;
-    let current = null;
-    headings.forEach(h => {
-        // 标题线滚到容器顶部往下 100px 以内 → 就算读到这个章节了
-        if (h.getBoundingClientRect().top - boxTop < 100) current = h;
-    });
-    if (!current) return;   // 还没到第一个标题 → 保持原来的高亮
-    if (current.id === tocActiveId) return;   // 章节没变就别动 DOM（滚动时一帧一次）
-    tocActiveId = current.id;
-    tocList.querySelectorAll('.toc-item').forEach(el => {
-        const active = el.dataset.id === current.id;
-        el.style.background = active ? 'var(--bg-elevated)' : 'transparent';
-        el.style.color = active ? 'var(--link)' : '';
-    });
+    let idx = -1;
+    for (let i = 0; i < headings.length; i++) {
+        // 标题线滚到容器顶部往下 100px 以内 → 就算读到这个章节了。
+        // 标题在文档里是按顺序排的，第一个不满足就说明后面都不满足，直接 break。
+        if (headings[i].getBoundingClientRect().top - boxTop < 100) idx = i;
+        else break;
+    }
+    if (idx < 0) return;   // 还没到第一个标题 → 保持原来的高亮
+    const id = headings[idx].id;
+    if (id === tocActiveId) return;   // 章节没变就别动 DOM（滚动时一帧一次）
+    tocActiveId = id;
+    // 只改「上一项 + 这一项」，不要遍历整个目录 —— 5000 项全写一次 style
+    // 会触发整条目录重排，实测几百毫秒。
+    const prev = tocList.querySelector('.toc-item.active');
+    if (prev) prev.classList.remove('active');
+    // 目录项和标题一一对应（截断时超出部分没有对应的项）
+    const next = tocList.children[idx];
+    if (next && next.classList && next.classList.contains('toc-item')) next.classList.add('active');
 }
 
 /** 滚动时刷新高亮：一帧最多算一次（编辑区滚动会带着预览区滚，事件很密） */

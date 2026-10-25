@@ -1419,6 +1419,10 @@ body.drag-over #drop-hint { display: flex; }
 .toc-item.lvl5 { padding-left: 56px; color: var(--text-dim); opacity: 0.65; }
 .toc-item.lvl6 { padding-left: 68px; color: var(--text-dim); opacity: 0.55; }
 
+/* 目录当前章节高亮（JS 只切 .active 类，不写内联样式 —— 遍历 5000 项改 style 太慢）
+   用 #toc-list 提高特异性，免得被上面 .toc-item.lvl2 的颜色盖掉 */
+#toc-list .toc-item.active { background: var(--bg-elevated); color: var(--link); }
+
 /* === 打印模式（导出 PDF 时临时启用：只显示预览内容） === */
 /* 关键：html/body 的 height:100% + overflow:hidden 会把内容裁到一屏，
    PrintToPdf 就只能导出一页。必须全部放开。 */
