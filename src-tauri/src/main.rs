@@ -187,6 +187,68 @@ fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+// ============ 崩溃恢复用的草稿 ============
+
+/// 草稿文件：`%LOCALAPPDATA%\com.vmd.app\scratch\draft.json`
+///
+/// 应用是单文档的，所以只留“最近这一份没保存的内容”，不做历史版本。
+/// 正常保存 / 换文件 / 关窗时前端会调 `clear_draft` 删掉它。
+fn draft_file() -> PathBuf {
+    settings_file()
+        .parent()
+        .map(|p| p.join("scratch"))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("draft.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Draft {
+    content: String,
+    /// 草稿对应的文件路径（新建的文件还没保存过 → null）
+    path: Option<String>,
+    /// 原编码，恢复后保存时按它写回
+    encoding: String,
+    /// 写入时间（UNIX 纳秒）—— 和 `file_stamp` 的 mtime 同一单位，前端直接比大小
+    saved_at: u64,
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// 存草稿（前端在有未保存修改时定时调用）
+#[tauri::command]
+fn save_draft(path: Option<String>, content: String, encoding: String) -> Result<(), String> {
+    let file = draft_file();
+    if let Some(dir) = file.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let draft = Draft {
+        content,
+        path,
+        encoding,
+        saved_at: now_nanos(),
+    };
+    let text = serde_json::to_string(&draft).map_err(|e| e.to_string())?;
+    write_atomic(&file.to_string_lossy(), text.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// 读草稿（启动时检查上一次是不是没能正常退出）
+#[tauri::command]
+fn load_draft() -> Option<Draft> {
+    let bytes = fs::read(draft_file()).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// 删草稿（保存成功 / 用户明确丢弃 / 关窗）
+#[tauri::command]
+fn clear_draft() {
+    let _ = fs::remove_file(draft_file());
+}
+
 #[tauri::command]
 fn read_file(path: String) -> Result<FileText, String> {
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
@@ -1218,6 +1280,9 @@ fn main() {
             settings_path,
             save_settings,
             startup_files,
+            save_draft,
+            load_draft,
+            clear_draft,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

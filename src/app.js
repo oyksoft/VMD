@@ -254,6 +254,8 @@ async function askBeforeClose() {
 
 /** 真正关窗（Rust 端用 destroy，绕开拦截） */
 async function doClose() {
+    // 窗口真要关了 → 草稿没意义了（用户已经选过保存/丢弃）
+    await dropDraft();
     try {
         await invoke('close_window');
     } catch (e) {
@@ -1594,6 +1596,7 @@ document.getElementById('btn-new').addEventListener('click', async () => {
     editor.value = '';
     currentFile = null;
     dirty = false;
+    dropDraft();                    // 新建 = 主动丢掉未保存内容，草稿也一起清
     fileStamp = null;
     fileMissing = false;
     setExternalChange(false);
@@ -1671,6 +1674,7 @@ async function openPath(path) {
     setExternalChange(false);       // 换了文件，之前的"外部已修改"标记作废
     await recordStamp();
     applyReadOnly();                // 自动重载开着 → 只读
+    await dropDraft();              // 换了文件，之前那个文件的草稿作废
     showToast('已打开');
 }
 
@@ -1717,6 +1721,7 @@ async function saveFile() {
         // 存回去的内容就是当前内容了，外部修改的问题随之解决
         setExternalChange(false);
         await recordStamp();
+        await dropDraft();               // 落盘了就没什么可恢复的了
         showToast('已保存');
         return true;
     } catch (e) {
@@ -1739,6 +1744,7 @@ async function saveAsFile() {
         updateFilename();
         // 另存到新文件：原文件仍然是"被外部改过"的状态，标记要留着
         await recordStamp();
+        await dropDraft();
         showToast('已保存');
         return true;
     } catch (e) {
@@ -2375,7 +2381,127 @@ function applyExternalContent(content, tip) {
     updateFilename();
     setExternalChange(false);
     recordStamp();
+    // 磁盘上的内容已经覆盖进来了，旧草稿作废（不然下次启动会拿它出来问恢复）
+    dropDraft();
     if (tip) showToast(tip);
+}
+
+// ============ 崩溃恢复（草稿快照）============
+//
+// 未保存的内容只存在内存里，崩溃 / 断电 / panic=abort 就直接没了。
+// 所以有未保存修改时定时往 `%LOCALAPPDATA%\com.vmd.app\scratch\draft.json` 快照一份，
+// 下次启动发现还有草稿就问用户要不要恢复。
+//
+// 注意：这**不是**自动保存 —— 普通保存/另存为/换文件/正常关窗时都要把草稿删掉。
+const DRAFT_INTERVAL = 5000;           // 普通文档 5 秒快照一次
+const DRAFT_INTERVAL_BIG = 20000;      // 超过 1MB 的文档拉长到 20 秒（全量写盘太频繁没意义）
+const DRAFT_BIG_SIZE = 1024 * 1024;
+let draftSavedContent = null;   // 上一次成功写进草稿的内容（一样就不重复写）
+let draftSavedAt = 0;           // 上一次成功写草稿的时间（Date.now）
+let draftBusy = false;          // 正在写（避免 5 秒定时器和输入事件叠在一起）
+
+/** 有未保存修改时把内容快照到磁盘 */
+async function maybeSaveDraft() {
+    if (!dirty || draftBusy) return;
+    const content = editor.value;
+    if (content === draftSavedContent) return;
+    const gap = content.length > DRAFT_BIG_SIZE ? DRAFT_INTERVAL_BIG : DRAFT_INTERVAL;
+    if (Date.now() - draftSavedAt < gap) return;
+    draftBusy = true;
+    try {
+        await invoke('save_draft', {
+            path: currentFile || null,
+            content,
+            encoding: currentEncoding,
+        });
+        draftSavedContent = content;
+        draftSavedAt = Date.now();
+    } catch (e) {
+        // 草稿写不进去（目录没权限、磁盘满）不该打扰用户 —— 下次再试
+        console.warn('draft save failed:', e);
+    } finally {
+        draftBusy = false;
+    }
+}
+
+/** 删草稿（保存成功、换文件、用户明确丢弃、关窗时调） */
+async function dropDraft() {
+    draftSavedContent = null;
+    draftSavedAt = 0;
+    try {
+        await invoke('clear_draft');
+    } catch (e) {
+        // 删不掉也无所谓，下次启动比较一下磁盘时间就会自动丢弃
+    }
+}
+
+/** 把草稿灌回编辑器（恢复上次未保存的内容） */
+async function restoreDraft(draft) {
+    editor.value = draft.content;
+    currentFile = draft.path || null;
+    currentEncoding = draft.encoding || 'utf-8';
+    dirty = true;          // 内容还是“未保存”状态，标题栏要有 ●
+    fileMissing = false;
+    setExternalChange(false);
+    renderPreview();
+    updateFilename();
+    await recordStamp();
+    applyReadOnly();
+    if (!editMode) setEditMode(true);   // 要接着写 → 切到编辑模式
+    editor.focus();
+    // 记住已经写进草稿的内容，免得启动后立刻又写一遍一模一样的
+    draftSavedContent = draft.content;
+    draftSavedAt = Date.now();
+    showToast('已恢复上次未保存的内容', 3000);
+}
+
+/**
+ * 启动时检查有没有上次没能保存的草稿。
+ *
+ * 丢弃条件（草稿已经没用了）：
+ * - 磁盘上的文件比草稿新（说明草稿之后已经保存过）
+ * - 磁盘内容跟草稿一模一样（没什么可恢复的）
+ * - 文件读不出来
+ */
+async function maybeOfferDraftRestore() {
+    let draft;
+    try {
+        draft = await invoke('load_draft');
+    } catch (e) {
+        return;
+    }
+    if (!draft || !draft.content) return;
+    if (draft.path) {
+        try {
+            const stamp = await invoke('file_stamp', { path: draft.path });
+            if (stamp) {
+                if (stamp.mtime > draft.saved_at) { await dropDraft(); return; }
+                const disk = await invoke('read_file', { path: draft.path });
+                if (disk.content === draft.content) { await dropDraft(); return; }
+            }
+            // 文件被删了（stamp 为 null）→ 草稿还有价值，接着问
+        } catch (e) {
+            await dropDraft();
+            return;
+        }
+    }
+    const name = draft.path ? draft.path.replace(/^.*[\\\/]/, '') : '未命名文档';
+    const when = new Date(draft.saved_at / 1e6).toLocaleString('zh-CN', { hour12: false });
+    const body = document.createElement('div');
+    body.textContent = '「' + name + '」里有上次没来得及保存的修改（' + when + '）。要恢复吗？';
+    const choice = await showDialog({
+        title: '发现未保存的草稿',
+        // 时钟 + 回转箭头
+        icon: '<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>',
+        body,
+        okText: '恢复',
+        cancelText: '丢弃',
+    });
+    if (choice !== true) {
+        await dropDraft();
+        return;
+    }
+    await restoreDraft(draft);
 }
 
 // ============ 自动重载开关 ============
@@ -3288,10 +3414,14 @@ updateThemeButton();
         updateFilename();
         recordStamp();
     }
+    // 上次没能正常退出的话（崩溃/断电），把没保存的内容捞回来
+    maybeOfferDraftRestore();
 })();
 
 // 外部修改检测：每 3 秒查一次（窗口没焦点时不查，切回来立刻查）
 setInterval(checkExternalChange, 3000);
+// 崩溃恢复：有未保存修改时定时快照（不是自动保存，见 maybeSaveDraft 注释）
+setInterval(maybeSaveDraft, DRAFT_INTERVAL);
 if (window.__TAURI__ && window.__TAURI__.event) {
     window.__TAURI__.event.listen('tauri://focus', () => {
         winFocused = true;
