@@ -152,16 +152,19 @@ async function openDroppedFiles(paths) {
     const ok = list.filter(p => OPENABLE_EXT.includes(extOf(p)));
     if (!ok.length) {
         const names = list.map(p => p.replace(/^.*[\\\/]/, '')).join('、');
-        alert('只能打开 .md / .markdown / .txt 文件' + (names ? '：\n' + names : ''));
+        showError('打不开这个文件', '只能打开 .md / .markdown / .txt 文件' + (names ? '。\n' + names : ''));
         return;
     }
     if (ok.length > 1) {
-        alert('一次只能打开一个文件，已打开第一个：\n' + ok[0].replace(/^.*[\\\/]/, ''));
+        showToast('一次只能打开一个文件，已打开「' + ok[0].replace(/^.*[\\\/]/, '') + '」', 3000);
     }
+    // 拖放打开也要过「未保存修改」这一关 —— 以前只有 Ctrl+O 检查，
+    // 拖一个文件进来会把正在写的内容静默覆盖掉
+    if (!(await confirmDiscardCurrent())) return;
     try {
         await openPath(ok[0]);
     } catch (e) {
-        alert('打开失败：' + (e && e.message ? e.message : e));
+        showError('打不开这个文件', e);
     }
 }
 
@@ -440,6 +443,9 @@ preview.addEventListener('click', async (e) => {
 const STARTUP = window.__VMD_STARTUP__ || {};
 
 let currentFile = STARTUP.path || null;
+// 当前文件的编码（utf-8 / utf-8-bom / utf-16le / utf-16be / ansi）——
+// 保存时按原编码写回，不悄悄把 GBK 转成 UTF-8。见 main.rs 的 decode_text()。
+let currentEncoding = STARTUP.encoding || 'utf-8';
 let dirty = false;
 
 const WELCOME = `# 欢迎使用 VMD 👋
@@ -650,12 +656,69 @@ previewScroll && previewScroll.addEventListener('scroll', () => {
     syncEditorToPreview();
 });
 
+// ============ 预览 HTML 消毒 ============
+//
+// marked 不做 sanitize：md 里的原始 HTML 会原样进 preview.innerHTML。
+// `<script>` 通过 innerHTML 插入不会执行，但 `<img src=x onerror=...>` /
+// `<svg onload=...>` **会**执行 —— 而本页面持有 Tauri 的 invoke 权限
+// （read_file / write_file 接受任意路径），所以「打开别人给的 .md」
+// 就足以读写本机任意文件。写入预览前必须过滤。
+//
+// 只过滤 marked 的原始输出：KaTeX / Mermaid / 代码高亮都是之后在预览 DOM 上
+// 做的改造，它们生成的节点不经过这里，不会被误伤。
+
+const PURIFY_CONFIG = {
+    // 常规 HTML + SVG（md 里内嵌图常见）+ MathML
+    USE_PROFILES: { html: true, svg: true, svgFilters: true, mathMl: true },
+    // <style>/<form> 用不上：样式走主题，不让文档自己改界面
+    FORBID_TAGS: ['style', 'form', 'base', 'link', 'meta'],
+    FORBID_ATTR: ['action', 'formaction', 'srcdoc', 'ping'],
+    ALLOW_DATA_ATTR: false,
+    // 只放行 http/https/mailto/tel + 相对路径与锚点。
+    // 默认规则也是这个意思，这里显式写出来，免得升级 DOMPurify 后白名单变宽。
+    // data: 图片由 DOMPurify 自己的 DATA_URI_TAGS 处理（img/video/audio），不受影响。
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
+    // 直接返回 DocumentFragment：省一次「序列化 → 再解析」，长文档快不少
+    RETURN_DOM_FRAGMENT: true,
+};
+
+/** 消毒 marked 输出，返回可直接 append 的 DocumentFragment */
+function sanitizePreview(html) {
+    if (window.DOMPurify) return window.DOMPurify.sanitize(html, PURIFY_CONFIG);
+    // 兜底：vendor 里的 DOMPurify 没加载时，宁可少渲染也不能执行脚本
+    console.warn('[VMD] DOMPurify 未加载，改用降级清理');
+    return fallbackSanitize(html);
+}
+
+/** DOMPurify 缺失时的最小清理：删危险标签 + 所有 on* 属性 + 危险 scheme */
+function fallbackSanitize(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('script,style,iframe,object,embed,link,meta,base,form')
+        .forEach(n => n.remove());
+    for (const el of doc.querySelectorAll('*')) {
+        for (const attr of Array.from(el.attributes)) {
+            const name = attr.name.toLowerCase();
+            if (name.startsWith('on') || name === 'srcdoc' || name === 'formaction') {
+                el.removeAttribute(attr.name);
+            } else if (['href', 'src', 'xlink:href', 'action'].includes(name) &&
+                       /^\s*(?:javascript|vbscript|data:text\/html)/i.test(attr.value)) {
+                el.removeAttribute(attr.name);
+            }
+        }
+    }
+    const frag = document.createDocumentFragment();
+    for (const node of Array.from(doc.body.childNodes)) {
+        frag.appendChild(document.importNode(node, true));
+    }
+    return frag;
+}
+
 function renderPreview() {
     const text = editor.value;
     // [TOC] / [TOCM] 是目录占位符。代码块/行内代码里的不算（应该原样显示）。
     const { text: workText, types: tocTypes, count: tocCount } = replaceTocPlaceholders(text);
-    let html = marked.parse(workText);
-    preview.innerHTML = html;
+    const html = marked.parse(workText);
+    preview.replaceChildren(sanitizePreview(html));
     renderMermaidBlocks();    // 必须在 highlightCodeBlocks 前——后者会冲掉 language-* class
     highlightCodeBlocks();
     highlightUnmatchedDelimiters(text);   // 从源文本扫描错误写法，映射到 DOM 文本节点标黄
@@ -1526,13 +1589,8 @@ function updateThemeButton() {
 }
 
 document.getElementById('btn-new').addEventListener('click', async () => {
-    // 有未保存的修改时先问 —— 用应用内弹窗，不用浏览器原生 confirm（样式突兀）
-    if (dirty) {
-        const r = await askSaveChanges();
-        if (r === 'cancel') return;
-        if (r === 'save' && !(await saveFile())) return;   // 保存失败 → 不新建
-        // 'discard' → 继续新建，丢弃当前修改
-    }
+    // 有未保存的修改时先问 —— 和打开/拖放走同一套检查
+    if (!(await confirmDiscardCurrent())) return;
     editor.value = '';
     currentFile = null;
     dirty = false;
@@ -1602,9 +1660,10 @@ document.getElementById('btn-auto-reload').addEventListener('click', toggleAutoR
 
 /** 打开指定路径的文件（"打开"对话框和拖放共用） */
 async function openPath(path) {
-    const content = await invoke('read_file', { path });
-    editor.value = content;
+    const file = await invoke('read_file', { path });
+    editor.value = file.content;
     currentFile = path;
+    currentEncoding = file.encoding || 'utf-8';
     dirty = false;
     fileMissing = false;
     renderPreview();
@@ -1615,25 +1674,32 @@ async function openPath(path) {
     showToast('已打开');
 }
 
+/**
+ * 打开另一个文件（或新建）前的统一检查：有未保存修改就先问一句。
+ * 返回 true = 可以继续，false = 用户取消 / 保存失败。
+ *
+ * Ctrl+O、拖放、新建三条路都要走这里 —— 以前只有 Ctrl+O 检查，
+ * 拖放会把当前编辑区的内容静默覆盖掉（未保存的改动直接没）。
+ */
+async function confirmDiscardCurrent() {
+    if (!dirty) return true;
+    const r = await askSaveChanges();
+    if (r === 'cancel') return false;
+    if (r === 'save' && !(await saveFile())) return false;   // 保存失败/取消 → 不继续
+    return true;   // 'discard' → 继续，丢弃当前修改
+}
+
 async function openFile() {
-    // 有未保存的修改时先问一句 —— 否则打开新文件会把当前内容静默丢掉
-    if (dirty) {
-        const r = await askSaveChanges();
-        if (r === 'cancel') return;
-        if (r === 'save' && !(await saveFile())) return;   // 保存失败/取消 → 不打开新文件
-        // 'discard' → 继续打开，丢弃当前修改
-    }
+    if (!(await confirmDiscardCurrent())) return;
     try {
-        console.log('[VMD] openFile() called');
         const path = await open({
             multiple: false,
             filters: [{ name: 'Markdown', extensions: ['md', 'markdown', 'txt'] }],
         });
-        console.log('[VMD] open() returned:', path);
         if (!path) return;
         await openPath(path);
     } catch (e) {
-        alert('打开失败：' + e);
+        showError('打不开这个文件', e);
     }
 }
 
@@ -1644,7 +1710,7 @@ async function saveFile() {
         return false;
     }
     try {
-        await invoke('write_file', { path: currentFile, content: editor.value });
+        await invoke('write_file', { path: currentFile, content: editor.value, encoding: currentEncoding });
         dirty = false;
         fileMissing = false;
         updateFilename();
@@ -1654,7 +1720,7 @@ async function saveFile() {
         showToast('已保存');
         return true;
     } catch (e) {
-        alert('保存失败：' + e);
+        showError('保存失败', e);
         return false;
     }
 }
@@ -1666,7 +1732,7 @@ async function saveAsFile() {
             defaultPath: currentFile || 'untitled.md',
         });
         if (!path) return false;      // 用户取消了"另存为" → 没保存
-        await invoke('write_file', { path, content: editor.value });
+        await invoke('write_file', { path, content: editor.value, encoding: currentEncoding });
         currentFile = path;
         dirty = false;
         fileMissing = false;
@@ -1676,7 +1742,7 @@ async function saveAsFile() {
         showToast('已保存');
         return true;
     } catch (e) {
-        alert('保存失败：' + e);
+        showError('保存失败', e);
         return false;
     }
 }
@@ -2248,10 +2314,11 @@ async function promptExternalChange() {
 /** 用磁盘上的内容覆盖编辑器 */
 async function reloadFromDisk() {
     try {
-        const content = await invoke('read_file', { path: currentFile });
-        applyExternalContent(content, '已重新加载');
+        const file = await invoke('read_file', { path: currentFile });
+        currentEncoding = file.encoding || 'utf-8';
+        applyExternalContent(file.content, '已重新加载');
     } catch (e) {
-        alert('重新加载失败：' + (e && e.message ? e.message : e));
+        showError('重新加载失败', e);
     }
 }
 
@@ -2271,7 +2338,10 @@ async function autoReloadFromDisk() {
     if (!before) return;                // 文件没了，下一轮再说
     let content;
     try {
-        content = await invoke('read_file', { path });
+        const file = await invoke('read_file', { path });
+        content = file.content;
+        // 外部工具可能改了编码（比如另存为 GBK），跟着它走
+        if (currentFile === path) currentEncoding = file.encoding || 'utf-8';
     } catch (e) {
         return;
     }
@@ -2506,7 +2576,7 @@ function setCtxMenuEnabled(on) {
     // 必须立刻通知 Rust：它那边决定要不要屏蔽 WebView2 的原生菜单，
     // 两边不同步的话会出现"自定义菜单没了、原生菜单也没了"的情况
     invoke('set_context_menu_enabled', { enabled: settings.ctxMenu }).catch((e) => {
-        alert('设置右键菜单失败：' + (e && e.message ? e.message : e));
+        showError('设置右键菜单失败', e);
     });
     syncSettingsUI();
 }
@@ -2613,7 +2683,7 @@ document.getElementById('menu-on').addEventListener('click', async () => {
         await invoke('set_shell_menu', { enable: true });
         showToast('已添加「用 VMD 打开」菜单项', 2500);
     } catch (e) {
-        alert('添加失败：' + (e && e.message ? e.message : e));
+        showError('添加右键菜单失败', e);
     }
     refreshShellMenuState();
 });
@@ -2622,7 +2692,7 @@ document.getElementById('menu-off').addEventListener('click', async () => {
         await invoke('set_shell_menu', { enable: false });
         showToast('已移除右键菜单项', 2500);
     } catch (e) {
-        alert('移除失败：' + (e && e.message ? e.message : e));
+        showError('移除右键菜单失败', e);
     }
     refreshShellMenuState();
 });
@@ -2672,7 +2742,7 @@ document.getElementById('assoc-on').addEventListener('click', async () => {
         await invoke('set_file_association', { enable: true });
         showToast('已关联 .md / .markdown', 2500);
     } catch (e) {
-        alert('关联失败：' + (e && e.message ? e.message : e));
+        showError('关联失败', e);
     }
 });
 document.getElementById('assoc-off').addEventListener('click', async () => {
@@ -2680,7 +2750,7 @@ document.getElementById('assoc-off').addEventListener('click', async () => {
         await invoke('set_file_association', { enable: false });
         showToast('已取消文件关联', 2500);
     } catch (e) {
-        alert('取消失败：' + (e && e.message ? e.message : e));
+        showError('取消关联失败', e);
     }
 });
 
@@ -2749,6 +2819,32 @@ function openNextDialog() {
     if (!next) return;
     modalResolve = next.resolve;
     renderDialog(next.opts);
+}
+
+/** 把 invoke 的 reject 值（字符串或对象）变成一行可读文本 */
+function errText(e) {
+    if (e == null) return '';
+    if (typeof e === 'string') return e;
+    return e.message ? e.message : String(e);
+}
+
+/**
+ * 统一的错误提示：应用内弹窗（只有一个「知道了」按钮）。
+ * 不用浏览器原生 alert —— 它样式跟主题无关、阻塞、也不进弹窗队列。
+ */
+function showError(title, detail) {
+    const body = document.createElement('div');
+    body.className = 'modal-error';
+    // textContent：错误信息里可能带 < > & 和长路径，绝不能当 HTML 解析
+    body.textContent = errText(detail);
+    showDialog({
+        title,
+        icon: '<circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12.5"/><line x1="12" y1="16" x2="12" y2="16.1"/>',
+        danger: true,
+        body,
+        okText: '知道了',
+        hideCancel: true,
+    });
 }
 
 function showDialog(opts) {
@@ -2910,7 +3006,7 @@ async function exportHtml() {
     } catch (e) {
         console.error(e);
         hideToast();
-        alert('导出 HTML 失败：' + (e && e.message ? e.message : e));
+        showError('导出 HTML 失败', e);
     }
 }
 
@@ -2964,7 +3060,7 @@ async function exportPdf() {
             showToast('PDF 已导出', 2500);
         } catch (e) {
             console.error(e);
-            alert('导出 PDF 失败：' + (e && e.message ? e.message : e));
+            showError('导出 PDF 失败', e);
             hideToast();
         } finally {
             document.body.classList.remove('print-mode');
@@ -2980,7 +3076,7 @@ async function exportPdf() {
             }
         }
     } catch (e) {
-        alert('导出 PDF 失败：' + e);
+        showError('导出 PDF 失败', e);
     }
 }
 
@@ -3178,7 +3274,9 @@ updateThemeButton();
     // （超过 512KB 的没注入内容，异步读一次）
     if (currentFile && STARTUP.content == null) {
         try {
-            editor.value = await invoke('read_file', { path: currentFile });
+            const file = await invoke('read_file', { path: currentFile });
+            editor.value = file.content;
+            currentEncoding = file.encoding || 'utf-8';
             renderPreview();
         } catch (e) {
             editor.value = WELCOME;

@@ -1,6 +1,7 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,14 +12,193 @@ mod assoc;
 #[cfg(target_os = "windows")]
 mod drop;
 
-#[tauri::command]
-fn read_file(path: String) -> Result<String, String> {
-    fs::read_to_string(&path).map_err(|e| format!("read failed: {}", e))
+// ============ 文本文件读写（编码感知 + 原子写入）============
+
+/// 读出来的文本 + 原文件编码。保存时按原编码写回。
+///
+/// 为什么不统一转成 UTF-8 存：中文 Windows 上不少 `.txt` 是 GBK，
+/// 悄悄改成 UTF-8 会让 git diff 满屏、别的工具也可能不认。BOM 同理。
+#[derive(serde::Serialize)]
+struct FileText {
+    content: String,
+    /// utf-8 / utf-8-bom / utf-16le / utf-16be / ansi（ansi = 系统代码页，中文系统就是 GBK）
+    encoding: String,
+}
+
+/// 把原始字节解成文本，同时告诉前端这是什么编码
+fn decode_text(bytes: &[u8]) -> Result<(String, String), String> {
+    // 1. BOM 最权威，BOM 本身不留在内容里
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(rest.to_vec())
+            .map(|s| (s, "utf-8-bom".to_string()))
+            .map_err(|_| "文件声明自己是 UTF-8 BOM，内容却不是合法 UTF-8".to_string());
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return Ok((utf16_to_string(rest, true), "utf-16le".to_string()));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return Ok((utf16_to_string(rest, false), "utf-16be".to_string()));
+    }
+    // 2. 没有 BOM，先按 UTF-8 试（现行标准）
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return Ok((s.to_string(), "utf-8".to_string()));
+    }
+    // 3. 退回系统 ANSI 代码页（中文 Windows = GBK/GB18030 系列）
+    #[cfg(target_os = "windows")]
+    if let Some(s) = ansi_to_string(bytes) {
+        return Ok((s, "ansi".to_string()));
+    }
+    Err("这个文件不是 UTF-8 / UTF-16 编码，按系统编码也读不出来（可能是二进制文件）".to_string())
+}
+
+/// UTF-16 字节 → String（不合法代理对用 U+FFFD 代替，不报错）
+fn utf16_to_string(bytes: &[u8], little_endian: bool) -> String {
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        units.push(if little_endian {
+            u16::from_le_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], pair[1]])
+        });
+    }
+    String::from_utf16_lossy(&units)
+}
+
+/// 文本 → 要写进磁盘的字节（按 encoding 还原 BOM / UTF-16 / ANSI）
+fn encode_text(content: &str, encoding: &str) -> Result<Vec<u8>, String> {
+    match encoding {
+        "utf-8-bom" => {
+            let mut out = vec![0xEF, 0xBB, 0xBF];
+            out.extend_from_slice(content.as_bytes());
+            Ok(out)
+        }
+        "utf-16le" => {
+            let mut out = vec![0xFF, 0xFE];
+            for u in content.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            Ok(out)
+        }
+        "utf-16be" => {
+            let mut out = vec![0xFE, 0xFF];
+            for u in content.encode_utf16() {
+                out.extend_from_slice(&u.to_be_bytes());
+            }
+            Ok(out)
+        }
+        "ansi" => {
+            #[cfg(target_os = "windows")]
+            {
+                string_to_ansi(content)
+                    .ok_or_else(|| "按系统编码保存失败（内容里有 GBK 表示不了的字符）".to_string())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Ok(content.as_bytes().to_vec())
+            }
+        }
+        // 默认（以及任何不认识的编码名）都按 UTF-8 写
+        _ => Ok(content.as_bytes().to_vec()),
+    }
+}
+
+/// 系统 ANSI 代码页 → String
+#[cfg(target_os = "windows")]
+fn ansi_to_string(bytes: &[u8]) -> Option<String> {
+    use windows::Win32::Globalization::{MultiByteToWideChar, CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0);
+    let need = unsafe { MultiByteToWideChar(CP_ACP, flags, bytes, None) };
+    if need <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; need as usize];
+    let got = unsafe { MultiByteToWideChar(CP_ACP, flags, bytes, Some(&mut buf)) };
+    if got <= 0 {
+        return None;
+    }
+    buf.truncate(got as usize);
+    Some(String::from_utf16_lossy(&buf))
+}
+
+/// String → 系统 ANSI 代码页字节（表示不了的字符会被换成 '?'，和别的记事本类工具一致）
+#[cfg(target_os = "windows")]
+fn string_to_ansi(s: &str) -> Option<Vec<u8>> {
+    use windows::core::PCSTR;
+    use windows::Win32::Globalization::{WideCharToMultiByte, CP_ACP};
+    if s.is_empty() {
+        return Some(Vec::new());
+    }
+    let wide: Vec<u16> = s.encode_utf16().collect();
+    let need = unsafe { WideCharToMultiByte(CP_ACP, 0, &wide, None, PCSTR::null(), None) };
+    if need <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; need as usize];
+    let got = unsafe {
+        WideCharToMultiByte(CP_ACP, 0, &wide, Some(&mut buf), PCSTR::null(), None)
+    };
+    if got <= 0 {
+        return None;
+    }
+    buf.truncate(got as usize);
+    Some(buf)
+}
+
+/// 原子写入：先写同目录临时文件 → fsync → rename 覆盖目标。
+///
+/// 直接 `fs::write` 是「截断 + 写」，中途崩溃/断电/被杀软锁住会留下**半截文档**。
+/// 改名是原子操作，所以目标文件要么是旧的完整版本，要么是新的完整版本。
+fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let target = PathBuf::from(path);
+    let name = target
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "无效的文件路径"))?
+        .to_string_lossy()
+        .to_string();
+    let dir = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    // 临时文件名带 PID + 序号：多开实例、同一进程连续保存都不会撞名
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.vmd-tmp",
+        name,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        // 先保证数据真的落盘，再改名 —— 否则改名成功但内容还在缓存里，断电就是空文件
+        f.sync_all()?;
+        drop(f);
+        // Windows 上 std 的 rename 用 MOVEFILE_REPLACE_EXISTING，可以直接覆盖
+        fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);   // 失败别把临时文件留在用户目录里
+    }
+    result
 }
 
 #[tauri::command]
-fn write_file(path: String, content: String) -> Result<(), String> {
-    fs::write(&path, &content).map_err(|e| format!("write failed: {}", e))
+fn read_file(path: String) -> Result<FileText, String> {
+    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    let (content, encoding) = decode_text(&bytes)?;
+    Ok(FileText { content, encoding })
+}
+
+#[tauri::command]
+fn write_file(path: String, content: String, encoding: Option<String>) -> Result<(), String> {
+    let encoding = encoding.unwrap_or_else(|| "utf-8".to_string());
+    let bytes = encode_text(&content, &encoding)?;
+    write_atomic(&path, &bytes).map_err(|e| e.to_string())
 }
 
 /// 导出 HTML：把正文里的本地图片换成 base64 内嵌，输出自包含的单文件
@@ -26,7 +206,7 @@ fn write_file(path: String, content: String) -> Result<(), String> {
 #[tauri::command]
 fn export_html(path: String, html: String, base_dir: String) -> Result<(), String> {
     let html = inline_local_images(&html, &base_dir);
-    fs::write(&path, html).map_err(|e| format!("write failed: {}", e))
+    write_atomic(&path, html.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// base64 编码（不引 base64 crate，省体积）
@@ -545,7 +725,7 @@ fn save_settings(settings: serde_json::Value) -> Result<(), String> {
         let _ = fs::create_dir_all(dir);
     }
     let text = serde_json::to_string_pretty(&settings).unwrap_or_default();
-    fs::write(&path, text).map_err(|e| format!("保存设置失败：{e}"))
+    write_atomic(&path.to_string_lossy(), text.as_bytes()).map_err(|e| format!("保存设置失败：{e}"))
 }
 
 /// 设置文件路径（设置面板里显示）
@@ -812,6 +992,89 @@ mod tests {
             );
         }
     }
+
+    mod text_io {
+        use super::super::*;
+
+        #[test]
+        fn decode_plain_utf8() {
+            let (s, enc) = decode_text("中文 abc".as_bytes()).unwrap();
+            assert_eq!(s, "中文 abc");
+            assert_eq!(enc, "utf-8");
+        }
+
+        #[test]
+        fn decode_utf8_with_bom_strips_it() {
+            let mut bytes = vec![0xEF, 0xBB, 0xBF];
+            bytes.extend_from_slice("你好".as_bytes());
+            let (s, enc) = decode_text(&bytes).unwrap();
+            assert_eq!(s, "你好");           // BOM 不能留在内容里
+            assert_eq!(enc, "utf-8-bom");
+        }
+
+        #[test]
+        fn decode_utf16_both_endians() {
+            let text = "中文 😄";
+            for (bom, le) in [([0xFFu8, 0xFE], true), ([0xFE, 0xFF], false)] {
+                let mut bytes = bom.to_vec();
+                for u in text.encode_utf16() {
+                    let b = if le { u.to_le_bytes() } else { u.to_be_bytes() };
+                    bytes.extend_from_slice(&b);
+                }
+                let (s, enc) = decode_text(&bytes).unwrap();
+                assert_eq!(s, text);
+                assert_eq!(enc, if le { "utf-16le" } else { "utf-16be" });
+            }
+        }
+
+        /// 系统 ANSI 代码页（中文 Windows = GBK）往返
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn ansi_roundtrip() {
+            let text = "中文测试，逗号。";
+            let bytes = string_to_ansi(text).unwrap();
+            let back = ansi_to_string(&bytes).unwrap();
+            assert_eq!(back, text);
+            // 无 BOM、非合法 UTF-8（除非系统 ACP 就是 UTF-8）
+            if bytes != text.as_bytes() {
+                assert!(std::str::from_utf8(&bytes).is_err());
+                let (s, enc) = decode_text(&bytes).unwrap();
+                assert_eq!(s, text);
+                assert_eq!(enc, "ansi");
+            }
+        }
+
+        #[test]
+        fn encode_roundtrips_every_encoding() {
+            let text = "# 标题\n正文 中文\n";
+            for enc in ["utf-8", "utf-8-bom", "utf-16le", "utf-16be"] {
+                let bytes = encode_text(text, enc).unwrap();
+                let (back, got) = decode_text(&bytes).unwrap();
+                assert_eq!(back, text, "{} 往返失败", enc);
+                assert_eq!(got, enc);
+            }
+        }
+
+        /// 原子写：目标文件已是旧内容，写新内容后旧内容必须完整消失、
+        /// 且不能留下临时文件
+        #[test]
+        fn write_atomic_replaces_file() {
+            let dir = std::env::temp_dir().join(format!("vmd-atomic-test-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("doc.md");
+            let path_s = path.to_string_lossy().to_string();
+            fs::write(&path, "旧内容，比新内容长很多很多很多很多很多").unwrap();
+            write_atomic(&path_s, "新内容".as_bytes()).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "新内容");
+            // 目录里只应该有目标文件，临时文件已被改名或被清掉
+            let left: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(left, vec!["doc.md".to_string()], "留下了临时文件：{:?}", left);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// 最近一次“放行”的导航 URL
@@ -841,13 +1104,17 @@ fn main() {
     // 用文件关联双击打开的文件：路径 + 内容一起注入页面。
     // 内容小的直接塞进去 → **首帧就是文件内容**，不会先闪一下欢迎页再跳到文件。
     let startup_path = startup_file_path();
-    let startup_content: Option<String> = startup_path
+    // 启动文件也用同一套编码探测 → GBK / UTF-16 文件首帧就能正确显示，
+    // 不会"先闪一下欢迎页再跳到文件"（两跳）。
+    let startup_text: Option<(String, String)> = startup_path
         .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .filter(|c| c.len() < 512 * 1024);   // 太大的文件前端再异步读
+        .and_then(|p| fs::read(p).ok())
+        .and_then(|b| decode_text(&b).ok())
+        .filter(|(content, _)| content.len() < 512 * 1024);   // 太大的文件前端再异步读
     let startup_json = serde_json::to_string(&serde_json::json!({
         "path": startup_path,
-        "content": startup_content,
+        "content": startup_text.as_ref().map(|(c, _)| c.clone()),
+        "encoding": startup_text.as_ref().map(|(_, e)| e.clone()),
     }))
     .unwrap_or_else(|_| "null".to_string());
     // 注意：注入脚本在"文档刚创建"时执行，那时 document.documentElement 可能还是 null，

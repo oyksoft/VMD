@@ -22,6 +22,7 @@ webview2-com = "0.39"
 # 只开实际用到的两个模块，避免拉进整个 Win32 API（编译时间和体积都省）
 windows = { version = "0.62", default-features = false, features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_Com",

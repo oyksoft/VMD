@@ -1150,6 +1150,14 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     color: var(--text-strong);
     font-weight: 600;
 }
+/* 错误详情：保留换行（系统错误 / 多行信息），长路径/长堆栈可以滚 */
+.modal-error {
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 40vh;
+    overflow: auto;
+    user-select: text;   /* 错误文本要能选中复制（报告问题用） */
+}
 .modal-warn {
     margin-top: 10px;
     padding: 8px 10px;

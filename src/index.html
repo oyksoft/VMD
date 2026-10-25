@@ -10,6 +10,9 @@
     <script src="./theme.js"></script>
     <!-- marked.js (markdown → HTML) -->
     <script src="vendor/marked.min.js"></script>
+    <!-- DOMPurify (预览 HTML 消毒) — md 里的原始 HTML 必须过滤后才能进 innerHTML，
+         否则 <img onerror> / <svg onload> 会在持有 Tauri 权限的页面里执行脚本 -->
+    <script src="vendor/dompurify.min.js"></script>
     <!-- highlight.js (代码高亮) — cdnjs 浏览器版，含全部语言 -->
     <script src="vendor/highlight.min.js"></script>
     <!-- KaTeX (LaTeX 数学公式渲染) -->
