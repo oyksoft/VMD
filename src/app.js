@@ -561,7 +561,7 @@ const TAB_SIZE = 2;   // markdown 嵌套列表用 2 空格（4 空格会被 Comm
  * 这个 API 虽然废弃了，但目前是唯一能保留 textarea 撤销栈的办法。
  */
 function replaceSelectionKeepingUndo(text, selStart, selEnd) {
-    editor.focus();
+    editor.focus({ preventScroll: true });
     editor.setSelectionRange(selStart, selEnd);
     const before = editor.value;
     let ok = false;
@@ -571,10 +571,19 @@ function replaceSelectionKeepingUndo(text, selStart, selEnd) {
         ok = false;
     }
     if (ok && editor.value !== before) {
-        // execCommand 一般会触发 input 事件（dirty / 预览刷新自动搞定）；
-        // 万一没触发就手动补一下 —— 宁可重复调用也不能漏掉 dirty
-        markEdited();
-        return;
+        // ⚠️ 校验插入的内容是不是真的进去了 ——
+        //    execCommand 在某些情况下会“成功但内容不对”（比如换行被吃掉）。
+        //    对不上就走回退路径，保证内容一定是想要的。
+        //    （比较时去掉 \r：textarea 的 value 会把 \r\n 规范成 \n）
+        const got = editor.value.slice(selStart, selStart + text.length).replace(/\r/g, '');
+        if (got === text.replace(/\r/g, '')) {
+            // execCommand 一般会触发 input 事件（dirty / 预览刷新自动搞定）；
+            // 万一没触发就手动补一下 —— 宁可重复调用也不能漏掉 dirty
+            markEdited();
+            return;
+        }
+        // 插进去的不是要的东西 → 先撤掉这次插入，再走回退
+        try { document.execCommand('undo'); } catch (e2) { /* 撤不掉就算了，下面直接覆盖 */ }
     }
     // 回退：直接改 value（撤销栈断了，但功能得能用）
     const after = editor.value.slice(0, selStart) + text + editor.value.slice(selEnd);
@@ -4001,11 +4010,14 @@ if (window.__TAURI__ && window.__TAURI__.event) {
 
         // ----- textarea 操作 -----
         if (menuTarget === 'editor') {
-            if (act === 'undo')        document.execCommand('undo');
-            else if (act === 'redo')   document.execCommand('redo');
-            else if (act === 'cut')    document.execCommand('cut');
-            else if (act === 'copy')   document.execCommand('copy');
-            else if (act === 'paste')  { editor.focus(); document.execCommand('paste'); }
+            // ⚠️ 点菜单时编辑区已经失焦（焦点被菜单抢走）——
+            //    execCommand('undo'/'redo'/'cut'/'copy') 作用在失焦的编辑区上会无效，
+            //    所以每个命令前都要先把焦点抢回来。preventScroll 防止视图乱跳。
+            if (act === 'undo') { editor.focus({ preventScroll: true }); document.execCommand('undo'); }
+            else if (act === 'redo') { editor.focus({ preventScroll: true }); document.execCommand('redo'); }
+            else if (act === 'cut') { editor.focus({ preventScroll: true }); document.execCommand('cut'); }
+            else if (act === 'copy') { editor.focus({ preventScroll: true }); document.execCommand('copy'); }
+            else if (act === 'paste')  { editor.focus({ preventScroll: true }); document.execCommand('paste'); }
             else if (act === 'selectAll') editor.select();
             // 格式化选中
             else if (act === 'fmt-bold' && sel.length)      wrapSelection(`**${sel}**`);
@@ -4040,21 +4052,38 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     // （markEdited 现在是模块级的函数，见上方定义）
 
     // textarea 工具函数
+
+    /**
+     * 右键菜单改内容：插入 / 包裹。
+     *
+     * ⚠️ 必须走 `replaceSelectionKeepingUndo()`（内部用 execCommand('insertText')），
+     *    **不能**直接改 `editor.value` —— 直接改会把浏览器的撤销历史冲掉，
+     *    插入完按 Ctrl+Z 撤销不了（这个坑踩过）。
+     *
+     * @param text      要插入 / 替换的文本
+     * @param selStart  替换区间起点
+     * @param selEnd    替换区间终点（= selStart 就是纯插入）
+     * @param caret     true = 光标落在插入内容末尾；false = 选中插入内容
+     */
+    function menuInsertText(text, selStart, selEnd, caret) {
+        replaceSelectionKeepingUndo(text, selStart, selEnd);
+        if (caret) {
+            const p = selStart + text.length;
+            editor.setSelectionRange(p, p);
+        } else {
+            editor.setSelectionRange(selStart, selStart + text.length);
+        }
+        editor.focus({ preventScroll: true });
+    }
+
     function wrapSelection(text) {
         const s = editor.selectionStart, e = editor.selectionEnd;
-        editor.value = editor.value.slice(0, s) + text + editor.value.slice(e);
-        editor.selectionStart = s;
-        editor.selectionEnd = s + text.length;
-        editor.focus();
-        markEdited();
+        menuInsertText(text, s, e, false);   // 插入后选中它，方便继续改
     }
 
     function insertAtCursor(text) {
-        editor.focus();
         const s = editor.selectionStart, e = editor.selectionEnd;
-        editor.value = editor.value.slice(0, s) + text + editor.value.slice(e);
-        editor.selectionStart = editor.selectionEnd = s + text.length;
-        markEdited();
+        menuInsertText(text, s, e, true);    // 插入后光标落在末尾
     }
 
     function copyPreviewSelection() {
