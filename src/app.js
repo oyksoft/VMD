@@ -550,6 +550,36 @@ function markEdited() {
 }
 
 // ============ Markdown 格式化（右键菜单 / 浮动工具栏共用）============
+
+/**
+ * 插入 / 替换一段文本（右键菜单、浮动工具栏、插入图片都用它）。
+ *
+ * ⚠️ 必须走 `replaceSelectionKeepingUndo()`（内部用 execCommand('insertText')），
+ *    **不能**直接改 `editor.value` —— 直接改会把浏览器的撤销历史冲掉，
+ *    插入完按 Ctrl+Z 撤销不了（这个坑踩过）。
+ *
+ * @param text      要插入 / 替换的文本
+ * @param selStart  替换区间起点
+ * @param selEnd    替换区间终点（= selStart 就是纯插入）
+ * @param caret     true = 光标落在插入内容末尾；false = 选中插入内容
+ */
+function menuInsertText(text, selStart, selEnd, caret) {
+    replaceSelectionKeepingUndo(text, selStart, selEnd);
+    if (caret) {
+        const p = selStart + text.length;
+        editor.setSelectionRange(p, p);
+    } else {
+        editor.setSelectionRange(selStart, selStart + text.length);
+    }
+    editor.focus({ preventScroll: true });
+}
+
+/** 在光标处插入文本（会替换掉当前选区） */
+function insertAtCursor(text) {
+    const s = editor.selectionStart, e = editor.selectionEnd;
+    menuInsertText(text, s, e, true);    // 插入后光标落在末尾
+}
+
 /**
  * 选区内容**已经**是这种格式的话，把它拆掉（返回去掉标记后的文字）；
  * 不是的话返回 null。
@@ -4257,10 +4287,6 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         ctxMenu.style.visibility = 'visible';
     }
 
-    function escHTML(s) {
-        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-
     function item(label, opts = {}) {
         const dis = opts.disabled ? ' ctx-item-disabled' : '';
         const danger = opts.danger ? ' ctx-item-danger' : '';
@@ -4472,22 +4498,6 @@ if (window.__TAURI__ && window.__TAURI__.event) {
      * @param selEnd    替换区间终点（= selStart 就是纯插入）
      * @param caret     true = 光标落在插入内容末尾；false = 选中插入内容
      */
-    function menuInsertText(text, selStart, selEnd, caret) {
-        replaceSelectionKeepingUndo(text, selStart, selEnd);
-        if (caret) {
-            const p = selStart + text.length;
-            editor.setSelectionRange(p, p);
-        } else {
-            editor.setSelectionRange(selStart, selStart + text.length);
-        }
-        editor.focus({ preventScroll: true });
-    }
-
-    function insertAtCursor(text) {
-        const s = editor.selectionStart, e = editor.selectionEnd;
-        menuInsertText(text, s, e, true);    // 插入后光标落在末尾
-    }
-
     function copyPreviewSelection() {
         const s = window.getSelection();
         if (s && s.toString()) {
