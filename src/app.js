@@ -594,6 +594,7 @@ function unwrapFormat(sel, kind) {
  *    直接改 editor.value 会冲掉撤销栈，插入完按 Ctrl+Z 撤销不了。
  */
 function formatSelection(kind) {
+    if (editor.readOnly) return false;     // 只读模式不改内容
     const s = editor.selectionStart, e = editor.selectionEnd;
     if (s === e) return false;
     const sel = editor.value.slice(s, e);
@@ -821,6 +822,7 @@ function mapOffset(oldBlock, oldOffset, newBlock, strips, adds) {
 
 /** Ctrl+1~6：把选中的行变成标题 */
 function applyHeading(level) {
+    if (editor.readOnly) return;           // 只读模式不改内容
     const [lineStart, lineEnd] = selectedLineRange();
     const s = editor.selectionStart, e = editor.selectionEnd;
     const oldBlock = editor.value.slice(lineStart, lineEnd);
@@ -844,6 +846,7 @@ function applyHeading(level) {
 
 /** Ctrl+Shift+7/8：有序 / 无序列表（再按一次 = 取消列表） */
 function applyList(kind) {
+    if (editor.readOnly) return;           // 只读模式不改内容
     const [lineStart, lineEnd] = selectedLineRange();
     const s = editor.selectionStart, e = editor.selectionEnd;
     const oldBlock = editor.value.slice(lineStart, lineEnd);
@@ -883,7 +886,20 @@ const TAB_SIZE = 2;   // markdown 嵌套列表用 2 空格（4 空格会被 Comm
  * 直接改 value 会把浏览器的撤销历史冲掉（一下要按十几次 Ctrl+Z 才回得去）。
  * 这个 API 虽然废弃了，但目前是唯一能保留 textarea 撤销栈的办法。
  */
+/**
+ * 替换选区里的内容，并且**保住原生撤销栈**（一次 Ctrl+Z 能整体撤销这次缩进）。
+ *
+ * 关键：用 `document.execCommand('insertText')` 而不是直接改 `editor.value` ——
+ * 直接改 value 会把浏览器的撤销历史冲掉（一下要按十几次 Ctrl+Z 才回得去）。
+ * 这个 API 虽然废弃了，但目前是唯一能保留 textarea 撤销栈的办法。
+ *
+ * @returns false = 因为只读而没动（调用方据此提示，不要误报“已替换”）
+ */
 function replaceSelectionKeepingUndo(text, selStart, selEnd) {
+    // ⚠️ 只读模式（自动重载开着）不能改内容 ——
+    //    textarea 的 readOnly 只挡键盘输入，execCommand 在只读框上会失败，
+    //    然后回退路径直接改 value 就把只读绕过去了（这个坑踩过）。
+    if (editor.readOnly) return false;
     editor.focus({ preventScroll: true });
     editor.setSelectionRange(selStart, selEnd);
     const before = editor.value;
@@ -903,17 +919,18 @@ function replaceSelectionKeepingUndo(text, selStart, selEnd) {
             // execCommand 一般会触发 input 事件（dirty / 预览刷新自动搞定）；
             // 万一没触发就手动补一下 —— 宁可重复调用也不能漏掉 dirty
             markEdited();
-            return;
+            return true;
         }
         // 插进去的不是要的东西 → 先撤掉这次插入，再走回退
         try { document.execCommand('undo'); } catch (e2) { /* 撤不掉就算了，下面直接覆盖 */ }
     }
     // 回退：直接改 value（撤销栈断了，但功能得能用）
     const after = editor.value.slice(0, selStart) + text + editor.value.slice(selEnd);
-    if (after === editor.value) return;      // 什么都没变（比如反缩进时行首没空白）
+    if (after === editor.value) return true;   // 什么都没变（比如反缩进时行首没空白）
     editor.value = after;
     editor.setSelectionRange(selStart, selStart + text.length);
     markEdited();
+    return true;
 }
 
 editor.addEventListener('keydown', (e) => {
@@ -2684,7 +2701,10 @@ function replaceCurrentMatch() {
         gotoMatch(1);
         return;
     }
-    replaceSelectionKeepingUndo(rep, s, e);
+    if (!replaceSelectionKeepingUndo(rep, s, e)) {
+        showToast('自动重载模式下内容是只读的');
+        return;
+    }
     collectMatches();
     if (findMatches.length) gotoMatch(1);
 }
@@ -2704,7 +2724,10 @@ function replaceAllMatches() {
     const n = findMatches.length;
     const text = editor.value;
     const out = text.split(q).join(rep);   // split/join 不把 $& 当特殊字符
-    replaceSelectionKeepingUndo(out, 0, text.length);
+    if (!replaceSelectionKeepingUndo(out, 0, text.length)) {
+        showToast('自动重载模式下内容是只读的');
+        return;
+    }
     collectMatches();
     showToast('已替换 ' + n + ' 处');
 }
@@ -3950,20 +3973,32 @@ document.addEventListener('keydown', (e) => {
     else if (ctrl && !e.shiftKey && k === 'f') { e.preventDefault(); openFindBar(false); }
     else if (ctrl && e.shiftKey && k === 'h') { e.preventDefault(); openFindBar(true); }
     // ---- 标题 / 列表快捷键 ----
+    // ⚠️ 这些都是**改编辑区内容**的快捷键，必须要求焦点在编辑区 ——
+    //    否则在设置面板（滑块、输入框）里按 Ctrl+1 也会去改正文。
     // ⚠️ Ctrl+1/2/3 在 Chrome 里是「切换标签页」的保留键，可能根本收不到。
     //    收不到就得去 WebView2 层拦（见 main.rs 的 install_reload_blocker），
     //    拦完记得 emit 事件通知前端。
     else if (ctrl && !e.shiftKey) {
         const m = /^Digit([1-6])$/.exec(e.code || '');
-        if (m) { e.preventDefault(); applyHeading(Number(m[1])); }
+        if (m) {
+            if (document.activeElement !== editor) return;
+            e.preventDefault();
+            applyHeading(Number(m[1]));
+        }
         // ---- 格式化快捷键（只在编辑区聚焦时才生效）----
         else if (document.activeElement === editor) {
             if (e.code === 'KeyB') { e.preventDefault(); formatSelection('bold'); }
             else if (e.code === 'KeyI') { e.preventDefault(); formatSelection('italic'); }
             else if (e.code === 'Backquote') { e.preventDefault(); formatSelection('code'); }
         }
-    } else if (ctrl && e.shiftKey && e.code === 'Digit7') { e.preventDefault(); applyList('ol'); }
-    else if (ctrl && e.shiftKey && e.code === 'Digit8') { e.preventDefault(); applyList('ul'); }
+    } else if (ctrl && e.shiftKey && e.code === 'Digit7') {
+        if (document.activeElement !== editor) return;
+        e.preventDefault(); applyList('ol');
+    }
+    else if (ctrl && e.shiftKey && e.code === 'Digit8') {
+        if (document.activeElement !== editor) return;
+        e.preventDefault(); applyList('ul');
+    }
     else if (ctrl && e.shiftKey && e.code === 'KeyX' && document.activeElement === editor) {
         e.preventDefault(); formatSelection('strike');   // 删除线
     }
