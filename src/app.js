@@ -551,8 +551,40 @@ function markEdited() {
 
 // ============ Markdown 格式化（右键菜单 / 浮动工具栏共用）============
 /**
- * 把选中的文字包成 Markdown 格式。
+ * 选区内容**已经**是这种格式的话，把它拆掉（返回去掉标记后的文字）；
+ * 不是的话返回 null。
+ * 用于“按一下加上、再按一下取消”的切换行为。
+ */
+function unwrapFormat(sel, kind) {
+    if (kind === 'bold') {
+        const m = sel.match(/^\*\*([\s\S]+)\*\*$/);
+        return m ? m[1] : null;
+    }
+    if (kind === 'italic') {
+        // 首字符不能是 * —— 否则 `**bold**` 会被误当成斜体
+        const m = sel.match(/^\*([^*\s][\s\S]*?)\*$/);
+        return m ? m[1] : null;
+    }
+    if (kind === 'code') {
+        const m = sel.match(/^`([^`]+)`$/);
+        return m ? m[1] : null;
+    }
+    if (kind === 'codeblock') {
+        // 插入时是 `\n```\n内容\n```\n`，所以围栏前后各有一个换行
+        const m = sel.match(/^\s*```[^\n]*\n([\s\S]*?)\n```\s*$/);
+        return m ? m[1] : null;
+    }
+    if (kind === 'link') {
+        const m = sel.match(/^\[([^\]]*)\]\(([^)]*)\)$/);
+        return m ? m[1] : null;
+    }
+    return null;
+}
+
+/**
+ * 把选中的文字包成 Markdown 格式（**可切换**）。
  * kind: 'bold' | 'italic' | 'code' | 'codeblock' | 'link'
+ * 已经套过这个格式 → 拆掉（“按一下加上、再按一下取消”）。
  * 没选区时什么也不做（返回 false）。
  * ⚠️ 走 replaceSelectionKeepingUndo()（内部用 execCommand('insertText')）——
  *    直接改 editor.value 会冲掉撤销栈，插入完按 Ctrl+Z 撤销不了。
@@ -561,6 +593,14 @@ function formatSelection(kind) {
     const s = editor.selectionStart, e = editor.selectionEnd;
     if (s === e) return false;
     const sel = editor.value.slice(s, e);
+    // 已经是这个格式 → 拆掉
+    const unwrapped = unwrapFormat(sel, kind);
+    if (unwrapped !== null) {
+        replaceSelectionKeepingUndo(unwrapped, s, e);
+        editor.setSelectionRange(s, s + unwrapped.length);
+        editor.focus({ preventScroll: true });
+        return true;
+    }
     let text;
     if (kind === 'bold') text = '**' + sel + '**';
     else if (kind === 'italic') text = '*' + sel + '*';
@@ -632,6 +672,11 @@ function updateSelToolbar() {
     const r = selectionRect();
     selToolbar.style.visibility = 'hidden';
     selToolbar.classList.add('show');
+    // 按钮的激活状态：选中的内容已经是这个格式（比如已经加粗了）
+    const sel = editor.value.slice(editor.selectionStart, editor.selectionEnd);
+    for (const btn of selToolbar.querySelectorAll('button[data-fmt]')) {
+        btn.classList.toggle('on', unwrapFormat(sel, btn.dataset.fmt) !== null);
+    }
     const tw = selToolbar.offsetWidth, th = selToolbar.offsetHeight;
     // 水平：居中于选区，但不超出窗口
     let left = r.x + r.w / 2 - tw / 2;
@@ -3886,6 +3931,12 @@ document.addEventListener('keydown', (e) => {
     else if (ctrl && !e.shiftKey) {
         const m = /^Digit([1-6])$/.exec(e.code || '');
         if (m) { e.preventDefault(); applyHeading(Number(m[1])); }
+        // ---- 格式化快捷键（只在编辑区聚焦时才生效）----
+        else if (document.activeElement === editor) {
+            if (e.code === 'KeyB') { e.preventDefault(); formatSelection('bold'); }
+            else if (e.code === 'KeyI') { e.preventDefault(); formatSelection('italic'); }
+            else if (e.code === 'Backquote') { e.preventDefault(); formatSelection('code'); }
+        }
     } else if (ctrl && e.shiftKey && e.code === 'Digit7') { e.preventDefault(); applyList('ol'); }
     else if (ctrl && e.shiftKey && e.code === 'Digit8') { e.preventDefault(); applyList('ul'); }
 });

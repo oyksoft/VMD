@@ -1584,6 +1584,11 @@ body.print-mode .mermaid-block { background: transparent !important; }
     background: var(--bg-elevated);
     color: var(--text-strong);
 }
+/* 选中的内容已经是这个格式（比如已经加粗了）→ 按钮点亮 */
+.sel-toolbar button.on {
+    background: var(--accent);
+    color: #fff;
+}
 .sel-toolbar .mono { font-family: var(--font-mono); font-size: 12px; }
 
 /* === 代码块：右上角浮动语言标签 + 复制按钮（不占行） === */
