@@ -4131,13 +4131,10 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     // 所以只读模式下这些项必须单独挡住，否则"只读却能改"。
     const EDIT_ACTIONS = new Set([
         'undo', 'redo', 'cut', 'paste',
-        'fmt-bold', 'fmt-italic', 'fmt-code', 'fmt-codeblock', 'fmt-link',
         'insert-link', 'insert-codeblock', 'insert-table', 'insert-image',
     ]);
 
     function editorMenu() {
-        const sel = editor.value.substring(editor.selectionStart, editor.selectionEnd);
-        const hasSel = sel.length > 0;
         const ro = editor.readOnly;   // 自动重载开着 = 只读
         return [
             item('撤销',  { act: 'undo',  icon: '↶', shortcut: 'Ctrl+Z', disabled: ro }),
@@ -4149,14 +4146,9 @@ if (window.__TAURI__ && window.__TAURI__.event) {
             sep(),
             item('全选', { act: 'selectAll', icon: '🔲', shortcut: 'Ctrl+A' }),
             sep(),
-            // ---- 格式化区：把**选中的文字**包起来（没选中就置灰）----
-            item('加粗 **',    { act: 'fmt-bold',   icon: 'B', disabled: ro || !hasSel }),
-            item('斜体 *',     { act: 'fmt-italic', icon: 'I', disabled: ro || !hasSel }),
-            item('行内代码 `', { act: 'fmt-code',   icon: '<>', disabled: ro || !hasSel }),
-            item('代码块 ```', { act: 'fmt-codeblock', icon: '{ }', disabled: ro || !hasSel }),
-            item('链接',       { act: 'fmt-link',   icon: '🔗', disabled: ro || !hasSel }),
-            sep(),
             // ---- 插入区：纯插入（会替换掉当前选区），归到二级菜单里 ----
+            // ⚠️ 这里**不再放**加粗/斜体/代码那些格式化项 —— 它们由「选区浮动工具栏」
+            //    负责（选中文字就自动浮现），重复放两份是冗余。
             subItem('插入', 'insert', '➕', [
                 item('链接 [文字](url)', { act: 'insert-link', icon: '🔗', disabled: ro }),
                 item('图片',             { act: 'insert-image', icon: '🖼', disabled: ro }),
@@ -4257,7 +4249,6 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         // 点到二级菜单的父项（如“插入”）→ 只是展开子菜单，不执行任何动作
         if (row.classList.contains('ctx-item-has-sub')) return;
         const act = row.dataset.act;
-        const sel = editor.value.substring(editor.selectionStart, editor.selectionEnd);
 
         // 只读（自动重载）模式下不许改内容 —— 菜单项已经置灰，这里再挡一道（菜单可能是只读前打开的）
         if (menuTarget === 'editor' && editor.readOnly && EDIT_ACTIONS.has(act)) {
@@ -4277,15 +4268,6 @@ if (window.__TAURI__ && window.__TAURI__.event) {
             else if (act === 'copy') { editor.focus({ preventScroll: true }); document.execCommand('copy'); }
             else if (act === 'paste')  { editor.focus({ preventScroll: true }); document.execCommand('paste'); }
             else if (act === 'selectAll') editor.select();
-            // 格式化选中（把选中的文字包起来）
-            else if (act === 'fmt-bold' && sel.length)      formatSelection('bold');
-            else if (act === 'fmt-italic' && sel.length)    formatSelection('italic');
-            else if (act === 'fmt-code' && sel.length)      formatSelection('code');
-            // 代码块：选中的文字整体变成一个围栏代码块
-            // （前面后面各补一个换行 —— markdown 里围栏必须独占一行）
-            else if (act === 'fmt-codeblock' && sel.length) formatSelection('codeblock');
-            // 链接：选中的文字变成链接文字（网址先给个占位，用户自己改）
-            else if (act === 'fmt-link' && sel.length)      formatSelection('link');
             // 插入模板（会替换掉当前选区 —— 这是“插入”的语义）
             else if (act === 'insert-link')       insertAtCursor('[文字](https://)');
             else if (act === 'insert-codeblock')  insertAtCursor('\n```\n代码\n```\n');
