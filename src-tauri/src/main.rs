@@ -563,6 +563,16 @@ fn apply_background_color<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>, t
 /// 用系统默认程序打开 URL（替代 tauri-plugin-shell，省体积）
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
+    // ⚠️ 只允许 http/https/mailto ——
+    //    ShellExecuteW("open") 会用系统默认程序「打开」任何东西（.exe 直接就执行了）。
+    //    md 文件可能来自别人，里面的链接不可信 → 这里必须自己把住。
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:"))
+    {
+        return Err("只允许打开 http/https 链接".to_string());
+    }
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::UI::Shell::ShellExecuteW;

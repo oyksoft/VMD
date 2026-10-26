@@ -435,6 +435,13 @@ preview.addEventListener('click', async (e) => {
     const href = a.getAttribute('href');
     if (!href) return;
     if (href.startsWith('#')) return;   // 锚点不处理（marked 会渲染成普通链接）
+    // ⚠️ 只把 **网址** 交给系统打开 ——
+    //    open_url 底层是 ShellExecuteW("open")，会用系统默认程序「打开」任何东西
+    //    （.exe 直接就执行了）。md 可能来自别人，里面的链接不可信。
+    if (!/^(?:https?|mailto|tel):/i.test(href)) {
+        showToast('这不是网址，没有自动打开（需要的话请复制到浏览器里）', 3200);
+        return;
+    }
     try {
         await invoke('open_url', { url: href });
     } catch (err) {
@@ -1071,7 +1078,10 @@ const PURIFY_CONFIG = {
     // 只放行 http/https/mailto/tel + 相对路径与锚点。
     // 默认规则也是这个意思，这里显式写出来，免得升级 DOMPurify 后白名单变宽。
     // data: 图片由 DOMPurify 自己的 DATA_URI_TAGS 处理（img/video/audio），不受影响。
-    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
+    // ⚠️ 还要放行 **Windows 盘符路径**（`D:/x.png` / `D:\x.png`）：
+    //    没有当前文件时插入的图片就是绝对路径，默认规则会把它当“未知协议”干掉
+    //    （src 属性直接被删 → 图片空白）。`[a-z]:[\\/]` 只匹配盘符，不影响 javascript:。
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):|[a-z]:[\\/]|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
     // 直接返回 DocumentFragment：省一次「序列化 → 再解析」，长文档快不少
     RETURN_DOM_FRAGMENT: true,
 };
@@ -1251,7 +1261,6 @@ function currentBaseDir() {
  */
 function resolveLocalImages() {
     const baseDir = currentBaseDir();
-    if (!baseDir) return;              // 没有文件 → 相对路径无从解析
     // 一次查全文档：逐块查在大文档上会慢很多（几千个块 = 几千次 querySelectorAll）
     const imgs = preview.querySelectorAll('img');
     const pending = [];
@@ -1260,6 +1269,10 @@ function resolveLocalImages() {
         if (!src || !isLocalImageSrc(src)) continue;
         // 已经试过且失败的不再重复请求（图片可能确实不存在）
         if (im.dataset.vmdImgTried) continue;
+        // 相对路径必须有基准目录（当前 markdown 文件所在目录）；
+        // **绝对路径不需要** —— 没有当前文件时插入的图片就是绝对路径，
+        // 那时候 baseDir 是空的，不能因此把图片整个跳过（会白屏）。
+        if (!baseDir && !isAbsoluteImageSrc(src)) continue;
         const key = baseDir + '\u0000' + src;
         const cached = localImageCache.get(key);
         if (cached) {
@@ -1321,6 +1334,11 @@ function isLocalImageSrc(src) {
     if (/^(?:https?:|data:|blob:)/i.test(s)) return false;
     if (s.startsWith('//')) return false;   // 协议相对 URL
     return true;
+}
+
+/** 是不是绝对路径（Windows 盘符 `D:/` 或 `D:\`，或 `/` 开头） */
+function isAbsoluteImageSrc(src) {
+    return /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith('/');
 }
 
 // 1×1 透明 GIF：图片还在等 Rust 读盘时先顶上，
