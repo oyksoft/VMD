@@ -341,7 +341,7 @@ cargo build --release
 mkdir ..\release -Force | Out-Null
 copy /y target\release\vmd.exe ..\release\VMD.exe
 cd ..\release
-Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.5-win64-portable.zip -Force
+Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.5.1-win64-portable.zip -Force
 ```
 
 > touch `tauri.conf.json` 这步别漏 —— `tauri-build` 只监听配置文件的变化，
@@ -351,7 +351,19 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.5-win64-porta
 
 ## 更新日志
 
-### 0.2.5（当前）
+### 0.2.5.1（当前）
+
+修 0.2.5 的两个 Bug：
+
+- 🐛 **「插入 > 图片」报错**（`insertAtCursor is not defined`）—— 插入图片用到的函数
+  定义在右键菜单那个闭包内部，全局看不到。现在挪到全局了
+- 🐛 **插入的图片渲染不出来** —— 没有当前文件时插入的是绝对路径（`D:/x.png`），
+  但白名单不认盘符路径，图片地址被直接删掉。现在放行盘符路径了
+- 🐛 **链接能执行本地程序** —— 别人给的 md 里放一个 `[点我](./xxx.exe)`，
+  你一點它就被系统执行了。现在只有网址（http/https/mailto/tel）会自动打开，
+  其余的提示一下就不动
+
+### 0.2.5
 
 这一版专注**写起来更顺手** —— 选中文字就有工具栏、常用操作有快捷键、
 右键菜单按语义分成两层，另外修了几个影响体验的 Bug。

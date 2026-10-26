@@ -1,6 +1,6 @@
 [package]
 name = "vmd"
-version = "0.2.5"
+version = "0.2.5.1"
 edition = "2021"
 description = "VMD - 一个轻量级的 Markdown 查看与编辑工具"
 
