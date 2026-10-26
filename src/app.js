@@ -653,6 +653,12 @@ if (selToolbar) {
         if (formatSelection(btn.dataset.fmt)) updateSelToolbar();
     });
 }
+// ⚠️ 用户在编辑区按下鼠标 → 肯定要改选区了，工具栏先收起来。
+//    不能只靠 selectionchange：点击（而不是拖选）时浏览器不一定发那个事件，
+//    结果就是“点了别处、选区没了，工具栏还赖着不走”（这个坑踩过）。
+editor.addEventListener('mousedown', () => {
+    if (selToolbar) selToolbar.classList.remove('show');
+});
 editor.addEventListener('scroll', updateSelToolbar);
 window.addEventListener('resize', updateSelToolbar);
 // 失焦 → 工具栏要收起来
