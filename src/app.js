@@ -549,6 +549,214 @@ function markEdited() {
     updateFilename();
 }
 
+// ============ Markdown 格式化（右键菜单 / 浮动工具栏共用）============
+/**
+ * 把选中的文字包成 Markdown 格式。
+ * kind: 'bold' | 'italic' | 'code' | 'codeblock' | 'link'
+ * 没选区时什么也不做（返回 false）。
+ * ⚠️ 走 replaceSelectionKeepingUndo()（内部用 execCommand('insertText')）——
+ *    直接改 editor.value 会冲掉撤销栈，插入完按 Ctrl+Z 撤销不了。
+ */
+function formatSelection(kind) {
+    const s = editor.selectionStart, e = editor.selectionEnd;
+    if (s === e) return false;
+    const sel = editor.value.slice(s, e);
+    let text;
+    if (kind === 'bold') text = '**' + sel + '**';
+    else if (kind === 'italic') text = '*' + sel + '*';
+    else if (kind === 'code') text = '`' + sel + '`';
+    // 代码块：前后各补一个换行 —— markdown 里围栏必须独占一行
+    else if (kind === 'codeblock') text = '\n```\n' + sel + '\n```\n';
+    else if (kind === 'link') text = '[' + sel + '](https://)';
+    else return false;
+    replaceSelectionKeepingUndo(text, s, e);
+    editor.setSelectionRange(s, s + text.length);
+    editor.focus({ preventScroll: true });
+    return true;
+}
+
+// ============ 选区浮动工具栏 ============
+// 选中编辑区文字后，在选区上方浮现一排格式化按钮。
+//
+// 位置靠**算**而不是靠镜像层：编辑区是等宽字体 + wrap="off"（不折行），
+// 所以「行号 × 行高」= y、「列号 × 字符宽」= x —— 和目录跳转是同一套思路。
+const selToolbar = document.getElementById('sel-toolbar');
+let charWidthCache = 0;
+let charWidthFont = '';
+
+/** 编辑区里一个字符的宽度（等宽字体，用 canvas 量） */
+function editorCharWidth() {
+    const cs = getComputedStyle(editor);
+    const font = cs.fontSize + ' ' + cs.fontFamily;
+    if (font !== charWidthFont) {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        ctx.font = font;
+        charWidthCache = ctx.measureText('M').width;
+        charWidthFont = font;
+    }
+    return charWidthCache;
+}
+
+/** 选区在视口里的位置和尺寸 */
+function selectionRect() {
+    const value = editor.value;
+    const s = editor.selectionStart, e = editor.selectionEnd;
+    const before = value.slice(0, s);
+    const line = before.split('\n').length - 1;
+    const lineStart = before.lastIndexOf('\n') + 1;
+    const col = s - lineStart;
+    const cs = getComputedStyle(editor);
+    const lh = parseFloat(cs.lineHeight) || 20;
+    const cw = editorCharWidth();
+    const rect = editor.getBoundingClientRect();
+    const x = rect.left + parseFloat(cs.paddingLeft) + col * cw - editor.scrollLeft;
+    const y = rect.top + parseFloat(cs.paddingTop) + line * lh - editor.scrollTop;
+    // 宽度：到本行行尾为止（跨行时只取第一行那段）
+    const nl = value.indexOf('\n', s);
+    const endCol = (nl === -1 ? value.length : nl) - s;
+    const w = Math.min(endCol, e - s) * cw;
+    return { x, y, w, h: lh };
+}
+
+/** 显示 / 隐藏 / 移动浮动工具栏 */
+function updateSelToolbar() {
+    if (!selToolbar) return;
+    const show = editMode && !editor.readOnly
+        && document.activeElement === editor
+        && editor.selectionStart !== editor.selectionEnd;
+    if (!show) {
+        selToolbar.classList.remove('show');
+        return;
+    }
+    const r = selectionRect();
+    selToolbar.style.visibility = 'hidden';
+    selToolbar.classList.add('show');
+    const tw = selToolbar.offsetWidth, th = selToolbar.offsetHeight;
+    // 水平：居中于选区，但不超出窗口
+    let left = r.x + r.w / 2 - tw / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+    // 垂直：默认在选区上方；上方不够（第一行 / 贴着工具栏）就放下方
+    let top = r.y - th - 8;
+    if (top < 56) top = r.y + r.h + 8;
+    selToolbar.style.left = left + 'px';
+    selToolbar.style.top = top + 'px';
+    selToolbar.style.visibility = 'visible';
+}
+
+if (selToolbar) {
+    // mousedown 阻止默认 → 按钮不会抢走编辑区焦点，选区还在（否则点了按钮就没得选了）
+    selToolbar.addEventListener('mousedown', (e) => e.preventDefault());
+    selToolbar.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-fmt]');
+        if (!btn) return;
+        if (formatSelection(btn.dataset.fmt)) updateSelToolbar();
+    });
+}
+editor.addEventListener('scroll', updateSelToolbar);
+window.addEventListener('resize', updateSelToolbar);
+// 失焦 → 工具栏要收起来
+editor.addEventListener('blur', updateSelToolbar);
+// ⚠️ 程序性的 setSelectionRange / 改 value **不一定会触发 selectionchange**
+//    （浏览器只在用户操作时发），所以再兜几个：
+//    select = 选区变化的标准事件（程序性 setSelectionRange 也会发，最准）
+//    input = 打字后；keyup = 方向键等（虽然 selectionchange 一般也会跟着）
+editor.addEventListener('select', updateSelToolbar);
+editor.addEventListener('input', updateSelToolbar);
+editor.addEventListener('keyup', updateSelToolbar);
+
+// ============ 插入图片 ============
+/** 图片路径转成相对于当前 markdown 文件的路径（markdown 里统一用 / 分隔） */
+function relativeImagePath(full) {
+    const f = String(full).replace(/\\/g, '/');
+    const base = currentFile ? currentBaseDir().replace(/\\/g, '/').replace(/\/+$/, '') : '';
+    if (!base) return f;
+    // 同一个目录树下 → 用相对路径（换台电脑、换个目录也能用）
+    if (f.toLowerCase().startsWith(base.toLowerCase() + '/')) return f.slice(base.length + 1);
+    return f;   // 不在同一个目录树下 → 只能用绝对路径
+}
+
+/** 选一张本地图片，插入 ![](相对路径) */
+async function insertImage() {
+    try {
+        const picked = await open({
+            multiple: false,
+            filters: [{
+                name: '图片',
+                extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'avif'],
+            }],
+        });
+        if (!picked) return;
+        const path = Array.isArray(picked) ? picked[0] : picked;
+        const rel = relativeImagePath(path);
+        // 路径里有空格时用尖括号包起来（markdown 标准写法，不用 %20 编码）
+        const target = /\s/.test(rel) ? '<' + rel + '>' : rel;
+        const text = '\n![](' + target + ')\n';
+        const s = editor.selectionStart;
+        insertAtCursor(text);
+        // 光标落到 alt 文本里（![] 的中间），用户直接就能写图片说明
+        const altPos = s + 3;   // '\n' + '!' + '['
+        editor.setSelectionRange(altPos, altPos);
+        editor.focus({ preventScroll: true });
+    } catch (e) {
+        showError('插入图片失败', e);
+    }
+}
+
+// ============ 快捷键：标题 / 列表 ============// Ctrl+1/2/3 → 把选中的行变成 # / ## / ###
+// Ctrl+Shift+7/8 → 有序 / 无序列表
+//
+// 用 e.code 判断（物理键位）：Ctrl+Shift+8 在 US 布局下 e.key 是 '*'，
+// 用 e.key 会漏掉其它布局。
+// ⚠️ Ctrl+1/2/3 在 Chrome 里是“切换标签页”的保留键，可能根本收不到 ——
+//    如果实测收不到，得去 WebView2 层（AcceleratorKeyPressed）拦，
+//    拦完记得 emit 事件通知前端（见 main.rs 的 install_reload_blocker）。
+
+/** 选区覆盖的行范围（没有选区时就是光标所在那一行） */
+function selectedLineRange() {
+    const value = editor.value;
+    const s = editor.selectionStart, e = editor.selectionEnd;
+    const lineStart = value.lastIndexOf('\n', s - 1) + 1;
+    let lineEnd = value.indexOf('\n', e);
+    if (lineEnd === -1) lineEnd = value.length;
+    return [lineStart, lineEnd];
+}
+
+/** Ctrl+1/2/3：把选中的行变成标题 */
+function applyHeading(level) {
+    const [lineStart, lineEnd] = selectedLineRange();
+    const block = editor.value.slice(lineStart, lineEnd);
+    const prefix = '#'.repeat(level) + ' ';
+    const out = block.split('\n')
+        .map(line => prefix + line.replace(/^#{1,6}\s*/, ''))   // 去掉旧标题标记
+        .join('\n');
+    replaceSelectionKeepingUndo(out, lineStart, lineEnd);
+    editor.setSelectionRange(lineStart, lineStart + out.length);
+    editor.focus({ preventScroll: true });
+}
+
+/** Ctrl+Shift+7/8：有序 / 无序列表（再按一次 = 取消列表） */
+function applyList(kind) {
+    const [lineStart, lineEnd] = selectedLineRange();
+    const block = editor.value.slice(lineStart, lineEnd);
+    let n = 0;
+    const out = block.split('\n').map(line => {
+        const m = line.match(/^(\s*)(?:[-*+]|\d+\.)\s+(.*)$/);
+        const indent = m ? m[1] : (line.match(/^(\s*)/) || ['', ''])[1];
+        const rest = m ? m[2] : line.slice(indent.length);
+        const isUl = /^[-*+]\s/.test(line);
+        const isOl = /^\d+\.\s/.test(line);
+        // 已经是目标类型的列表 → 再按一次就取消（变回普通段落）
+        if ((kind === 'ul' && isUl) || (kind === 'ol' && isOl)) return indent + rest;
+        n++;
+        const marker = kind === 'ol' ? n + '. ' : '- ';
+        return indent + marker + rest;
+    }).join('\n');
+    replaceSelectionKeepingUndo(out, lineStart, lineEnd);
+    editor.setSelectionRange(lineStart, lineStart + out.length);
+    editor.focus({ preventScroll: true });
+}
+
 // textarea 的默认行为是"按 Tab 把焦点移走" —— 写 markdown 嵌套列表时想按 Tab
 // 缩进，结果焦点跳到工具栏按钮上去了。这里改成插缩进（Shift+Tab 反缩进）。
 const TAB_SIZE = 2;   // markdown 嵌套列表用 2 空格（4 空格会被 CommonMark 当成代码块）
@@ -862,6 +1070,7 @@ function renderPreview() {
     previewBlockKeys = keys;
     previewRenderedSource = text;
     previewRenderedBase = baseDir;
+    updateSelToolbar();   // 换文件后选区没了，浮动工具栏要收起来
 }
 
 /** 当前 markdown 文件所在目录（本地相对路径图片的解析基准） */
@@ -3617,6 +3826,16 @@ document.addEventListener('keydown', (e) => {
     else if (ctrl && k === 'n') { e.preventDefault(); document.getElementById('btn-new').click(); }
     else if (ctrl && !e.shiftKey && k === 'f') { e.preventDefault(); openFindBar(false); }
     else if (ctrl && e.shiftKey && k === 'h') { e.preventDefault(); openFindBar(true); }
+    // ---- 标题 / 列表快捷键 ----
+    // ⚠️ Ctrl+1/2/3 在 Chrome 里是「切换标签页」的保留键，可能根本收不到。
+    //    收不到就得去 WebView2 层拦（见 main.rs 的 install_reload_blocker），
+    //    拦完记得 emit 事件通知前端。
+    else if (ctrl && !e.shiftKey) {
+        if (e.code === 'Digit1') { e.preventDefault(); applyHeading(1); }
+        else if (e.code === 'Digit2') { e.preventDefault(); applyHeading(2); }
+        else if (e.code === 'Digit3') { e.preventDefault(); applyHeading(3); }
+    } else if (ctrl && e.shiftKey && e.code === 'Digit7') { e.preventDefault(); applyList('ol'); }
+    else if (ctrl && e.shiftKey && e.code === 'Digit8') { e.preventDefault(); applyList('ul'); }
 });
 
 // ============ TOC 高亮 ============
@@ -3907,7 +4126,7 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     const EDIT_ACTIONS = new Set([
         'undo', 'redo', 'cut', 'paste',
         'fmt-bold', 'fmt-italic', 'fmt-code', 'fmt-codeblock', 'fmt-link',
-        'insert-link', 'insert-codeblock', 'insert-table',
+        'insert-link', 'insert-codeblock', 'insert-table', 'insert-image',
     ]);
 
     function editorMenu() {
@@ -3934,6 +4153,7 @@ if (window.__TAURI__ && window.__TAURI__.event) {
             // ---- 插入区：纯插入（会替换掉当前选区），归到二级菜单里 ----
             subItem('插入', 'insert', '➕', [
                 item('链接 [文字](url)', { act: 'insert-link', icon: '🔗', disabled: ro }),
+                item('图片',             { act: 'insert-image', icon: '🖼', disabled: ro }),
                 item('代码块 ```',       { act: 'insert-codeblock', icon: '{ }', disabled: ro }),
                 item('表格',             { act: 'insert-table', icon: '⊞', disabled: ro }),
             ].join('')),
@@ -4052,18 +4272,20 @@ if (window.__TAURI__ && window.__TAURI__.event) {
             else if (act === 'paste')  { editor.focus({ preventScroll: true }); document.execCommand('paste'); }
             else if (act === 'selectAll') editor.select();
             // 格式化选中（把选中的文字包起来）
-            else if (act === 'fmt-bold' && sel.length)      wrapSelection(`**${sel}**`);
-            else if (act === 'fmt-italic' && sel.length)    wrapSelection(`*${sel}*`);
-            else if (act === 'fmt-code' && sel.length)      wrapSelection('`' + sel + '`');
+            else if (act === 'fmt-bold' && sel.length)      formatSelection('bold');
+            else if (act === 'fmt-italic' && sel.length)    formatSelection('italic');
+            else if (act === 'fmt-code' && sel.length)      formatSelection('code');
             // 代码块：选中的文字整体变成一个围栏代码块
             // （前面后面各补一个换行 —— markdown 里围栏必须独占一行）
-            else if (act === 'fmt-codeblock' && sel.length) wrapSelection('\n```\n' + sel + '\n```\n');
+            else if (act === 'fmt-codeblock' && sel.length) formatSelection('codeblock');
             // 链接：选中的文字变成链接文字（网址先给个占位，用户自己改）
-            else if (act === 'fmt-link' && sel.length) wrapSelection('[' + sel + '](https://)');
+            else if (act === 'fmt-link' && sel.length)      formatSelection('link');
             // 插入模板（会替换掉当前选区 —— 这是“插入”的语义）
             else if (act === 'insert-link')       insertAtCursor('[文字](https://)');
             else if (act === 'insert-codeblock')  insertAtCursor('\n```\n代码\n```\n');
             else if (act === 'insert-table')      insertAtCursor('\n| 列1 | 列2 |\n|---|---|\n| 内容 | 内容 |\n');
+            // 插入图片：要弹文件选择框，得异步 —— 先把菜单关了
+            else if (act === 'insert-image')      { closeMenu(); insertImage(); }
         }
         // ----- preview 操作 -----
         else if (menuTarget === 'preview') {
@@ -4111,11 +4333,6 @@ if (window.__TAURI__ && window.__TAURI__.event) {
             editor.setSelectionRange(selStart, selStart + text.length);
         }
         editor.focus({ preventScroll: true });
-    }
-
-    function wrapSelection(text) {
-        const s = editor.selectionStart, e = editor.selectionEnd;
-        menuInsertText(text, s, e, false);   // 插入后选中它，方便继续改
     }
 
     function insertAtCursor(text) {

@@ -89,6 +89,15 @@
                 <div id="editor-status" class="editor-status"></div>
             </main>
 
+            <!-- 选区浮动工具栏：编辑区里选中文字后，在选区上方浮现的一排格式化按钮 -->
+            <div id="sel-toolbar" class="sel-toolbar">
+                <button type="button" data-fmt="bold" title="加粗"><b>B</b></button>
+                <button type="button" data-fmt="italic" title="斜体"><i>I</i></button>
+                <button type="button" data-fmt="code" title="行内代码"><span class="mono">&lt;&gt;</span></button>
+                <button type="button" data-fmt="codeblock" title="代码块"><span class="mono">{ }</span></button>
+                <button type="button" data-fmt="link" title="链接"><span class="mono">🔗</span></button>
+            </div>
+
             <div class="splitter" id="split-preview" title="拖动调整宽度（双击重置）"></div>
 
             <section id="preview-wrap">

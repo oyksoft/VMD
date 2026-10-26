@@ -1546,6 +1546,46 @@ body.print-mode #preview hr { border-color: #ccc !important; }
 /* 打印时用浅色主题（深色背景打印出来耗墨且不清晰） */
 body.print-mode .mermaid-block { background: transparent !important; }
 
+/* === 选区浮动工具栏 === */
+/* 选中编辑区文字后，在选区上方浮现。
+   ⚠️ 位置用 fixed（视口坐标），和 getBoundingClientRect 同一坐标系；
+   放在 #content 里（它 overflow:hidden，但 fixed 不受祖先 overflow 影响）。
+   ⚠️ 别放进 #editor-wrap —— 那是滚动容器，浮层会跟着正文一起滚走。 */
+.sel-toolbar {
+    position: fixed;
+    z-index: 10003;
+    display: none;
+    align-items: center;
+    gap: 2px;
+    padding: 4px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.38);
+}
+.sel-toolbar.show { display: flex; }
+.sel-toolbar button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    min-width: 27px;
+    height: 27px;
+    padding: 0 5px;
+    border-radius: 5px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.sel-toolbar button:hover {
+    background: var(--bg-elevated);
+    color: var(--text-strong);
+}
+.sel-toolbar .mono { font-family: var(--font-mono); font-size: 12px; }
+
 /* === 代码块：右上角浮动语言标签 + 复制按钮（不占行） === */
 .code-block {
     position: relative;
