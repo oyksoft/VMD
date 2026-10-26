@@ -1,6 +1,6 @@
 # VMD · 一个轻量的 Markdown 编辑器（带实时预览）
 
-[![version](https://img.shields.io/badge/version-0.2.5-blue)](https://github.com/oyksoft/VMD)
+[![version](https://img.shields.io/badge/version-0.2.6-blue)](https://github.com/oyksoft/VMD)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4?logo=windows)](https://github.com/oyksoft/VMD)
 [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/oyksoft/VMD)
 
@@ -341,7 +341,7 @@ cargo build --release
 mkdir ..\release -Force | Out-Null
 copy /y target\release\vmd.exe ..\release\VMD.exe
 cd ..\release
-Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.5.1-win64-portable.zip -Force
+Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.6-win64-portable.zip -Force
 ```
 
 > touch `tauri.conf.json` 这步别漏 —— `tauri-build` 只监听配置文件的变化，
@@ -351,9 +351,9 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.5.1-win64-por
 
 ## 更新日志
 
-### 0.2.5.1（当前）
+### 0.2.6（当前）
 
-修 0.2.5 的两个 Bug：
+0.2.5 的补丁版，修三个 Bug：
 
 - 🐛 **「插入 > 图片」报错**（`insertAtCursor is not defined`）—— 插入图片用到的函数
   定义在右键菜单那个闭包内部，全局看不到。现在挪到全局了
