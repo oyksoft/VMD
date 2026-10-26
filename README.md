@@ -1,12 +1,34 @@
 # VMD · 一个轻量的 Markdown 编辑器（带实时预览）
 
-[![version](https://img.shields.io/badge/version-0.2.3-blue)](https://github.com/oyksoft/VMD)
+[![version](https://img.shields.io/badge/version-0.2.4-blue)](https://github.com/oyksoft/VMD)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4?logo=windows)](https://github.com/oyksoft/VMD)
 [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/oyksoft/VMD)
 
 > 用 Tauri + 系统自带 WebView 写的小工具，**打开就能用**，**全离线**，**不需要 Node / Python / Electron**。
 
 左边写，右边实时看到效果。写的每一个字都是**纯 Markdown 源码**，所见即所得，不给你偷偷加格式。
+
+---
+
+## 这是个什么软件
+
+**VMD 是一个 Windows 上的 Markdown 笔记 / 文档编辑器** —— 左边是纯 Markdown 源码，右边是实时渲染的预览。
+
+它做的事就三件，但每件都做得很实在：
+
+1. **写** —— 双栏对着写，所见即所得。你写的每一行都是标准 Markdown 源码，
+   VMD 不会给你塞任何私有格式，文件拿别的编辑器打开一样能用。
+2. **看** —— Mermaid 流程图、LaTeX 公式、代码高亮、表格、Emoji 短代码都支持，
+   渲染结果就是最终排版，不是「预览个大概」。
+3. **存** —— 就是一个普通的 `.md` 文件。双击能开、能关联、能拖进来、能导出 PDF。
+
+**适合谁**：写技术文档 / 博客草稿 / README 的人，需要离线或在内网工作的人，
+以及不想被 Typora / Obsidian 那种「格式锁死」绑架的人。
+
+**不适合谁**：要协同 / 云同步的人（VMD 是纯本地工具），
+要导出 Word / PPT 的人，或者想要 Word 那种所见即所得富文本的人。
+
+**一句话**：如果你需要的是一个「安静、离线、打开就写」的 Markdown 编辑器，VMD 就是干这个的。
 
 ---
 
@@ -319,7 +341,7 @@ cargo build --release
 mkdir ..\release -Force | Out-Null
 copy /y target\release\vmd.exe ..\release\VMD.exe
 cd ..\release
-Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.1-win64-portable.zip -Force
+Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.4-win64-portable.zip -Force
 ```
 
 > touch `tauri.conf.json` 这步别漏 —— `tauri-build` 只监听配置文件的变化，
@@ -329,7 +351,44 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.1-win64-porta
 
 ## 更新日志
 
-### 0.2.3（当前）
+### 0.2.4（当前）
+
+这一版基本都是「把地基打牢」—— 安全、可靠、长文档能用，另外加了两个新功能。
+
+**新增**
+
+- 🆘 **崩溃恢复** —— 没保存的内容会定时存一份快照（每 5 秒），
+  万一程序崩了 / 被强杀了，下次启动会问你要不要恢复。
+  拖 `.md` 进来时如果会覆盖正在写的内容，现在也会先问一句了
+- 🔤 **代码自动换行**（设置项）—— 预览区里很长的代码行自动折行，不用横向拖。
+  表格单元格里的长代码也会断（不然整张表会被撑得比窗口还宽）。
+  编辑区不受影响 —— 那边不折行是目录精确跳转的前提
+- 🔒 **预览内容消毒** —— 打开别人给的 `.md` 不会再有风险。
+  原始 HTML 里的 `<script>`、`<img onerror=...>`、`javascript:` 链接都被清掉了，
+  但图片、表格、任务列表的勾选框这些正常功能一个不少
+
+**修复**
+
+- 🐛 **预览里的本地图片加载不出来** —— `![](images/a.png)` 这种相对路径的图片
+  之前一律空白（WebView2 不让网页直接读本地文件）。现在由程序读出来内嵌成图片，正常显示
+- 🐛 **拖进来的文件会静默覆盖正在写的内容** —— 之前完全没提示，改一下就没了。现在会先问
+- 🐛 **保存时会半路截断文件** —— 之前是「清空再写」，写到一半断电 / 被杀毒软件锁住，
+  文件就废了。现在改成「写临时文件 → 落盘 → 改名」，中途出事原文件完好
+- 🐛 **GBK 编码的文件被悄悄转成 UTF-8** —— 现在能认出来（UTF-8 / 带 BOM 的 / UTF-16 / GBK），
+  保存时按原来的编码写回去，不会偷偷改你文件的格式
+- 🐛 **浏览器原生 `alert` 弹窗** —— 全部换成应用内弹窗，样式跟主题一致
+- 🐛 **Mermaid 渲染失败时的提示块会执行源码里的 HTML** —— 现在改成纯文本显示
+
+**优化**
+
+- ⚡ **长文档渲染改增量** —— 以前每次敲一个字，整篇文档都要重新解析 + 重新排版。
+  1MB 的文档改一个字要等 1.2 秒；现在只重算真正变了的那几块，**约 150 毫秒**（快 8 倍）
+- 📑 **目录不再跟着每次输入重建** —— 以前每敲一个字目录都在抖。现在结构没变就原地更新
+- 🔬 **Mermaid 收紧到 strict 模式** —— 别人给的文档里的流程图不能再偷偷挂链接
+- 🔍 **文字缩放改成 5% 一档** —— 原来 10% 一档，中间值够不着
+- 💬 界面文案去掉技术黑话
+
+### 0.2.3
 
 **新增**
 
