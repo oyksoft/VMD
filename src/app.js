@@ -728,22 +728,36 @@ function selectedLineRange() {
     return [lineStart, lineEnd];
 }
 
-/** Ctrl+1/2/3：把选中的行变成标题 */
+/**
+ * 替换一段文本后，把**原来的选区**映射到新文本里。
+ * - 原来只是光标（没选中）→ 新位置还是光标（不会变成“选中了”）
+ * - 原来选了字 → 选区跟着走（相对行首的偏移不变）
+ * 不这么做的话，改完标题/列表会突然把整行选中（用户反馈过）。
+ */
+function remapSelection(lineStart, oldStart, oldEnd, newLen) {
+    const from = Math.max(0, Math.min(oldStart - lineStart, newLen));
+    const to = Math.max(from, Math.min(oldEnd - lineStart, newLen));
+    editor.setSelectionRange(lineStart + from, lineStart + to);
+}
+
+/** Ctrl+1~6：把选中的行变成标题 */
 function applyHeading(level) {
     const [lineStart, lineEnd] = selectedLineRange();
+    const s = editor.selectionStart, e = editor.selectionEnd;
     const block = editor.value.slice(lineStart, lineEnd);
     const prefix = '#'.repeat(level) + ' ';
     const out = block.split('\n')
         .map(line => prefix + line.replace(/^#{1,6}\s*/, ''))   // 去掉旧标题标记
         .join('\n');
     replaceSelectionKeepingUndo(out, lineStart, lineEnd);
-    editor.setSelectionRange(lineStart, lineStart + out.length);
+    remapSelection(lineStart, s, e, out.length);
     editor.focus({ preventScroll: true });
 }
 
 /** Ctrl+Shift+7/8：有序 / 无序列表（再按一次 = 取消列表） */
 function applyList(kind) {
     const [lineStart, lineEnd] = selectedLineRange();
+    const s = editor.selectionStart, e = editor.selectionEnd;
     const block = editor.value.slice(lineStart, lineEnd);
     let n = 0;
     const out = block.split('\n').map(line => {
@@ -759,7 +773,7 @@ function applyList(kind) {
         return indent + marker + rest;
     }).join('\n');
     replaceSelectionKeepingUndo(out, lineStart, lineEnd);
-    editor.setSelectionRange(lineStart, lineStart + out.length);
+    remapSelection(lineStart, s, e, out.length);
     editor.focus({ preventScroll: true });
 }
 
@@ -3837,9 +3851,8 @@ document.addEventListener('keydown', (e) => {
     //    收不到就得去 WebView2 层拦（见 main.rs 的 install_reload_blocker），
     //    拦完记得 emit 事件通知前端。
     else if (ctrl && !e.shiftKey) {
-        if (e.code === 'Digit1') { e.preventDefault(); applyHeading(1); }
-        else if (e.code === 'Digit2') { e.preventDefault(); applyHeading(2); }
-        else if (e.code === 'Digit3') { e.preventDefault(); applyHeading(3); }
+        const m = /^Digit([1-6])$/.exec(e.code || '');
+        if (m) { e.preventDefault(); applyHeading(Number(m[1])); }
     } else if (ctrl && e.shiftKey && e.code === 'Digit7') { e.preventDefault(); applyList('ol'); }
     else if (ctrl && e.shiftKey && e.code === 'Digit8') { e.preventDefault(); applyList('ul'); }
 });
