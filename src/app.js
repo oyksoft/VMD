@@ -1776,24 +1776,31 @@ function highlightUnmatchedDelimiters(sourceText) {
     });
     if (!sourceText) return;
 
-    // 在源文本里找 **..** / *..*，只看那些“不紧贴”的
-    const pattern = /(?<!\\)(\*\*?)([^\*\n]+?)\1(?!\\)/g;
-    const errRanges = [];   // [{ start, end }]
-    let m;
-    while ((m = pattern.exec(sourceText))) {
-        const delim = m[1];
-        const inner = m[2];
-        if (!inner) continue;
-        const startPos = m.index;
-        // CommonMark 规则：delimiter 必须紧贴内容，即 inner 的首尾都不能有空白
-        // - **text **  → inner 末尾有空格 → 不成粗体（错误写法）
-        // - ** text**  → inner 开头有空格 → 不成粗体（错误写法）
-        // - **text**   → 紧贴 → 正常
-        // 注意：delim 前面有空格是允许的（如 "- **左侧**：..."），不是错误
-        const innerStartSpace = /^\s/.test(inner);
-        const innerEndSpace = /\s$/.test(inner);
-        if (innerStartSpace || innerEndSpace) {
-            errRanges.push({ start: startPos, end: startPos + m[0].length, delimLen: delim.length });
+    // 在源文本里找 **..** / *..* / ~~..~~，只看那些“不紧贴”的
+    // （删除线是 GFM 扩展，规则一样：~~ 紧贴内容才能生效）
+    const patterns = [
+        { re: /(?<!\\)(~~)([^~\n]+?)\1(?!\\)/g, label: '~~' },
+        { re: /(?<!\\)(\*\*?)([^*\n]+?)\1(?!\\)/g, label: null },   // label=null 时按长度区分 ** / *
+    ];
+    const errRanges = [];   // [{ start, end, delim }]
+    for (const p of patterns) {
+        p.re.lastIndex = 0;
+        let m;
+        while ((m = p.re.exec(sourceText))) {
+            const delim = m[1];
+            const inner = m[2];
+            if (!inner) continue;
+            const startPos = m.index;
+            // CommonMark 规则：delimiter 必须紧贴内容，即 inner 的首尾都不能有空白
+            // - **text **  → inner 末尾有空格 → 不成粗体（错误写法）
+            // - ** text**  → inner 开头有空格 → 不成粗体（错误写法）
+            // - **text**   → 紧贴 → 正常
+            // 注意：delim 前面有空格是允许的（如 "- **左侧**：..."），不是错误
+            const innerStartSpace = /^\s/.test(inner);
+            const innerEndSpace = /\s$/.test(inner);
+            if (innerStartSpace || innerEndSpace) {
+                errRanges.push({ start: startPos, end: startPos + m[0].length, delim: delim });
+            }
         }
     }
 
@@ -1812,8 +1819,8 @@ function highlightUnmatchedDelimiters(sourceText) {
             while (p && p !== preview) {
                 const tag = p.tagName;
                 if (tag === 'CODE' || tag === 'PRE' || tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
-                // 跳过已被 marked 正确渲染为粗/斜体的文本（不该报黄）
-                if (tag === 'STRONG' || tag === 'EM') return NodeFilter.FILTER_REJECT;
+                // 跳过已被 marked 正确渲染为粗/斜体/删除线的文本（不该报黄）
+                if (tag === 'STRONG' || tag === 'EM' || tag === 'DEL') return NodeFilter.FILTER_REJECT;
                 p = p.parentNode;
             }
             return NodeFilter.FILTER_ACCEPT;
@@ -1826,7 +1833,7 @@ function highlightUnmatchedDelimiters(sourceText) {
     // 对每个 errRange，在 preview 的文本节点里找对应的全文
     for (const range of errRanges) {
         const snippet = sourceText.slice(range.start, range.end);   // e.g. "**WebView **"
-        const d = range.delimLen || 2;
+        const d = range.delim.length;
         const inner = snippet.slice(d, snippet.length - d);        // 去掉 delimiter
         if (!inner) continue;
         for (const tn of textNodes) {
@@ -1836,31 +1843,32 @@ function highlightUnmatchedDelimiters(sourceText) {
             // 优先匹配完整 snippet（marked 原样输出未渲染的 **..**）
             const idx = text.indexOf(snippet);
             if (idx >= 0) {
-                wrapWithUnmatched(tn, idx, snippet);
+                wrapWithUnmatched(tn, idx, snippet, range.delim);
                 break;
             }
             // 退而求其次：匹配 inner（去掉 delimiter 后的文字）
             const idx2 = text.indexOf(inner);
             if (idx2 >= 0) {
-                wrapWithUnmatched(tn, idx2, inner);
+                wrapWithUnmatched(tn, idx2, inner, range.delim);
                 break;
             }
         }
     }
 }
 
-function wrapWithUnmatched(textNode, start, middle) {
+function wrapWithUnmatched(textNode, start, middle, delim) {
     const text = textNode.textContent;
     const end = start + middle.length;
     const before = text.slice(0, start);
     const after = text.slice(end);
-    const isBold = middle.includes('**');
     const span = document.createElement('span');
     span.className = 'md-unmatched';
     span.textContent = middle;
-    span.title = isBold
-        ? '** 紧贴内容才能形成粗体（CommonMark 规则）'
-        : '* 紧贴内容才能形成斜体（CommonMark 规则）';
+    span.title = delim === '~~'
+        ? '~~ 紧贴内容才能形成删除线（GFM 规则）'
+        : (delim.length === 2
+            ? '** 紧贴内容才能形成粗体（CommonMark 规则）'
+            : '* 紧贴内容才能形成斜体（CommonMark 规则）');
     const frag = document.createDocumentFragment();
     if (before) frag.appendChild(document.createTextNode(before));
     frag.appendChild(span);

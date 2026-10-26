@@ -1367,7 +1367,7 @@ body.drag-over #drop-hint { display: flex; }
     color: inherit;
 }
 
-/* === 未匹配的 markdown 强调标记（**..** / *..* 因空格未生效） === */
+/* === 未匹配的 markdown 强调标记（**..** / *..* / ~~..~~ 因空格未生效） === */
 .md-unmatched {
     background: rgba(255, 200, 50, 0.25);
     border-bottom: 1.5px dotted #e0a020;
