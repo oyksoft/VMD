@@ -3856,6 +3856,8 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         if (newY + h > winH) newY = y - h - 4;       // 下边不够 → 菜单画在鼠标上方（而不是贴窗底，避免鼠标在菜单内）
         if (newX < 4) newX = 4;
         if (newY < 4) newY = 4;
+        // 二级菜单往右展开 → 右边得再留出 ~210px，否则会跑出屏幕点不到
+        ctxMenu.classList.toggle('ctx-sub-left', newX + w + 210 > winW);
         ctxMenu.style.left = newX + 'px';
         ctxMenu.style.top = newY + 'px';
         ctxMenu.style.visibility = 'visible';
@@ -3873,6 +3875,19 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         return `<div class="ctx-item${dis}${danger}" data-act="${opts.act}">${icon}<span class="ctx-item-label">${escHTML(label)}</span>${shortcut}</div>`;
     }
 
+    /**
+     * 带二级菜单的菜单项。
+     * 子菜单嵌套在父项内部（:hover 才显示）—— 见 style.css 里 .ctx-submenu 的说明。
+     */
+    function subItem(label, key, icon, childrenHtml) {
+        return `<div class="ctx-item ctx-item-has-sub" data-sub="${key}">` +
+            `<span class="ctx-item-icon">${icon}</span>` +
+            `<span class="ctx-item-label">${escHTML(label)}</span>` +
+            `<span class="ctx-item-arrow">›</span>` +
+            `<div class="ctx-submenu">${childrenHtml}</div>` +
+            `</div>`;
+    }
+
     function sep() {
         return '<div class="ctx-separator"></div>';
     }
@@ -3882,7 +3897,7 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     // 所以只读模式下这些项必须单独挡住，否则"只读却能改"。
     const EDIT_ACTIONS = new Set([
         'undo', 'redo', 'cut', 'paste',
-        'fmt-bold', 'fmt-italic', 'fmt-code',
+        'fmt-bold', 'fmt-italic', 'fmt-code', 'fmt-codeblock', 'fmt-link',
         'insert-link', 'insert-codeblock', 'insert-table',
     ]);
 
@@ -3900,13 +3915,19 @@ if (window.__TAURI__ && window.__TAURI__.event) {
             sep(),
             item('全选', { act: 'selectAll', icon: '🔲', shortcut: 'Ctrl+A' }),
             sep(),
+            // ---- 格式化区：把**选中的文字**包起来（没选中就置灰）----
             item('加粗 **',    { act: 'fmt-bold',   icon: 'B', disabled: ro || !hasSel }),
             item('斜体 *',     { act: 'fmt-italic', icon: 'I', disabled: ro || !hasSel }),
             item('行内代码 `', { act: 'fmt-code',   icon: '<>', disabled: ro || !hasSel }),
+            item('代码块 ```', { act: 'fmt-codeblock', icon: '{ }', disabled: ro || !hasSel }),
+            item('链接',       { act: 'fmt-link',   icon: '🔗', disabled: ro || !hasSel }),
             sep(),
-            item('链接 [文字](url)', { act: 'insert-link', icon: '🔗', disabled: ro }),
-            item('代码块 ```',       { act: 'insert-codeblock', icon: '{ }', disabled: ro }),
-            item('表格',             { act: 'insert-table', icon: '⊞', disabled: ro }),
+            // ---- 插入区：纯插入（会替换掉当前选区），归到二级菜单里 ----
+            subItem('插入', 'insert', '➕', [
+                item('链接 [文字](url)', { act: 'insert-link', icon: '🔗', disabled: ro }),
+                item('代码块 ```',       { act: 'insert-codeblock', icon: '{ }', disabled: ro }),
+                item('表格',             { act: 'insert-table', icon: '⊞', disabled: ro }),
+            ].join('')),
         ].join('');
     }
 
@@ -3998,6 +4019,8 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     ctxMenu.addEventListener('click', async (e) => {
         const row = e.target.closest('.ctx-item');
         if (!row || row.classList.contains('ctx-item-disabled')) return;
+        // 点到二级菜单的父项（如“插入”）→ 只是展开子菜单，不执行任何动作
+        if (row.classList.contains('ctx-item-has-sub')) return;
         const act = row.dataset.act;
         const sel = editor.value.substring(editor.selectionStart, editor.selectionEnd);
 
@@ -4019,11 +4042,16 @@ if (window.__TAURI__ && window.__TAURI__.event) {
             else if (act === 'copy') { editor.focus({ preventScroll: true }); document.execCommand('copy'); }
             else if (act === 'paste')  { editor.focus({ preventScroll: true }); document.execCommand('paste'); }
             else if (act === 'selectAll') editor.select();
-            // 格式化选中
+            // 格式化选中（把选中的文字包起来）
             else if (act === 'fmt-bold' && sel.length)      wrapSelection(`**${sel}**`);
             else if (act === 'fmt-italic' && sel.length)    wrapSelection(`*${sel}*`);
             else if (act === 'fmt-code' && sel.length)      wrapSelection('`' + sel + '`');
-            // 插入模板
+            // 代码块：选中的文字整体变成一个围栏代码块
+            // （前面后面各补一个换行 —— markdown 里围栏必须独占一行）
+            else if (act === 'fmt-codeblock' && sel.length) wrapSelection('\n```\n' + sel + '\n```\n');
+            // 链接：选中的文字变成链接文字（网址先给个占位，用户自己改）
+            else if (act === 'fmt-link' && sel.length) wrapSelection('[' + sel + '](https://)');
+            // 插入模板（会替换掉当前选区 —— 这是“插入”的语义）
             else if (act === 'insert-link')       insertAtCursor('[文字](https://)');
             else if (act === 'insert-codeblock')  insertAtCursor('\n```\n代码\n```\n');
             else if (act === 'insert-table')      insertAtCursor('\n| 列1 | 列2 |\n|---|---|\n| 内容 | 内容 |\n');

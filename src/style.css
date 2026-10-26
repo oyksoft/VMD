@@ -1309,6 +1309,40 @@ body.drag-over #drop-hint { display: flex; }
 .ctx-item-label { flex: 1; }
 .ctx-item-shortcut { color: var(--text-dim); font-size: 11px; margin-left: 16px; }
 
+/* === 二级菜单（“插入”子菜单）===
+   子菜单 DOM 嵌套在父项**内部** —— 这样鼠标移到子菜单上时父项仍然匹配 :hover，
+   子菜单不会消失（如果是兄弟节点，一移过去就收起了）。
+   ⚠️ 父项是 .ctx-item，所以点击时 e.target.closest('.ctx-item') 会先命中子项
+   （子项更近），父项靠 .ctx-item-has-sub 类识别后直接忽略。 */
+.ctx-item-has-sub { position: relative; }
+.ctx-item-arrow {
+    color: var(--text-dim);
+    font-size: 15px;
+    line-height: 1;
+    margin-left: 12px;
+}
+.ctx-submenu {
+    display: none;
+    position: absolute;
+    left: calc(100% - 4px);
+    top: -5px;
+    min-width: 200px;
+    padding: 4px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow:
+        0 12px 32px rgba(0, 0, 0, 0.5),
+        0 2px 8px rgba(0, 0, 0, 0.25);
+    z-index: 10000;
+}
+.ctx-item-has-sub:hover > .ctx-submenu { display: block; }
+/* 菜单靠屏幕右边时，二级菜单改到左侧展开（否则会跑出屏幕外点不到） */
+.ctx-menu.ctx-sub-left .ctx-submenu {
+    left: auto;
+    right: calc(100% - 4px);
+}
+
 .ctx-separator {
     height: 1px;
     background: var(--border);
