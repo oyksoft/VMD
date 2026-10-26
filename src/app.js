@@ -778,20 +778,29 @@ function renderPreview() {
     const body = tokens.filter(t => t.type !== 'space' && t.type !== 'def');
     const keys = body.map(t => t.type + '\u0001' + t.raw);
 
-    // 从两头夹逼，找出真正变了的块区间。尾部的对齐要带上索引偏移 ——
-    // 插入/删除一块时，后面的块只是位置挪了，内容并没变。
+    // 找出真正变了的块区间（标准的前缀 + 后缀 diff）
+    //
+    // ⚠️ 前后缀要**分别**算，不能用「同时递减 pb/qb」那套 ——
+    //    块数变了的时候（文档变短、变空、打开另一个文件），
+    //    同时递减会拿不同索引的内容互比（错位），判断出来的区间是错的。
+    //    后果：新建空文档时会被误判成「内容没变」→ 直接早退 →
+    //    预览和目录都留着上一个文件的内容（这个坑踩过）。
     const prevKeys = previewBlockKeys;
     const nk = keys.length;
     const pk = prevKeys ? prevKeys.length : 0;
-    let a = 0, pb = nk - 1, qb = pk - 1;   // new 用 [a, pb]，old 用 [a, qb]
-    if (prevKeys && !hasDef) {
-        while (a < nk && a < pk && prevKeys[a] === keys[a]) a++;
-        while (pb >= a && qb >= a && prevKeys[qb] === keys[pb]) { pb--; qb--; }
-    }
+    // 前缀相同的块数
+    let a = 0;
+    while (a < nk && a < pk && prevKeys[a] === keys[a]) a++;
+    // 后缀相同的块数（不能与前缀重叠）
+    let s = 0;
+    while (s < nk - a && s < pk - a && prevKeys[pk - 1 - s] === keys[nk - 1 - s]) s++;
+    // 变化区间：新的 [a, newEnd]，旧的 [a, oldEnd]（可能为空）
+    const newEnd = nk - 1 - s;
+    const oldEnd = pk - 1 - s;
     // 旧 DOM 必须还是上次那批块，才敢按索引局部替换
     const canPatch = !!prevKeys && !hasDef && preview.children.length === prevKeys.length;
 
-    if (canPatch && pb < a) {
+    if (canPatch && newEnd < a && oldEnd < a) {
         // 一个字都没改到结构：连重排都省了
         previewBlockKeys = keys;
         previewRenderedSource = text;
@@ -805,19 +814,19 @@ function renderPreview() {
     // 逐块 parser 拼起来和整篇 parse 完全一致，已验证。）
     let changed = null;
     if (canPatch) {
-        const frag = sanitizePreview(marked.parser(body.slice(a, pb + 1)));
+        const frag = sanitizePreview(marked.parser(body.slice(a, newEnd + 1)));
         changed = [];
         for (let n = frag.firstChild; n; n = n.nextSibling) {
             if (n.nodeType === 1) changed.push(n);
         }
         // 块数对不上（顶级原始 HTML 展开成多节点）就不敢乱插，回退整篇
-        if (changed.length !== pb - a + 1) changed = null;
+        if (changed.length !== newEnd - a + 1) changed = null;
     }
 
     if (changed) {
         // 先记下插入位置的下一个兄弟，再删旧块（children 会边删边变）
-        const ref = preview.children[qb + 1] ? preview.children[qb + 1] : null;
-        for (let i = a; i <= qb; i++) {
+        const ref = preview.children[oldEnd + 1] ? preview.children[oldEnd + 1] : null;
+        for (let i = a; i <= oldEnd; i++) {
             const el = preview.children[a];
             if (el) el.remove();
         }
