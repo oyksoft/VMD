@@ -578,6 +578,10 @@ function unwrapFormat(sel, kind) {
         const m = sel.match(/^\[([^\]]*)\]\(([^)]*)\)$/);
         return m ? m[1] : null;
     }
+    if (kind === 'strike') {
+        const m = sel.match(/^~~([\s\S]+)~~$/);
+        return m ? m[1] : null;
+    }
     return null;
 }
 
@@ -608,6 +612,7 @@ function formatSelection(kind) {
     // 代码块：前后各补一个换行 —— markdown 里围栏必须独占一行
     else if (kind === 'codeblock') text = '\n```\n' + sel + '\n```\n';
     else if (kind === 'link') text = '[' + sel + '](https://)';
+    else if (kind === 'strike') text = '~~' + sel + '~~';
     else return false;
     replaceSelectionKeepingUndo(text, s, e);
     editor.setSelectionRange(s, s + text.length);
@@ -659,13 +664,25 @@ function selectionRect() {
     return { x, y, w, h: lh };
 }
 
+/**
+ * 选区是否落在围栏代码块里。
+ * 代码块里的是**源码**，套 Markdown 格式（加粗等）没意义 —— 所以那里不弹浮动工具栏。
+ * 只数光标之前的围栏开关个数（奇数 = 在代码块里）。
+ * ⚠️ 这个要扫文本，**只能在有选区时调用**（打字时每次都扫 1MB 会卡）。
+ */
+function selectionInCodeBlock() {
+    const before = editor.value.slice(0, editor.selectionStart);
+    const fences = before.match(/^[ \t]{0,3}(?:```|~~~)/gm);
+    return fences ? fences.length % 2 === 1 : false;
+}
+
 /** 显示 / 隐藏 / 移动浮动工具栏 */
 function updateSelToolbar() {
     if (!selToolbar) return;
     const show = editMode && !editor.readOnly
         && document.activeElement === editor
         && editor.selectionStart !== editor.selectionEnd;
-    if (!show) {
+    if (!show || selectionInCodeBlock()) {
         selToolbar.classList.remove('show');
         return;
     }
@@ -3939,6 +3956,9 @@ document.addEventListener('keydown', (e) => {
         }
     } else if (ctrl && e.shiftKey && e.code === 'Digit7') { e.preventDefault(); applyList('ol'); }
     else if (ctrl && e.shiftKey && e.code === 'Digit8') { e.preventDefault(); applyList('ul'); }
+    else if (ctrl && e.shiftKey && e.code === 'KeyX' && document.activeElement === editor) {
+        e.preventDefault(); formatSelection('strike');   // 删除线
+    }
 });
 
 // ============ TOC 高亮 ============

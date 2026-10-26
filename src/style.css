@@ -1590,6 +1590,8 @@ body.print-mode .mermaid-block { background: transparent !important; }
     color: #fff;
 }
 .sel-toolbar .mono { font-family: var(--font-mono); font-size: 12px; }
+/* 删除线按钮的图标 */
+.sel-toolbar .strike { text-decoration: line-through; }
 
 /* === 代码块：右上角浮动语言标签 + 复制按钮（不占行） === */
 .code-block {
