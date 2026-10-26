@@ -732,6 +732,15 @@ function fallbackSanitize(html) {
 let previewBlockKeys = null;
 // 上一次渲染用的源码，没变就什么都不用干
 let previewRenderedSource = null;
+// 上一次渲染时当前文件所在目录（相对路径图片的解析基准）
+let previewRenderedBase = null;
+// 本地图片 → data URI 的缓存。key = 基准目录 + \0 + 原始 src
+const localImageCache = new Map();
+// 缓存上限：data URI 很大（base64 膨胀 1/3），无上限会吃光内存
+const LOCAL_IMAGE_CACHE_MAX = 300;
+// 正在解析的本地图片数量（导出 PDF 前要等它们转完）
+let localImagePending = 0;
+let localImageWaiters = [];
 
 /**
  * 在 root 子树里查选择器，root 自己是元素且匹配时也算一个。
@@ -745,7 +754,11 @@ function sel(root, selector) {
 
 function renderPreview() {
     const text = editor.value;
-    if (text === previewRenderedSource && previewBlockKeys) { updateFilename(); return; }
+    const baseDir = currentBaseDir();
+    if (text === previewRenderedSource && previewBlockKeys && baseDir === previewRenderedBase) {
+        updateFilename();
+        return;
+    }
     // [TOC] / [TOCM] 是目录占位符。代码块/行内代码里的不算（应该原样显示）。
     const { text: workText, types: tocTypes, count: tocCount } = replaceTocPlaceholders(text);
 
@@ -773,6 +786,7 @@ function renderPreview() {
         // 一个字都没改到结构：连重排都省了
         previewBlockKeys = keys;
         previewRenderedSource = text;
+        previewRenderedBase = baseDir;
         updateFilename();
         return;
     }
@@ -820,6 +834,7 @@ function renderPreview() {
         replaceEmojiShortcodes(root);
         wrapTables(root);
     }
+    resolveLocalImages();              // 本地相对路径图片 → data URI（否则一律加载失败）
     highlightUnmatchedDelimiters(text);   // 从源文本扫描错误写法，映射到 DOM 文本节点标黄（内部先清旧的）
     if (tocCount > 0) renderInlineToc(tocTypes);
     queueMath(changed);
@@ -828,7 +843,100 @@ function renderPreview() {
     updateFilename();
     previewBlockKeys = keys;
     previewRenderedSource = text;
+    previewRenderedBase = baseDir;
 }
+
+/** 当前 markdown 文件所在目录（本地相对路径图片的解析基准） */
+function currentBaseDir() {
+    if (!currentFile) return '';
+    return currentFile.replace(/[^\\\/]+$/, '');
+}
+
+/**
+ * 本地图片（相对路径 / file:// ）在预览里加载不出来：
+ * 页面 origin 是 `http://tauri.localhost`，WebView2 直接拒掉 `file://` 和 `asset://`。
+ * 所以让 Rust 把图片读出来转成 data URI 再塞回 src。
+ * - 远程图片（http/https）和已经是 data: 的不动
+ * - 有缓存，同一张图不重复读盘
+ * - invoke 是异步的，所以图片会晚一拍出现（不影响其它内容）
+ */
+function resolveLocalImages() {
+    const baseDir = currentBaseDir();
+    if (!baseDir) return;              // 没有文件 → 相对路径无从解析
+    // 一次查全文档：逐块查在大文档上会慢很多（几千个块 = 几千次 querySelectorAll）
+    const imgs = preview.querySelectorAll('img');
+    const pending = [];
+    for (const im of imgs) {
+        const src = im.getAttribute('src');
+        if (!src || !isLocalImageSrc(src)) continue;
+        // 已经试过且失败的不再重复请求（图片可能确实不存在）
+        if (im.dataset.vmdImgTried) continue;
+        const key = baseDir + '\u0000' + src;
+        const cached = localImageCache.get(key);
+        if (cached) {
+            im.setAttribute('src', cached);
+            continue;
+        }
+        im.dataset.vmdImgTried = '1';
+        // 先换上占位图（原值记在 dataset 里，真读不出来时再还原，让用户看到破图 = 路径有问题）
+        im.dataset.vmdImgOrig = src;
+        im.setAttribute('src', IMG_PLACEHOLDER);
+        pending.push({ img: im, src, key });
+    }
+    if (!pending.length) return;
+    // 同一张图可能出现多次，去重后再问 Rust
+    const srcs = [...new Set(pending.map(p => p.src))];
+    localImagePending++;
+    invoke('read_local_images', { baseDir, srcs }).then(map => {
+        for (const p of pending) {
+            const uri = map && map[p.src];
+            // 渲染期间这个节点可能已经被换掉了
+            if (!p.img.isConnected) continue;
+            if (uri) {
+                if (localImageCache.size >= LOCAL_IMAGE_CACHE_MAX) {
+                    localImageCache.clear();   // 简单粗暴：超了就清空
+                }
+                localImageCache.set(p.key, uri);
+                p.img.setAttribute('src', uri);
+            } else {
+                // 读不出来 → 还原原路径，让浏览器显示破图（提示用户路径有问题）
+                p.img.setAttribute('src', p.img.dataset.vmdImgOrig || p.src);
+            }
+        }
+    }).catch(() => {
+        // IPC 整个失败 → 也还原
+        for (const p of pending) {
+            if (p.img.isConnected) p.img.setAttribute('src', p.img.dataset.vmdImgOrig || p.src);
+        }
+    }).finally(() => {
+        localImagePending--;
+        if (localImagePending <= 0) {
+            localImagePending = 0;
+            const ws = localImageWaiters;
+            localImageWaiters = [];
+            ws.forEach(fn => fn());
+        }
+    });
+}
+
+/** 等所有本地图片转成 data URI（导出 PDF 前要等，否则打印出来是空图） */
+function whenLocalImagesReady() {
+    if (localImagePending <= 0) return Promise.resolve();
+    return new Promise(resolve => localImageWaiters.push(resolve));
+}
+
+/** 是不是「本地路径」图片（远程的、data: 的都不算） */
+function isLocalImageSrc(src) {
+    const s = src.trim();
+    if (!s) return false;
+    if (/^(?:https?:|data:|blob:)/i.test(s)) return false;
+    if (s.startsWith('//')) return false;   // 协议相对 URL
+    return true;
+}
+
+// 1×1 透明 GIF：图片还在等 Rust 读盘时先顶上，
+// 免得浏览器去请求 http://tauri.localhost/xxx.png（必然 404，还闪一个破图图标）
+const IMG_PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 // ============ Emoji 短代码（:smile: → 😄）============
 // 只在预览里替换，源码保持原样（和 GitHub 一致）。
@@ -3324,6 +3432,11 @@ async function buildExportHtml() {
     // 剔掉应用自己的 UI（代码块的语言标签 + 复制按钮），文档里不该有
     const clone = preview.cloneNode(true);
     clone.querySelectorAll('.code-block-header').forEach(el => el.remove());
+    // 本地图片解析用的内部标记，导出时不要带出去
+    clone.querySelectorAll('[data-vmd-img-tried],[data-vmd-img-orig]').forEach(el => {
+        el.removeAttribute('data-vmd-img-tried');
+        el.removeAttribute('data-vmd-img-orig');
+    });
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3413,6 +3526,8 @@ async function exportPdf() {
         document.head.appendChild(lightLink);
         document.body.classList.add('print-mode');
         document.documentElement.classList.add('print-mode');   // html 也要放开 height/overflow
+        // 等本地图片转成 data URI（图片是异步转的，不等会打印出空图）
+        await whenLocalImagesReady();
         // 等浏览器完成布局刷新，确保打印的是新样式
         await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
         try {

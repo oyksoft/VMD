@@ -1,5 +1,6 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -263,6 +264,80 @@ fn write_file(path: String, content: String, encoding: Option<String>) -> Result
     write_atomic(&path, &bytes).map_err(|e| e.to_string())
 }
 
+/// 预览用的本地图片读取：把一批图片路径转成 data URI。
+///
+/// 为什么要这么做：预览页面跑在 `http://tauri.localhost` 这个 origin 上，
+/// WebView2 会拒掉 `file://` 和 `asset://`（本地文件访问被禁）——
+/// 所以相对路径图片只能由 Rust 读出来、内嵌成 data URI 才能显示。
+/// 一次处理一批，避免每张图一次 IPC 往返。
+#[tauri::command]
+fn read_local_images(base_dir: String, srcs: Vec<String>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for src in srcs {
+        // 只转真正的图片：md 里的路径可以指向任意文件（甚至 ../ 出去），
+        // 把非图片文件塞进 data URI 没有意义，还白占内存。
+        if !is_image_path(&src) {
+            continue;
+        }
+        let decoded = percent_decode(&src);
+        // 体积上限：超大图转 base64 会撑爆内存（base64 还膨胀 1/3）
+        match local_file_size(&base_dir, &decoded) {
+            Some(n) if n <= MAX_INLINE_IMAGE => {}
+            _ => continue,
+        }
+        if let Some(uri) = img_to_data_uri(&base_dir, &decoded) {
+            out.insert(src, uri);
+        }
+    }
+    out
+}
+
+/// 预览用内嵌图片的体积上限（8MB）
+const MAX_INLINE_IMAGE: u64 = 8 * 1024 * 1024;
+
+/// 是不是图片文件（按扩展名判断，只认常见格式）
+fn is_image_path(src: &str) -> bool {
+    let s = src.to_ascii_lowercase();
+    // 去掉查询串和锚点
+    let s = s.split(['?', '#']).next().unwrap_or(&s);
+    s.ends_with(".png")
+        || s.ends_with(".jpg")
+        || s.ends_with(".jpeg")
+        || s.ends_with(".gif")
+        || s.ends_with(".webp")
+        || s.ends_with(".bmp")
+        || s.ends_with(".svg")
+        || s.ends_with(".ico")
+        || s.ends_with(".avif")
+}
+
+/// 算出本地文件的绝对路径（相对路径按 base_dir 解析）
+/// src 传入前应当已经 percent 解码过
+fn local_file_path(base_dir: &str, src: &str) -> Option<PathBuf> {
+    let src = src.trim();
+    if src.is_empty() {
+        return None;
+    }
+    // file:///D:/x.png → D:/x.png（也处理 file://host/D:/x.png 这种带主机名的写法）
+    let src = if let Some(rest) = src.strip_prefix("file://") {
+        let rest = match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => rest,
+        };
+        rest.strip_prefix('/').unwrap_or(rest).to_string()
+    } else {
+        src.to_string()
+    };
+    let p = PathBuf::from(&src);
+    Some(if p.is_absolute() { p } else { PathBuf::from(base_dir).join(p) })
+}
+
+/// 本地文件大小（读不出来就返回 None）
+fn local_file_size(base_dir: &str, src: &str) -> Option<u64> {
+    let p = local_file_path(base_dir, src)?;
+    fs::metadata(p).ok().map(|m| m.len())
+}
+
 /// 导出 HTML：把正文里的本地图片换成 base64 内嵌，输出自包含的单文件
 /// （不引任何依赖：base64 编码和 img 替换都是自己实现的）
 #[tauri::command]
@@ -349,12 +424,7 @@ fn attr_span(tag: &str, name: &str) -> Option<(usize, usize)> {
 
 /// 读一张本地图片，转成 data URI（相对路径按 markdown 文件所在目录找）
 fn img_to_data_uri(base_dir: &str, src: &str) -> Option<String> {
-    let p = PathBuf::from(src);
-    let full = if p.is_absolute() {
-        p
-    } else {
-        PathBuf::from(base_dir).join(p)
-    };
+    let full = local_file_path(base_dir, src)?;
     let data = fs::read(&full).ok()?;
     Some(format!(
         "data:{};base64,{}",
@@ -1137,6 +1207,46 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
     }
+
+    /// 本地图片路径解析：预览里相对路径图片全靠它转成绝对路径。
+    /// （预览页面跑在 http://tauri.localhost，file:// / asset:// 都被 WebView2 拒掉）
+    mod images {
+        use super::super::{is_image_path, local_file_path};
+
+        #[test]
+        fn relative_path_joins_base_dir() {
+            let p = local_file_path("D:/docs", "img/a.png").unwrap();
+            assert_eq!(p, std::path::PathBuf::from("D:/docs").join("img/a.png"));
+        }
+
+        #[test]
+        fn absolute_path_kept() {
+            let p = local_file_path("D:/docs", "E:/other/a.png").unwrap();
+            assert_eq!(p, std::path::PathBuf::from("E:/other/a.png"));
+        }
+
+        #[test]
+        fn file_url_stripped() {
+            let p = local_file_path("D:/docs", "file:///D:/pics/a.png").unwrap();
+            assert_eq!(p, std::path::PathBuf::from("D:/pics/a.png"));
+        }
+
+        #[test]
+        fn empty_is_none() {
+            assert!(local_file_path("D:/docs", "  ").is_none());
+        }
+
+        #[test]
+        fn only_images_are_embedded() {
+            assert!(is_image_path("a.png"));
+            assert!(is_image_path("A.JPEG"));
+            assert!(is_image_path("sub/dir/a.webp?v=2"));
+            // 非图片不能读进来（md 里的路径可以指向任意文件）
+            assert!(!is_image_path("secret.txt"));
+            assert!(!is_image_path("a.png.exe"));
+            assert!(!is_image_path("noext"));
+        }
+    }
 }
 
 /// 最近一次“放行”的导航 URL
@@ -1261,6 +1371,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             read_file,
             write_file,
+            read_local_images,
             export_html,
             file_exists,
             export_pdf,
