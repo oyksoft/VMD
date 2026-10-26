@@ -729,28 +729,54 @@ function selectedLineRange() {
 }
 
 /**
- * 替换一段文本后，把**原来的选区**映射到新文本里。
- * - 原来只是光标（没选中）→ 新位置还是光标（不会变成“选中了”）
- * - 原来选了字 → 选区跟着走（相对行首的偏移不变）
- * 不这么做的话，改完标题/列表会突然把整行选中（用户反馈过）。
+ * 行首发生变动时（去掉旧标记 / 加上新前缀），把旧块里的一个偏移映射到新块里。
+ *
+ * ⚠️ 不能用“字符偏移 + 位移量”算 —— 每行前面加的前缀长度不同
+ *    （`# ` / `- ` / `1. ` / `10. `），字符偏移全变了。
+ *    要按“行号 + 行内列号”算：新行内的列号 = 原列号 - 旧标记长度 + 新前缀长度。
+ *
+ * @param strips 每行开头去掉了多少字符
+ * @param adds   每行开头加上了多少字符
+ * @returns 新块里的偏移
  */
-function remapSelection(lineStart, oldStart, oldEnd, newLen) {
-    const from = Math.max(0, Math.min(oldStart - lineStart, newLen));
-    const to = Math.max(from, Math.min(oldEnd - lineStart, newLen));
-    editor.setSelectionRange(lineStart + from, lineStart + to);
+function mapOffset(oldBlock, oldOffset, newBlock, strips, adds) {
+    const before = oldBlock.slice(0, oldOffset);
+    const lineIdx = before.split('\n').length - 1;
+    const oldLineStart = before.lastIndexOf('\n') + 1;
+    const col = oldOffset - oldLineStart;
+    // 新块里第 lineIdx 行的起始位置
+    let off = 0;
+    for (let i = 0; i < lineIdx; i++) {
+        const nl = newBlock.indexOf('\n', off);
+        if (nl === -1) return newBlock.length;
+        off = nl + 1;
+    }
+    const newCol = Math.max(0, col - (strips[lineIdx] || 0)) + (adds[lineIdx] || 0);
+    const nl = newBlock.indexOf('\n', off);
+    const maxCol = (nl === -1 ? newBlock.length : nl) - off;
+    return off + Math.min(newCol, maxCol);
 }
 
 /** Ctrl+1~6：把选中的行变成标题 */
 function applyHeading(level) {
     const [lineStart, lineEnd] = selectedLineRange();
     const s = editor.selectionStart, e = editor.selectionEnd;
-    const block = editor.value.slice(lineStart, lineEnd);
+    const oldBlock = editor.value.slice(lineStart, lineEnd);
     const prefix = '#'.repeat(level) + ' ';
-    const out = block.split('\n')
-        .map(line => prefix + line.replace(/^#{1,6}\s*/, ''))   // 去掉旧标题标记
-        .join('\n');
+    const strips = [], adds = [], parts = [];
+    for (const line of oldBlock.split('\n')) {
+        const m = line.match(/^(#{1,6}\s*)/);
+        const strip = m ? m[1].length : 0;
+        strips.push(strip);
+        adds.push(prefix.length);
+        parts.push(prefix + line.slice(strip));   // 去掉旧标题标记，再加新的
+    }
+    const out = parts.join('\n');
     replaceSelectionKeepingUndo(out, lineStart, lineEnd);
-    remapSelection(lineStart, s, e, out.length);
+    // 光标 / 选区跟着走（原来在文字中间，改完还在那个字后面）
+    const ns = mapOffset(oldBlock, s - lineStart, out, strips, adds);
+    const ne = mapOffset(oldBlock, e - lineStart, out, strips, adds);
+    editor.setSelectionRange(lineStart + ns, lineStart + ne);
     editor.focus({ preventScroll: true });
 }
 
@@ -758,22 +784,29 @@ function applyHeading(level) {
 function applyList(kind) {
     const [lineStart, lineEnd] = selectedLineRange();
     const s = editor.selectionStart, e = editor.selectionEnd;
-    const block = editor.value.slice(lineStart, lineEnd);
+    const oldBlock = editor.value.slice(lineStart, lineEnd);
+    const strips = [], adds = [], parts = [];
     let n = 0;
-    const out = block.split('\n').map(line => {
+    for (const line of oldBlock.split('\n')) {
         const m = line.match(/^(\s*)(?:[-*+]|\d+\.)\s+(.*)$/);
         const indent = m ? m[1] : (line.match(/^(\s*)/) || ['', ''])[1];
         const rest = m ? m[2] : line.slice(indent.length);
         const isUl = /^[-*+]\s/.test(line);
         const isOl = /^\d+\.\s/.test(line);
         // 已经是目标类型的列表 → 再按一次就取消（变回普通段落）
-        if ((kind === 'ul' && isUl) || (kind === 'ol' && isOl)) return indent + rest;
-        n++;
-        const marker = kind === 'ol' ? n + '. ' : '- ';
-        return indent + marker + rest;
-    }).join('\n');
+        const cancel = (kind === 'ul' && isUl) || (kind === 'ol' && isOl);
+        const marker = cancel ? '' : (kind === 'ol' ? (++n) + '. ' : '- ');
+        // strip/add 只算**标记**的长度（缩进两边一样，不影响列号）
+        // ⚠️ m[0] 是整个匹配（含正文），标记长度 = m[0] - 缩进 - 正文
+        strips.push(m ? m[0].length - indent.length - rest.length : 0);
+        adds.push(marker.length);
+        parts.push(indent + marker + rest);
+    }
+    const out = parts.join('\n');
     replaceSelectionKeepingUndo(out, lineStart, lineEnd);
-    remapSelection(lineStart, s, e, out.length);
+    const ns = mapOffset(oldBlock, s - lineStart, out, strips, adds);
+    const ne = mapOffset(oldBlock, e - lineStart, out, strips, adds);
+    editor.setSelectionRange(lineStart + ns, lineStart + ne);
     editor.focus({ preventScroll: true });
 }
 
