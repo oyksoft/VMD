@@ -11,6 +11,7 @@
 | `mermaid-check.md` | Mermaid `securityLevel: strict` 回归：click 不生效、`<br>` 变字面量、渲染失败的提示块不执行源码里的 HTML。 |
 | `image-check.md` | 图片显示回归：data URI 内联 / 相对路径 / 引用式 / 列表里 / 引用块里，共 8 张图都要显示出来（浅灰边框的白色矩形 320×120）；带 `onerror` 的那张图**照常显示但脚本不执行**。 |
 | `blank.png` | `image-check.md` 用的空白图片（纯白 + 浅灰边框，纯白图在白底页面上看不见）。 |
+| `code-wrap-check.md` | 代码自动换行开关：超长无空格行、超长 URL、长代码行、短行、表格里的长代码。开了换行应该全部折行，编辑区仍不折行。 |
 
 编码相关的判断办法：
 

@@ -510,6 +510,24 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     color: var(--text);
 }
 
+/* === 代码自动换行（设置项：预览区里很长的代码行自动折行） ===
+   开关在 <html> 上加/去 .code-wrap 类（首帧由 theme.js 决定）。
+   pre 默认 white-space: pre（不折行，靠 overflow-x 横向滚动）；
+   开了换行后改成 pre-wrap，并允许在任意位置断（长 URL、没有空格的标识符）。
+   overflow-x 改成 visible：横向滚动条在折行后就没意义了，
+   留着反而在某些浏览器里多出一条 1px 的滚动槽。 */
+html.code-wrap #preview pre {
+    overflow-x: visible;
+}
+html.code-wrap #preview pre code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;   /* 长 URL / 长标识符也能断 */
+    word-break: break-word;
+}
+/* ⚠️ 编辑区（textarea）**不能**跟着换行 ——
+   它是 wrap="off"（不折行），这是目录跳转精确落行的前提（见 AGENTS.md）。
+   折行后“一行 = 一个行高”，行号 → 像素的映射就不再线性了。 */
+
 #preview blockquote {
     border-left: 3px solid var(--quote-bar);
     padding: 0 16px;

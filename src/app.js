@@ -3009,6 +3009,7 @@ let settings = {
     mode: 'read',       // 默认模式：read/edit
     ctxMenu: true,      // VMD 自己的右键菜单
     zoom: 100,          // 文字缩放（%）
+    codeWrap: true,     // 预览区代码自动换行
 };
 
 function loadSettings() {
@@ -3031,6 +3032,8 @@ function loadSettings() {
     if (!THEMES[settings.theme]) settings.theme = 'auto';
     if (settings.mode !== 'edit') settings.mode = 'read';
     settings.ctxMenu = settings.ctxMenu !== false;
+    // 代码换行默认开（旧设置文件里没这个字段 → 当作开）
+    settings.codeWrap = settings.codeWrap !== false;
     let z = Number(settings.zoom);
     if (!isFinite(z)) z = 100;
     z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));   // 超出范围就钳到边界
@@ -3070,6 +3073,19 @@ function setDefaultCtxMenu(v) {
     setCtxMenuEnabled(v === '1');
 }
 
+/** 预览区代码自动换行（立即生效：改的是当前预览，改完就该看到） */
+function setCodeWrap(v) {
+    settings.codeWrap = v === '1';
+    applyCodeWrap();
+    saveSettings();
+    syncSettingsUI();
+}
+
+/** 把「代码换行」这个开关应用到 <html> 上 */
+function applyCodeWrap() {
+    document.documentElement.classList.toggle('code-wrap', !!settings.codeWrap);
+}
+
 function saveSettings() {
     // 存到设置文件（Rust 写），下次启动时 Rust 会读它来决定窗口底色
     invoke('save_settings', { settings: settings }).catch((e) => {
@@ -3087,6 +3103,9 @@ function syncSettingsUI() {
     });
     document.querySelectorAll('#set-ctx .seg-btn').forEach(b => {
         b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.ctxMenu);
+    });
+    document.querySelectorAll('#set-wrap .seg-btn').forEach(b => {
+        b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.codeWrap);
     });
 }
 
@@ -3144,6 +3163,10 @@ function closeSettingsPanel() {
 // VMD 自己的右键菜单开关（设置项：只保存，下次启动生效）
 document.querySelectorAll('#set-ctx .seg-btn').forEach(b => {
     b.addEventListener('click', () => setDefaultCtxMenu(b.dataset.v));
+});
+// 预览区代码自动换行（立即生效）
+document.querySelectorAll('#set-wrap .seg-btn').forEach(b => {
+    b.addEventListener('click', () => setCodeWrap(b.dataset.v));
 });
 // 系统右键菜单项（.md 文件右键时多一个「用 VMD 打开」）
 document.getElementById('menu-on').addEventListener('click', async () => {
@@ -3428,6 +3451,10 @@ async function buildExportHtml() {
         buildKatexCss(),
     ]);
     const themeVars = Object.entries(theme.vars).map(([k, v]) => `${k}:${v}`).join(';');
+    // 代码换行：导出的是文档快照，应该和预览里看到的一致
+    const codeWrapCss = settings.codeWrap
+        ? '.doc pre{overflow-x:visible}.doc pre code{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}'
+        : '';
     const title = currentFile ? currentFile.replace(/^.*[\\\/]/, '') : '未命名';
     // 剔掉应用自己的 UI（代码块的语言标签 + 复制按钮），文档里不该有
     const clone = preview.cloneNode(true);
@@ -3446,6 +3473,7 @@ async function buildExportHtml() {
 <style>
 :root{${themeVars}}
 ${exportCss}
+${codeWrapCss}
 ${hljsCss}
 ${katexCss}
 </style>
@@ -3739,6 +3767,8 @@ updateThemeButton();
     buildThemeChips();
     // 文字缩放
     initZoom();
+    // 代码自动换行（首帧已由 theme.js 决定，这里再同步一次，保证与设置面板一致）
+    applyCodeWrap();
     // 主题：默认跟随系统，用户在设置里改过就用他选的
     await applyTheme(settings.theme);
     fetchSystemTheme();   // 预热系统主题（"自动"色块的悬停预览要用）

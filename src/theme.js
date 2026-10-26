@@ -178,6 +178,8 @@ window.VMD_THEMES = {
     const settings = window.__VMD_SETTINGS__ || null;
     const editMode = !!(settings && settings.mode === 'edit');
     document.documentElement.classList.toggle('read-mode', !editMode);
+    // 代码自动换行：也是首帧就要定下来的（不然会先不换行、再跳一下）
+    document.documentElement.classList.toggle('code-wrap', !(settings && settings.codeWrap === false));
 
     // 优先级：用户保存的设置（Rust 启动时读设置文件后注入）→ 系统主题（Rust 读注册表）
     const savedTheme = settings && settings.theme ? settings.theme : '';
