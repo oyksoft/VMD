@@ -35,3 +35,13 @@ function calculateTotal(items, taxRate, discount, shippingCost, insuranceFee, me
 | 项目 | 值 |
 |---|---|
 | 长代码 | `const x = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";` |
+
+## 6. 正文里的行内长代码
+
+正文里放一段行内代码：`const value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";`，应该也能断行。
+
+## 7. 表头里的长代码
+
+| `const headerCode = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";` | 普通表头 |
+|---|---|
+| 普通单元格 | 值 |

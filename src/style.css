@@ -521,8 +521,23 @@ html.code-wrap #preview pre {
 }
 html.code-wrap #preview pre code {
     white-space: pre-wrap;
-    overflow-wrap: anywhere;   /* 长 URL / 长标识符也能断 */
-    word-break: break-word;
+    /* ⚠️ 只能用 overflow-wrap: anywhere，**不能**再写 word-break: break-word ——
+       后者是 overflow-wrap: break-word 的别名（已废弃），会覆盖掉 anywhere。
+       区别在于：anywhere 会参与 min-content 宽度计算（表格/弹性布局能据此收缩），
+       break-word 不会 —— 表格单元格里就会把长串原样撑开。 */
+    overflow-wrap: anywhere;
+}
+/* 行内代码（表格里的、句子里的）也要能断 ——
+   不然表格单元格里一串没有空格的代码会把整张表撑破（比窗口还宽）。
+   行内 code 保持 white-space: normal（空格照常折叠），只放开断行。 */
+html.code-wrap #preview code {
+    overflow-wrap: anywhere;
+}
+/* 表头是 white-space: nowrap（表头不换行），
+   但表头里的代码得能断，否则整张表还是被撑破 */
+html.code-wrap #preview table th code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
 }
 /* ⚠️ 编辑区（textarea）**不能**跟着换行 ——
    它是 wrap="off"（不折行），这是目录跳转精确落行的前提（见 AGENTS.md）。

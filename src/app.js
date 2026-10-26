@@ -3453,7 +3453,8 @@ async function buildExportHtml() {
     const themeVars = Object.entries(theme.vars).map(([k, v]) => `${k}:${v}`).join(';');
     // 代码换行：导出的是文档快照，应该和预览里看到的一致
     const codeWrapCss = settings.codeWrap
-        ? '.doc pre{overflow-x:visible}.doc pre code{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}'
+        ? '.doc pre{overflow-x:visible}.doc pre code{white-space:pre-wrap;overflow-wrap:anywhere}' +
+          '.doc code{overflow-wrap:anywhere}.doc th code{white-space:pre-wrap;overflow-wrap:anywhere}'
         : '';
     const title = currentFile ? currentFile.replace(/^.*[\\\/]/, '') : '未命名';
     // 剔掉应用自己的 UI（代码块的语言标签 + 复制按钮），文档里不该有
