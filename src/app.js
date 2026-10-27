@@ -2694,7 +2694,10 @@ document.addEventListener('keydown', (e) => {
 
 // 光标移动 → 更新编辑区右下角的状态（行号 / 字数）
 document.addEventListener('selectionchange', () => {
-    if (document.activeElement === editor) scheduleEditorStatus();
+    if (document.activeElement === editor) {
+        scheduleEditorStatus();
+        showStatusBriefly();     // 键盘操作后短暂显示一下
+    }
 });
 
 // 屏蔽刷新键：F5 / Ctrl+R / Ctrl+Shift+R
@@ -3248,13 +3251,27 @@ let docStatsCache = { text: null, lines: 1, chars: 0 };
 function getDocStats(text) {
     if (docStatsCache.text === text) return docStatsCache;
     let lines = 1, chars = 0;
+    // 行起始偏移表 —— 光标行号靠它二分查（否则每次光标移动都要 O(n) 扫一遍，
+    // 1MB 文档拖选会卡）
+    const lineStarts = [0];
     for (let i = 0; i < text.length; i++) {
         const c = text.charCodeAt(i);
-        if (c === 10) lines++;
+        if (c === 10) { lines++; lineStarts.push(i + 1); }
         else if (c !== 32 && c !== 9 && c !== 13) chars++;   // 空白不算字数
     }
-    docStatsCache = { text, lines, chars };
+    docStatsCache = { text, lines, chars, lineStarts };
     return docStatsCache;
+}
+
+/** 光标位置在第几行（1 起）—— 二分查行起始表 */
+function lineAtPos(text, pos) {
+    const starts = getDocStats(text).lineStarts;
+    let lo = 0, hi = starts.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (starts[mid] <= pos) lo = mid; else hi = mid - 1;
+    }
+    return lo + 1;
 }
 
 function updateEditorStatus() {
@@ -3262,12 +3279,21 @@ function updateEditorStatus() {
     if (!el) return;
     const text = editor.value;
     const stats = getDocStats(text);
-    const pos = editor.selectionStart;
-    let line = 1;
-    for (let i = 0; i < pos; i++) {
-        if (text.charCodeAt(i) === 10) line++;
-    }
+    const line = lineAtPos(text, editor.selectionStart);
     el.textContent = '行 ' + line + '/' + stats.lines + ' · ' + stats.chars + ' 字';
+}
+
+/** 状态条只在“需要时”出现：鼠标在编辑区底部，或刚操作过键盘 */
+let statusTimer = 0;
+let pointerNearBottom = false;
+function showStatusBriefly() {
+    const el = document.getElementById('editor-status');
+    if (!el) return;
+    el.classList.add('show');
+    clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => {
+        if (!pointerNearBottom) el.classList.remove('show');
+    }, 1800);
 }
 
 /** 光标一动就更新状态栏（rAF 节流，不然拖选会卡） */
@@ -3278,6 +3304,32 @@ function scheduleEditorStatus() {
         updateEditorStatus();
     });
 }
+
+// 鼠标移到编辑区底部 → 状态条淡入；离开底部 → 淡出。
+// （平时完全不显示，免得浮在内容上遮住最后一行文字）
+(function initStatusHover() {
+    const wrap = document.getElementById('editor-wrap');
+    const el = document.getElementById('editor-status');
+    if (!wrap || !el) return;
+    wrap.addEventListener('mousemove', (e) => {
+        const r = wrap.getBoundingClientRect();
+        const near = (r.bottom - e.clientY) < 90;
+        if (near) {
+            // 鼠标在底部 → 持续显示（定时器别把它关了）
+            pointerNearBottom = true;
+            el.classList.add('show');
+            clearTimeout(statusTimer);
+        } else if (pointerNearBottom) {
+            // 离开底部 → 改成“短暂显示”，过一会儿自己藏起来
+            pointerNearBottom = false;
+            showStatusBriefly();
+        }
+    });
+    wrap.addEventListener('mouseleave', () => {
+        pointerNearBottom = false;
+        el.classList.remove('show');
+    });
+})();
 
 // ============ 外部修改检测 ============
 
