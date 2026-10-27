@@ -401,7 +401,299 @@ function legacyCopy(text) {
 
 // ============ DOM ============
 
-const editor = document.getElementById('editor');
+// ============ 编辑器（contenteditable）============
+
+/**
+ * 文档统计缓存 —— 行数 / 字数 / 行首偏移表。
+ * ⚠️ 声明必须**在编辑器块之前**：编辑器同步模型时会写它（rebuildLineStarts），
+ *    而编辑器块在文件前面 → 用 let 声明的话会撞 TDZ（访问未初始化的变量）。
+ */
+let docStatsCache = { text: null, lines: 1, chars: 0, lineStarts: [0] };
+
+//
+// ⚠️ **为什么不用 <textarea>**：
+//     Blink 的 <textarea> 在**输入法组字**时走 SetInnerEditorValue ——
+//     **整体替换整个 value** → 每次按键都要把全部行重新排版一遍。
+//     实测（3 万行 / 59 万字符的文档）：
+//         textarea  整体替换 + 重排 = 408ms/键   ← 中文输入法组字就是这个
+//         textarea  增量插入 + 重排 =  40ms/键   ← 英文字母走的是这条
+//     打一个中文词要 4~8 个拼音键 → 1.6~3.3 秒；打一整句话就是几十秒。
+//     （英文不受影响 —— 所以现象是"只有中文卡"。）
+//
+//     contenteditable 里**每行是独立的块**，组字只重排改动的那一行：
+//         CE 只改一段 + 重排 = 35ms
+//     快 10 倍以上。
+//
+// 这里用**代理对象**包住真实的 div，保持和 <textarea> 一样的 API，
+// app.js 里其它地方（95 处 editor.xxx）基本不用改。
+const edEl = document.getElementById('editor');
+
+/** 完整文本（模型）—— contenteditable 没有 value 属性，自己维护一份 */
+let editorText = '';
+/** 每行对应的元素（edEl.children） */
+let editorLineEls = [];
+/** 每行的起始字符偏移（行首表） */
+let editorLineStarts = [];
+/** 选区（字符偏移） */
+let selStartOff = 0;
+let selEndOff = 0;
+
+function escapeHtml(t) {
+    return t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * 从 DOM 读回完整文本（每行一个 div，之间用 \n 连接）。
+ *
+ * ⚠️ **「一行一块」是整个方案的地基** —— 行号 ↔ DOM 元素的映射靠它。
+ *    如果某一行里混进了 <br>（浏览器插入的软换行），textContent 就不含那个换行
+ *    → 读回来的行数和 DOM 里的行元素数对不上 → 行号全错。
+ *    所以这里检测到 <br> 就**规范化**（换成 \n），保证两边永远一致。
+ */
+function readTextFromDom() {
+    const kids = edEl.children;
+    const parts = new Array(kids.length);
+    for (let i = 0; i < kids.length; i++) {
+        const k = kids[i];
+        // 有 <br> 说明结构被破坏了 → 用 innerText（它把 <br> 算成换行）
+        parts[i] = (k.querySelector('br') ? k.innerText : k.textContent).replace(/\r/g, '');
+        // innerText 在末尾会多一个换行（每个块级元素的末尾）
+        if (parts[i].endsWith('\n')) parts[i] = parts[i].slice(0, -1);
+    }
+    return parts.join('\n');
+}
+
+/**
+ * 重建行首偏移表 + 字数统计。
+ *
+ * ⚠️ **这里只有一份行首表**（editorLineStarts）。
+ *    以前 getDocStats() 自己还建一份 → 两份可能不一致 → 行号错乱。
+ *    现在统一：编辑器模型的行首表就是唯一真相，
+ *    getDocStats() 直接复用它（见下面）。
+ */
+function rebuildLineStarts(text) {
+    const starts = [0];
+    let chars = 0;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        if (c === 10) starts.push(i + 1);
+        else if (c !== 32 && c !== 9 && c !== 13) chars++;
+    }
+    editorLineStarts = starts;
+    docStatsCache = { text, lines: starts.length, chars, lineStarts: starts };
+    return starts;
+}
+
+/** 设置完整文本（会清空浏览器的撤销栈 —— 和 textarea 一样） */
+function setEditorText(text) {
+    // ⚠️ 记住有没有焦点 —— 重建 DOM 会丢焦点，
+    //    而换文件/打开文件这类操作是希望焦点还在编辑区的。
+    const hadFocus = (document.activeElement === edEl);
+    editorText = text;
+    const lines = text.split('\n');
+    let html = '';
+    for (let i = 0; i < lines.length; i++) html += '<div>' + escapeHtml(lines[i]) + '</div>';
+    edEl.innerHTML = html;
+    editorLineEls = Array.from(edEl.children);
+    rebuildLineStarts(text);
+    modelDirty = false;
+    selStartOff = selEndOff = Math.min(selStartOff, text.length);
+    if (hadFocus) edEl.focus();
+}
+
+/** 字符偏移 → 行号（0 起，二分） */
+function lineOfOffset(off) {
+    const a = editorLineStarts;
+    if (!a.length) return 0;
+    let lo = 0, hi = a.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (a[mid] <= off) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+/** DOM 节点 → 字符偏移 */
+function offsetOfNode(node, offsetInNode) {
+    if (!node) return 0;
+    // 往上找到所在的那一行（顶层 div）
+    let el = node.nodeType === 1 ? node : node.parentNode;
+    while (el && el.parentNode && el.parentNode !== edEl) el = el.parentNode;
+    if (!el || el.parentNode !== edEl) return 0;
+    const idx = editorLineEls.indexOf(el);
+    if (idx < 0) return 0;
+    // 行内偏移
+    let off = 0;
+    if (node.nodeType === 3) {
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let n;
+        while ((n = walker.nextNode())) {
+            if (n === node) { off += offsetInNode; break; }
+            off += n.nodeValue.length;
+        }
+    } else {
+        // 元素节点：数它之前的兄弟文本长度
+        let prev = node.previousSibling;
+        while (prev) { off += prev.textContent.length; prev = prev.previousSibling; }
+        off += offsetInNode;
+    }
+    return (editorLineStarts[idx] || 0) + off;
+}
+
+/** 从当前 DOM 选区读出偏移 */
+function readSelection() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    const r = sel.getRangeAt(0);
+    if (!edEl.contains(r.startContainer) && r.startContainer !== edEl) return;
+    selStartOff = offsetOfNode(r.startContainer, r.startOffset);
+    selEndOff = offsetOfNode(r.endContainer, r.endOffset);
+    if (selStartOff > selEndOff) { const t = selStartOff; selStartOff = selEndOff; selEndOff = t; }
+}
+
+/** 字符偏移 → DOM Range */
+function rangeOfOffset(off) {
+    const line = lineOfOffset(off);
+    const el = editorLineEls[line];
+    const r = document.createRange();
+    if (!el) { r.selectNodeContents(edEl); r.collapse(true); return r; }
+    const lineStart = editorLineStarts[line] || 0;
+    let col = Math.max(0, off - lineStart);
+    // 行内找到第 col 个字符
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let n, acc = 0;
+    while ((n = walker.nextNode())) {
+        const len = n.nodeValue.length;
+        if (acc + len >= col) {
+            r.setStart(n, col - acc);
+            r.setEnd(n, col - acc);
+            return r;
+        }
+        acc += len;
+    }
+    r.selectNodeContents(el);
+    r.collapse(false);
+    return r;
+}
+
+/** 设置选区（字符偏移） */
+function setSelRange(start, end) {
+    const sel = window.getSelection();
+    if (!sel) return;
+    try {
+        sel.removeAllRanges();
+        sel.addRange(rangeOfOffset(start));
+        if (end !== start) {
+            const r2 = rangeOfOffset(end);
+            sel.removeAllRanges();
+            sel.addRange(rangeOfOffset(start));
+            sel.addRange(r2);
+        }
+    } catch (e) { /* 忽略 */ }
+    selStartOff = start; selEndOff = end;
+}
+
+/**
+ * DOM 变了 → 把模型同步回来。
+ *
+ * contenteditable 里是浏览器直接改 DOM（打字、IME 组字、粘贴、剪切、
+ * 撤销…），我们没有 value 属性可读，所以从 DOM 读回文本。
+ *
+ * ⚠️ **同步的正确性是这个方案的关键** —— 模型和 DOM 一旦不一致，
+ *    后面所有基于「字符偏移」的操作（格式化、查找、滚动同步、TOC 定位）
+ *    都会错位。所以：
+ *
+ *   1. **任何可能改 DOM 的路径都要标脏**：
+ *      input 事件（打字/组字/粘贴/剪切/撤销/重做都伴随它）、
+ *      drop 事件（拖放文本进来**不**触发 input！）。
+ *   2. **读 editor.value 之前先同步**（如果脏）→ 调用方永远拿到最新文本。
+ *   3. 同步时**一起重建行首表和行元素数组** → 行号映射不会过期。
+ *
+ * ⚠️ 成本 ∝ 文档大小（3 万行读回来 ≈ 10~30ms），比 textarea 的
+ *    「整体替换 + 全量重排（244ms）」好一个数量级。
+ */
+let modelDirty = false;         // DOM 可能已经变了
+let modelSyncPending = false;    // 已经排了 rAF 同步
+
+/** 标脏：DOM 变了但还没读回来 */
+function markModelDirty() {
+    modelDirty = true;
+    scheduleModelSync();
+}
+
+/** 排一次 rAF 同步（一帧内多次改动只读一次） */
+function scheduleModelSync() {
+    if (modelSyncPending) return;
+    modelSyncPending = true;
+    requestAnimationFrame(() => {
+        modelSyncPending = false;
+        syncModelNow();
+    });
+}
+
+/** 真正同步（读 DOM → 更新模型 / 行首表 / 行元素数组） */
+function syncModelNow() {
+    if (!modelDirty) return;
+    modelDirty = false;
+    const t = readTextFromDom();
+    if (t === editorText) return;
+    editorText = t;
+    editorLineEls = Array.from(edEl.children);
+    rebuildLineStarts(t);
+}
+
+/** 组字结束等"必须立刻拿到最新文本"的时机用 */
+function syncModelFromDom() {
+    modelDirty = true;
+    syncModelNow();
+}
+
+/**
+ * 编辑器的代理对象 —— 保持和 <textarea> 一样的 API。
+ * app.js 里其它地方直接用 editor.xxx，不用改。
+ */
+const editor = {
+    // ⚠️ 读之前先同步 —— 保证调用方拿到的永远是 DOM 的真实内容
+    get value() { syncModelNow(); return editorText; },
+    set value(v) { setEditorText(String(v)); },
+    get selectionStart() { syncModelNow(); readSelection(); return selStartOff; },
+    get selectionEnd() { syncModelNow(); readSelection(); return selEndOff; },
+    setSelectionRange(a, b) { setSelRange(a, b); },
+    select() { setSelRange(0, editorText.length); },
+    focus(o) { edEl.focus(o); },
+    blur() { edEl.blur(); },
+    addEventListener(t, f, o) { edEl.addEventListener(t, f, o); },
+    removeEventListener(t, f, o) { edEl.removeEventListener(t, f, o); },
+    get scrollTop() { return edEl.scrollTop; },
+    set scrollTop(v) { edEl.scrollTop = v; },
+    get scrollLeft() { return edEl.scrollLeft; },
+    set scrollLeft(v) { edEl.scrollLeft = v; },
+    get clientHeight() { return edEl.clientHeight; },
+    get clientWidth() { return edEl.clientWidth; },
+    get scrollHeight() { return edEl.scrollHeight; },
+    getBoundingClientRect() { return edEl.getBoundingClientRect(); },
+    get offsetWidth() { return edEl.offsetWidth; },
+    get offsetHeight() { return edEl.offsetHeight; },
+    get offsetTop() { return edEl.offsetTop; },
+    get offsetLeft() { return edEl.offsetLeft; },
+    get clientTop() { return edEl.clientTop; },
+    get clientLeft() { return edEl.clientLeft; },
+    get parentNode() { return edEl.parentNode; },
+    get firstChild() { return edEl.firstChild; },
+    get childNodes() { return edEl.childNodes; },
+    contains(n) { return edEl.contains(n); },
+    querySelector(s) { return edEl.querySelector(s); },
+    querySelectorAll(s) { return edEl.querySelectorAll(s); },
+    set innerHTML(v) { edEl.innerHTML = v; },
+    get innerHTML() { return edEl.innerHTML; },
+    get textContent() { return edEl.textContent; },
+    set textContent(v) { edEl.textContent = v; },
+    get readOnly() { return edEl.getAttribute('contenteditable') === 'false'; },
+    set readOnly(v) {
+        edEl.setAttribute('contenteditable', v ? 'false' : 'plaintext-only');
+    },
+    get activeElement() { return edEl; },
+};
 const preview = document.getElementById('preview');
 const tocList = document.getElementById('toc-list');
 // 目录项点击走事件委托（目录可能有上万个节点，逐个 addEventListener 太贵）
@@ -515,6 +807,9 @@ flowchart TD
 
 // 启动文件的内容（Rust 注入）；没有就用欢迎页
 editor.value = (STARTUP.content != null) ? STARTUP.content : WELCOME;
+// contenteditable 需要先有内容才正确布局
+edEl.focus();
+edEl.blur();
 
 // ============ 渲染 ============
 
@@ -543,6 +838,8 @@ function schedulePreviewRender() {
 
 editor.addEventListener('input', (e) => {
     dirty = true;
+    // contenteditable：浏览器直接改的是 DOM → 标脏，等 rAF 读回模型
+    markModelDirty();
     // ⚠️ **输入法组字期间要什么都不做**（中文/日文输入法最明显）。
     //
     // 组字时（compositionstart → compositionend）每个拼音键都会触发一次 input，
@@ -570,6 +867,38 @@ editor.addEventListener('input', (e) => {
         collectMatches();
         renderEditorHighlights();
     }
+});
+
+// ============ 编辑区：Enter 键插入换行 ============
+// contenteditable 默认的 Enter 会插入一个块级元素（<div>），
+// 那会把「源码的行」和「DOM 的块」搅在一起 → 行号映射全乱。
+// 所以自己处理：插入一个换行符文本节点。
+edEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.ctrlKey || e.metaKey || e.altKey) return;
+    e.preventDefault();
+    document.execCommand('insertLineBreak');   // plaintext-only 模式下插入 \n
+    markModelDirty();
+});
+
+// ============ 编辑区：拖放只取纯文本 ============
+// ⚠️ **拖放不会触发 input 事件** → 模型会不同步 → 必须单独处理。
+edEl.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const dt = e.dataTransfer;
+    const txt = dt ? (dt.getData('text/plain') || dt.getData('text/uri-list') || '') : '';
+    if (!txt) return;
+    document.execCommand('insertText', false, txt);
+    markModelDirty();
+});
+
+// ============ 编辑区：粘贴只取纯文本 ============
+// contenteditable 默认会把 HTML 一起粘进来 → 破坏「每行一个块」的结构。
+edEl.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const txt = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
+    if (!txt) return;
+    document.execCommand('insertText', false, txt);
+    markModelDirty();
 });
 
 // ============ 编辑区：Tab 键插入缩进 ============
@@ -764,7 +1093,7 @@ const selToolbarBox = { w: 0, h: 0 };
  * 只在会影响排版的时候调用：启动、窗口 resize、拖分隔条、缩放。
  */
 function refreshEditorBox() {
-    const cs = getComputedStyle(editor);
+    const cs = getComputedStyle(edEl);
     const rect = editor.getBoundingClientRect();
     editorBox.left = rect.left;
     editorBox.top = rect.top;
@@ -818,10 +1147,9 @@ function lineIndexAtPos(text, pos) {
  *    改用 editorBox 缓存（只在 resize / 拖分隔条 / 缩放时刷新）。
  *    scrollTop / scrollLeft 读的是滚动容器的现成值，不触发布局。
  */
-function selectionRect() {
+function selectionRect(value, s, e) {
     if (!editorBox.valid) refreshEditorBox();
-    const value = editor.value;
-    const s = editor.selectionStart, e = editor.selectionEnd;
+    if (value === undefined) { value = editor.value; s = editor.selectionStart; e = editor.selectionEnd; }
     const line = lineIndexAtPos(value, s);
     const col = s - getDocStats(value).lineStarts[line];
     const lh = editorBox.lh;
@@ -842,8 +1170,9 @@ function selectionRect() {
  * 只数光标之前的围栏开关个数（奇数 = 在代码块里）。
  * ⚠️ 这个要扫文本，**只能在有选区时调用**（打字时每次都扫 1MB 会卡）。
  */
-function selectionInCodeBlock() {
-    const before = editor.value.slice(0, editor.selectionStart);
+function selectionInCodeBlock(value, selStart) {
+    if (value === undefined) { value = editor.value; selStart = editor.selectionStart; }
+    const before = value.slice(0, selStart);
     const fences = before.match(/^[ \t]{0,3}(?:```|~~~)/gm);
     return fences ? fences.length % 2 === 1 : false;
 }
@@ -875,18 +1204,25 @@ function updateSelToolbar() {
         selToolbar.classList.remove('show');
         return;
     }
+    // ⚠️ **一次性同步** —— 下面要用到文本和选区好几处。
+    //    每个 getter 都会触发同步检查，虽然第二次很快（脏标记已清），
+    //    但还是先同步一次、后面全用局部变量最稳。
+    syncModelNow();
+    readSelection();
+    const txt = editorText;
+    const selS = selStartOff, selE = selEndOff;
     const show = editMode && !editor.readOnly
-        && document.activeElement === editor
-        && editor.selectionStart !== editor.selectionEnd;
-    if (!show || selectionInCodeBlock()) {
+        && document.activeElement === edEl
+        && selS !== selE;
+    if (!show || selectionInCodeBlock(txt, selS)) {
         selToolbar.classList.remove('show');
         return;
     }
-    const r = selectionRect();
+    const r = selectionRect(txt, selS, selE);
     selToolbar.style.visibility = 'hidden';
     selToolbar.classList.add('show');
     // 按钮的激活状态：选中的内容已经是这个格式（比如已经加粗了）
-    const sel = editor.value.slice(editor.selectionStart, editor.selectionEnd);
+    const sel = txt.slice(selS, selE);
     for (const btn of selToolbar.querySelectorAll('button[data-fmt]')) {
         btn.classList.toggle('on', unwrapFormat(sel, btn.dataset.fmt) !== null);
     }
@@ -947,6 +1283,8 @@ editor.addEventListener('compositionstart', () => {
 });
 editor.addEventListener('compositionend', () => {
     imeComposing = false;
+    // 组字期间模型没同步 → 这里补一次（同步读，不延后）
+    syncModelFromDom();
     // 组完字：内容变了 → 补上组字期间攒下的活（标题/状态、预览、查找高亮）
     if (imePendingRender) {
         imePendingRender = false;
@@ -3050,7 +3388,7 @@ let editorPadTop = 0;
  * 别的场合一律用缓存值，别去 getComputedStyle（会触发样式重算 / 强制重排）。
  */
 function refreshEditorLineHeight() {
-    const cs = getComputedStyle(editor);
+    const cs = getComputedStyle(edEl);
     const lh = parseFloat(cs.lineHeight);
     editorLineHeight = isNaN(lh) ? 16 : lh;
     editorPadTop = parseFloat(cs.paddingTop) || 0;
@@ -3061,7 +3399,7 @@ function scrollEditorToLine(line) {
     // ⚠️ 每次都刷新行高 —— 文字缩放会改行高，用旧值算出来的位置是错的
     //    （缓存只在启动时刷新过一次，缩放后就过期了）
     refreshEditorLineHeight();
-    const cs = getComputedStyle(editor);
+    const cs = getComputedStyle(edEl);
     const padTop = parseFloat(cs.paddingTop) || 0;   // 滚动的原点是 padding 顶边，要补上
     // ⚠️ **向上取整**：行高是小数（如 22.95），算出来的位置会被浏览器量化，
     //    少零点几像素就落在**上一行** → 章节判定差一节（实测踩过）。
@@ -3457,11 +3795,20 @@ document.addEventListener('keydown', (e) => {
 
 // 光标移动 → 更新编辑区右下角的状态（行号 / 字数）
 document.addEventListener('selectionchange', () => {
-    // ⚠️ 组字期间不更新状态：组字时每个拼音键都会改选区 → selectionchange 频繁触发
+    // ⚠️ 组字期间不更新：组字时每个拼音键都会改选区 → selectionchange 频繁触发
     //    → 状态标签要重建全文统计（3 万行）→ 白白浪费。
     //    等 compositionend 再更新一次。
     if (imeComposing) return;
-    if (document.activeElement === editor) scheduleEditorStatus();
+    if (document.activeElement !== edEl) {
+        // 焦点不在编辑区 → 工具栏要收起来
+        if (selToolbar) selToolbar.classList.remove('show');
+        return;
+    }
+    scheduleEditorStatus();
+    // ⚠️ **<textarea> 有 select 事件（选区变化），contenteditable 没有** ——
+    //    所以选区变化只能靠 selectionchange → 少了这一步，
+    //    选中文字后浮动工具栏就不会出现（textarea 时代是 select 事件触发的）。
+    scheduleSelToolbar();
 });
 
 // 屏蔽刷新键：F5 / Ctrl+R / Ctrl+Shift+R
@@ -3804,7 +4151,7 @@ function gotoPreviewMatch(dir) {
 /** 把某个字符位置滚到编辑区可视区域（行高固定，不折行） */
 function scrollEditorToPos(pos) {
     if (!editorLineHeight) refreshEditorLineHeight();
-    const cs = getComputedStyle(editor);
+    const cs = getComputedStyle(edEl);
     const padTop = parseFloat(cs.paddingTop) || 0;
     // 光标前的换行数 = 行号
     let line = 0;
@@ -4012,7 +4359,6 @@ if (findBar) {
 // ============ 编辑区状态（光标行 / 总行数 / 字数）============
 // 浮在编辑区右下角，不占工具栏宽度（工具栏的宽度预算很紧）。
 let statusRaf = 0;
-let docStatsCache = { text: null, lines: 1, chars: 0 };
 
 /**
  * 文档统计：行数 / 字数 / 行首偏移表。
@@ -4027,14 +4373,26 @@ let docStatsCache = { text: null, lines: 1, chars: 0 };
  */
 function getDocStats(text) {
     if (docStatsCache.text === text) return docStatsCache;
-    let lines = 1, chars = 0;
-    // 行起始偏移表 —— 光标行号靠它二分查（否则每次光标移动都要 O(n) 扫一遍，
-    // 1MB 文档拖选会卡）
-    const lineStarts = [0];
-    for (let i = 0; i < text.length; i++) {
-        const c = text.charCodeAt(i);
-        if (c === 10) { lines++; lineStarts.push(i + 1); }
-        else if (c !== 32 && c !== 9 && c !== 13) chars++;   // 空白不算字数
+    // ⚠️ 行首表**只有一份**（编辑器模型的 editorLineStarts）——
+    //    两份表可能不一致 → 行号错乱（目录跳转、滚动同步全歪）。
+    //    编辑器模型不同步的场合（比如算别的文本）才临时建一份。
+    let lines, chars, lineStarts;
+    if (text === editorText && editorLineStarts.length) {
+        lineStarts = editorLineStarts;
+        lines = editorLineStarts.length;
+        chars = 0;
+        for (let i = 0; i < text.length; i++) {
+            const c = text.charCodeAt(i);
+            if (c !== 10 && c !== 32 && c !== 9 && c !== 13) chars++;
+        }
+    } else {
+        lines = 1; chars = 0;
+        lineStarts = [0];
+        for (let i = 0; i < text.length; i++) {
+            const c = text.charCodeAt(i);
+            if (c === 10) { lines++; lineStarts.push(i + 1); }
+            else if (c !== 32 && c !== 9 && c !== 13) chars++;
+        }
     }
     docStatsCache = { text, lines, chars, lineStarts };
     return docStatsCache;
@@ -4461,7 +4819,14 @@ function setAutoReload(on) {
 function applyReadOnly() {
     const readOnly = autoReload && !!currentFile;
     // 值没变就别写 DOM（updateFilename 每次输入都会走到这里）
-    if (editor.readOnly !== readOnly) editor.readOnly = readOnly;
+    if (editor.readOnly !== readOnly) {
+        // ⚠️ contenteditable 切到 false 会**丢掉选区**（<textarea> 的 readonly 不会）
+        //    → 记下来，改完还回去。
+        const hadSel = (selStartOff !== selEndOff);
+        const s0 = selStartOff, e0 = selEndOff;
+        editor.readOnly = readOnly;
+        if (hadSel) setSelRange(s0, e0);
+    }
     // 只读时「保存 / 另存为」置灰（点了也存不了）
     ['btn-save', 'btn-save-as'].forEach(id => {
         const b = document.getElementById(id);
@@ -5185,25 +5550,25 @@ document.addEventListener('keydown', (e) => {
     else if (ctrl && !e.shiftKey) {
         const m = /^Digit([1-6])$/.exec(e.code || '');
         if (m) {
-            if (document.activeElement !== editor) return;
+            if (document.activeElement !== edEl) return;
             e.preventDefault();
             applyHeading(Number(m[1]));
         }
         // ---- 格式化快捷键（只在编辑区聚焦时才生效）----
-        else if (document.activeElement === editor) {
+        else if (document.activeElement === edEl) {
             if (e.code === 'KeyB') { e.preventDefault(); formatSelection('bold'); }
             else if (e.code === 'KeyI') { e.preventDefault(); formatSelection('italic'); }
             else if (e.code === 'Backquote') { e.preventDefault(); formatSelection('code'); }
         }
     } else if (ctrl && e.shiftKey && e.code === 'Digit7') {
-        if (document.activeElement !== editor) return;
+        if (document.activeElement !== edEl) return;
         e.preventDefault(); applyList('ol');
     }
     else if (ctrl && e.shiftKey && e.code === 'Digit8') {
-        if (document.activeElement !== editor) return;
+        if (document.activeElement !== edEl) return;
         e.preventDefault(); applyList('ul');
     }
-    else if (ctrl && e.shiftKey && e.code === 'KeyX' && document.activeElement === editor) {
+    else if (ctrl && e.shiftKey && e.code === 'KeyX' && document.activeElement === edEl) {
         e.preventDefault(); formatSelection('strike');   // 删除线
     }
 });

@@ -399,7 +399,6 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     color: var(--text);
     border: none;
     outline: none;
-    resize: none;
     font-family: var(--font-mono);
     font-size: 13.5px;
     line-height: 1.7;
@@ -411,9 +410,20 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     white-space: pre;
     overflow-wrap: normal;
     overflow-x: auto;
+    overflow-y: auto;
     position: relative;
     z-index: 1;          /* 浮在高亮层上面 */
 }
+/* contenteditable 的每一行是一个块（div）—— 组字时 Blink 只重排改动的那一行 */
+#editor > div {
+    /* ⚠️ 空行（<div></div>）里没有行盒 → 高度是 0 → 行号 ↔ 像素的换算全错
+       （浮动工具栏会跑到别的地方、目录跳转会落错行）。
+       必须让它和普通行一样高 —— 1lh = 一个行高（跟随字号自动变）。 */
+    min-height: 1lh;
+    white-space: pre;
+}
+/* 编辑器获得焦点时不要显示默认的 outline（用边框代替） */
+#editor:focus { outline: none; }
 /* 高亮层：在 textarea 下面，尺寸/字体/内边距跟 textarea 完全一致，
    只有背景色可见（文字透明）—— 这样匹配位置跟真实文字严丝合缝对得上 */
 #editor-hl {
