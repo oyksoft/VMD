@@ -2694,10 +2694,7 @@ document.addEventListener('keydown', (e) => {
 
 // 光标移动 → 更新编辑区右下角的状态（行号 / 字数）
 document.addEventListener('selectionchange', () => {
-    if (document.activeElement === editor) {
-        scheduleEditorStatus();
-        showStatusBriefly();     // 键盘操作后短暂显示一下
-    }
+    if (document.activeElement === editor) scheduleEditorStatus();
 });
 
 // 屏蔽刷新键：F5 / Ctrl+R / Ctrl+Shift+R
@@ -3283,20 +3280,9 @@ function updateEditorStatus() {
     el.textContent = '行 ' + line + '/' + stats.lines + ' · ' + stats.chars + ' 字';
 }
 
-/** 状态条只在“需要时”出现：鼠标在编辑区底部，或刚操作过键盘 */
-let statusTimer = 0;
-let pointerNearBottom = false;
-function showStatusBriefly() {
-    const el = document.getElementById('editor-status');
-    if (!el) return;
-    el.classList.add('show');
-    clearTimeout(statusTimer);
-    statusTimer = setTimeout(() => {
-        if (!pointerNearBottom) el.classList.remove('show');
-    }, 1800);
-}
-
-/** 光标一动就更新状态栏（rAF 节流，不然拖选会卡） */
+/**
+ * 光标一动就更新状态栏（rAF 节流，不然拖选会卡）
+ */
 function scheduleEditorStatus() {
     if (statusRaf) return;
     statusRaf = requestAnimationFrame(() => {
@@ -3304,32 +3290,6 @@ function scheduleEditorStatus() {
         updateEditorStatus();
     });
 }
-
-// 鼠标移到编辑区底部 → 状态条淡入；离开底部 → 淡出。
-// （平时完全不显示，免得浮在内容上遮住最后一行文字）
-(function initStatusHover() {
-    const wrap = document.getElementById('editor-wrap');
-    const el = document.getElementById('editor-status');
-    if (!wrap || !el) return;
-    wrap.addEventListener('mousemove', (e) => {
-        const r = wrap.getBoundingClientRect();
-        const near = (r.bottom - e.clientY) < 90;
-        if (near) {
-            // 鼠标在底部 → 持续显示（定时器别把它关了）
-            pointerNearBottom = true;
-            el.classList.add('show');
-            clearTimeout(statusTimer);
-        } else if (pointerNearBottom) {
-            // 离开底部 → 改成“短暂显示”，过一会儿自己藏起来
-            pointerNearBottom = false;
-            showStatusBriefly();
-        }
-    });
-    wrap.addEventListener('mouseleave', () => {
-        pointerNearBottom = false;
-        el.classList.remove('show');
-    });
-})();
 
 // ============ 外部修改检测 ============
 
