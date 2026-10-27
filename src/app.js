@@ -826,8 +826,9 @@ function selectionRect() {
     const col = s - getDocStats(value).lineStarts[line];
     const lh = editorBox.lh;
     const cw = editorBox.cw;
-    const x = editorBox.left + editorBox.padLeft + col * cw - editor.scrollLeft;
-    const y = editorBox.top + editorBox.padTop + line * lh - editor.scrollTop;
+    // ⚠️ 用缓存的滚动位置（读 editor.scrollTop 在布局脏时 = 强制重排 288ms）
+    const x = editorBox.left + editorBox.padLeft + col * cw - editorScrollLeft;
+    const y = editorBox.top + editorBox.padTop + line * lh - editorScrollTop;
     // 宽度：到本行行尾为止（跨行时只取第一行那段）
     const nl = value.indexOf('\n', s);
     const endCol = (nl === -1 ? value.length : nl) - s;
@@ -958,6 +959,8 @@ editor.addEventListener('compositionend', () => {
         }
     }
     scheduleSelToolbar();
+    // 组字期间攒下的滚动同步 → 补一次（此时布局已算好，读 scrollTop 免费）
+    scheduleImeScrollSync();
 });
 
 // ============ 插入图片 ============
@@ -1535,7 +1538,7 @@ function applyScrollByRatio(fromEditor) {
     const maxPrev = previewScrollMax;
     if (maxEdit <= 0 || maxPrev <= 0) return;
     if (fromEditor) {
-        const target = (editor.scrollTop / maxEdit) * maxPrev;
+        const target = (editorScrollTop / maxEdit) * maxPrev;
         setScrollTop(previewScroll, target);
     } else {
         const target = (previewScroll.scrollTop / maxPrev) * maxEdit;
@@ -1557,7 +1560,8 @@ function applyScrollToPreview() {
     if (!lh || !anchorList.length) { applyScrollByRatio(true); return; }
 
     // 锚点 = 源码顶行所在的预览元素（**精确查表**，不是按比例估算）
-    const topLine = Math.floor((editor.scrollTop - padTop) / lh);
+    // ⚠️ 用缓存的滚动位置，别读 editor.scrollTop（布局脏时读它 = 强制重排 288ms）
+    const topLine = Math.floor((editorScrollTop - padTop) / lh);
     const a = anchorAtLine(topLine);
     if (!a) { applyScrollByRatio(true); return; }
     // 锚点内部的位置用**字符比例**：长段落里源码几行、预览折成十几行，
@@ -1586,7 +1590,7 @@ function applyScrollToPreviewByBlock() {
         applyScrollByRatio(true);
         return;
     }
-    const topLine = Math.floor((editor.scrollTop - padTop) / lh);
+    const topLine = Math.floor((editorScrollTop - padTop) / lh);
     const k = blockIndexAtLine(topLine);
     if (k < 0) { applyScrollByRatio(true); return; }
     const el = preview.children[k];
@@ -1630,7 +1634,7 @@ function applyScrollToEditor() {
     }
     // 幂等保护：已经在那一行就不动
     const wantPos = Math.min(Math.ceil(line * lh + padTop), maxEdit);
-    if (Math.abs(editor.scrollTop - wantPos) < 2) { updateAlignedChapter(); return; }
+    if (Math.abs(editorScrollTop - wantPos) < 2) { updateAlignedChapter(); return; }
     scrollEditorToLine(line);
     updateAlignedChapter();
 }
@@ -1671,7 +1675,7 @@ function applyScrollToEditorByBlock() {
 editor.addEventListener('wheel', (e) => {
     if (!settings.scrollSync) return;
     const maxEdit = editorScrollMax;
-    if (e.deltaY > 0 && maxEdit > 0 && editor.scrollTop >= maxEdit - 1) {
+    if (e.deltaY > 0 && maxEdit > 0 && editorScrollTop >= maxEdit - 1) {
         // 编辑区到底了 → 把这次滚动交给预览区
         previewScroll.scrollTop += e.deltaY;
         e.preventDefault();
@@ -1679,6 +1683,20 @@ editor.addEventListener('wheel', (e) => {
 }, { passive: false });
 
 editor.addEventListener('scroll', () => {
+    // ⚠️⚠️ **输入法组字期间必须把整个滚动处理延到下一帧**。
+    //
+    // 组字刚改完 value → **布局是脏的** → 这时读 editor.scrollTop 会
+    // **强制重排整个 textarea**（实测 3 万行 = 224~288ms）。
+    // 而 Chromium 组字时会滚动 textarea 让预编辑文字可见 → 触发 scroll 事件
+    // → 读 scrollTop → 强制重排 → 重排又改变 scrollTop → **又触发 scroll 事件**
+    // → 又 224ms …… 无限循环 → 一个汉字卡几十秒。
+    //
+    // 延到下一帧（requestAnimationFrame）后，浏览器已经把布局算好了，
+    // 那时读 scrollTop 是**免费**的。
+    if (imeComposing) { scheduleImeScrollSync(); return; }
+    // 正常滚动：这里读 scrollTop 是免费的（浏览器算完布局才派发 scroll 事件）
+    editorScrollTop = editor.scrollTop;
+    editorScrollLeft = editor.scrollLeft;
     // 高亮层要跟着滚（单独一个 listener：滚动同步有回弹抑制，
     // 抑制的时候高亮也得跟）
     syncHlScroll();
@@ -1686,13 +1704,31 @@ editor.addEventListener('scroll', () => {
     // 横向滚动（scrollTop 没变）不该触发纵向同步 ——
     // 编辑区是不折行的（wrap="off"），长行要横滚，
     // 横滚时按比例重置预览区会让预览“跳走”。
-    if (editor.scrollTop === lastEditorScrollTop) return;
-    lastEditorScrollTop = editor.scrollTop;
+    if (editorScrollTop === lastEditorScrollTop) return;
+    lastEditorScrollTop = editorScrollTop;
     if (isEchoScrollEvent(editor)) return;   // 这是程序自己同步过来的 → 忽略
     if (!settings.scrollSync) return;        // 设置里关掉了同步
     noteScrollDir('editor', editor);
     applyScrollToPreview();
 });
+
+/**
+ * 组字期间的滚动处理 —— 延到下一帧做（那时布局已算好，读 scrollTop 免费）。
+ */
+let imeScrollRaf = 0;
+function scheduleImeScrollSync() {
+    if (imeScrollRaf) return;
+    imeScrollRaf = requestAnimationFrame(() => {
+        imeScrollRaf = 0;
+        if (!editor) return;
+        editorScrollTop = editor.scrollTop;
+        editorScrollLeft = editor.scrollLeft;
+        syncHlScroll();
+        if (syncing || !previewScroll) return;
+        if (!settings.scrollSync) return;
+        applyScrollToPreview();
+    });
+}
 // 反向同步：预览区滚动 → 编辑区
 previewScroll && previewScroll.addEventListener('scroll', () => {
     if (syncing || !editor) return;
@@ -2771,7 +2807,7 @@ function currentHeadingElement(dir) {
 function editorTopLine() {
     const { lh, padTop } = editorMetrics();
     if (!lh) return 0;
-    return Math.floor((editor.scrollTop - padTop) / lh);
+    return Math.floor((editorScrollTop - padTop) / lh);
 }
 
 // 记录“两边当前对齐到哪一节”（目录高亮用它）。
@@ -2831,24 +2867,49 @@ const scrollDir = { editor: 0, preview: 0 };
 let pendingEcho = [];   // [{el, pos}]
 
 /**
+ * 编辑区的滚动位置 —— **缓存**。
+ *
+ * ⚠️⚠️ **这是「输入中文卡几十秒」的直接元凶**。
+ *
+ * 读 `editor.scrollTop` 在**布局脏**时会强制重排整个 textarea
+ * （实测 3 万行的文档 = **288ms**）—— Blink 的 Element::scrollTop
+ * getter 会先 UpdateStyleAndLayoutForNode。
+ *
+ * 而滚动同步（applyScrollToPreview / applyScrollByRatio / isEchoScrollEvent…）
+ * 每次都要读它。IME 组字刚改完 value → 布局是脏的 → 每次读都 288ms →
+ * 重排又让 scrollTop 变了 → **又触发 scroll 事件** → 又读一次 → …
+ * → 无限循环，输入一个汉字要几十秒。
+ *
+ * 改成缓存：scroll 事件里读一次（那时浏览器刚算完布局，读是**免费**的），
+ * 之后一律用缓存值。
+ */
+let editorScrollTop = 0;
+let editorScrollLeft = 0;
+
+/**
  * 程序设置滚动位置 —— 顺带把“这一侧接下来那个 scroll 事件是回弹”标记上。
  * 下一帧的 scroll 事件会被忽略（它不是用户在滚）。
  * ⚠️ 用 setTimeout(0) 解锁：scroll 事件在同一帧的“渲染前”派发，
  *    宏任务在渲染之后 → 顺序是对的。
  */
 function setScrollTop(el, pos) {
-    const before = el.scrollTop;
+    // ⚠️ **只写不读** —— 读 el.scrollTop 会强制重排（布局脏时 = 几百毫秒）。
+    //    这里原本还要读一次来判断「有没有真的动」，那个判断不值得付这个代价。
     el.scrollTop = pos;
-    if (el.scrollTop === before) return;      // 没动 → 不会有 scroll 事件
-    pendingEcho.push({ el, pos: el.scrollTop });
+    if (el === editor) { editorScrollTop = pos; editorScrollLeft = el.scrollLeft; }
+    pendingEcho.push({ el, pos });
     if (pendingEcho.length > 12) pendingEcho.shift();
 }
 
 /** 这个 scroll 事件是不是程序同步引起的回弹？是的话吃掉它并返回 true */
 function isEchoScrollEvent(el) {
+    // ⚠️ **不读 el.scrollTop** —— 那是强制重排的元凶（见 editorScrollTop 的注释）。
+    //    改成按「谁被设置过」判定：pendingEcho 里记的是我们要设到哪，
+    //    对应的那次 scroll 事件就是回弹。
+    //    ⚠️ 位置不再校验 → 极端情况下可能把一次用户滚动误判成回弹（丢一次滚动），
+    //    这比卡死好得多；正常情况下回弹位置就是我们要设的位置。
     for (let i = pendingEcho.length - 1; i >= 0; i--) {
-        const p = pendingEcho[i];
-        if (p.el === el && Math.abs(el.scrollTop - p.pos) < 2) {
+        if (pendingEcho[i].el === el) {
             pendingEcho.splice(i, 1);     // 一次性消费
             return true;
         }
@@ -2881,8 +2942,8 @@ function visibleHeadingsPreview() {
 function visibleHeadingsEditor() {
     const { lh, padTop } = editorMetrics();
     if (!lh) return [];
-    const top = (editor.scrollTop - padTop) / lh;
-    const bot = (editor.scrollTop - padTop + editorBox.clientH) / lh;
+    const top = (editorScrollTop - padTop) / lh;
+    const bot = (editorScrollTop - padTop + editorBox.clientH) / lh;
     return headingPairs.filter(p => p.line >= top - 1 && p.line <= bot);
 }
 
@@ -3351,6 +3412,7 @@ async function openPath(path) {
     editor.value = file.content;
     editor.setSelectionRange(0, 0);     // 光标回到开头
     editor.scrollTop = 0;               // 先归零（渲染和后续同步都以顶部为基准）
+    editorScrollTop = 0;                // 缓存同步
     currentFile = path;
     currentEncoding = file.encoding || 'utf-8';
     dirty = false;
@@ -4164,6 +4226,7 @@ async function dropDraft() {
 async function restoreDraft(draft) {
     editor.value = draft.content;
     editor.scrollTop = 0;               // 恢复的是上次的内容 → 从顶部开始看
+    editorScrollTop = 0;                // 缓存同步
     currentFile = draft.path || null;
     currentEncoding = draft.encoding || 'utf-8';
     dirty = true;          // 内容还是“未保存”状态，标题栏要有 ●
