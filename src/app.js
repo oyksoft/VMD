@@ -1093,9 +1093,40 @@ function buildAnchorTable() {
         if (!bl) continue;
         const inner = contentElementOf(kids[k]);
         const rows = splitRows(inner, bl.start);
-        for (const r of rows) anchorList.push(r);
+        for (const r of rows) { r.block = k; anchorList.push(r); }
     }
     return anchorList;
+}
+
+/** 锚点对应的块 */
+function blockOfAnchor(a) {
+    return a && a.block !== undefined ? blockLines[a.block] : null;
+}
+
+/**
+ * 源码顶行在锚点内部的位置（0~1）—— 按**字符比例**算。
+ * 长段落里源码只有几行，预览却折成十几行，行高完全不成比例；
+ * 只有字符比例能对上（渲染后的高度大致与内容量成正比）。
+ */
+function fracInBlock(a, topLine) {
+    const bl = blockOfAnchor(a);
+    if (!bl || !bl.charLen) return 0;
+    const i = Math.max(0, Math.min(topLine - bl.start, bl.lineChars.length - 1));
+    const charInBlock = bl.lineChars[i] || 0;
+    return Math.max(0, Math.min(charInBlock / bl.charLen, 1));
+}
+
+/** 锚点内某个比例（0~1）对应源码的哪一行 */
+function lineOfCharInBlock(a, frac) {
+    const bl = blockOfAnchor(a);
+    if (!bl) return a ? a.line : 0;
+    const charInBlock = frac * bl.charLen;
+    const chars = bl.lineChars;
+    let li = 0;
+    for (let i = 0; i < chars.length; i++) {
+        if (chars[i] <= charInBlock) li = i; else break;
+    }
+    return bl.start + li;
 }
 
 /** 找“源码行 <= line 的最后一个锚点” */
@@ -1151,15 +1182,15 @@ function countNewlines(s) {
  *    一个 token 占的行数 = 换行数（raw 以换行结尾时）或 换行数+1（否则）。
  */
 function computeBlockLines(tokens, sourceText) {
-    // \u26a0\ufe0f \u5fc5\u987b\u6309**\u5b57\u7b26\u504f\u79fb**\u7b97\uff0c\u4e0d\u80fd\u6309\u201craw \u91cc\u7684\u6362\u884c\u6570\u201d\u7d2f\u52a0\uff1a
-    //    \u6362\u884c\u7684\u5f52\u5c5e\u8bf4\u4e0d\u6e05\uff1a\u6bb5\u843d token \u7684 raw \u4e0d\u542b\u7ed3\u5c3e\u6362\u884c\uff0c\u90a3\u4e2a\u6362\u884c\u5f52\u4e0b\u4e00\u4e2a token\uff0c
-    //    \u6309\u6362\u884c\u6570\u7d2f\u52a0\u4f1a\u8d8a\u7b97\u8d8a\u504f\uff08\u5b9e\u6d4b README \u4e0a\u504f\u4e86\u597d\u51e0\u4e2a\u5757\uff09\u3002
-    //    marked \u7684 token.raw \u7d2f\u52a0 === \u6e90\u7801\uff0c\u6240\u4ee5\u5b57\u7b26\u504f\u79fb\u662f\u51c6\u7684\u3002
+    // ⚠️ 必须按**字符偏移**算，不能按“raw 里的换行数”累加：
+    //    换行的归属说不清：段落 token 的 raw 不含结尾换行，那个换行归下一个 token，
+    //    按换行数累加会越算越偏（实测 README 上偏了好几个块）。
+    //    marked 的 token.raw 累加 === 源码，所以字符偏移是准的。
     const lineStarts = [0];
     for (let i = 0; i < sourceText.length; i++) {
         if (sourceText.charCodeAt(i) === 10) lineStarts.push(i + 1);
     }
-    // \u5b57\u7b26\u504f\u79fb \u2192 \u884c\u53f7\uff08\u6700\u540e\u4e00\u4e2a <= \u5b83\u7684\u884c\u8d77\u59cb\uff09
+    // 字符偏移 → 行号（最后一个 <= 它的行起始）
     const lineOf = (charPos) => {
         let lo = 0, hi = lineStarts.length - 1;
         while (lo < hi) {
@@ -1175,8 +1206,22 @@ function computeBlockLines(tokens, sourceText) {
         charPos += t.raw.length;
         if (t.type === 'space' || t.type === 'def') continue;
         const start = lineOf(startChar);
-        const end = lineOf(Math.max(startChar, charPos - 1));   // raw \u7684\u6700\u540e\u4e00\u4e2a\u5b57\u7b26\u6240\u5728\u884c
-        lines.push({ start, count: Math.max(1, end - start + 1) });
+        const end = lineOf(Math.max(startChar, charPos - 1));   // raw 的最后一个字符所在行
+        const count = Math.max(1, end - start + 1);
+        // 块内每一行的起始字符偏移（相对块首）——
+        // 长段落（源码几行、预览折成十几行）必须按**字符比例**定位，
+        // 按行比例会偏很多（行高完全不成比例）。
+        const lineChars = [];
+        for (let ln = start; ln <= end; ln++) {
+            const off = lineStarts[ln] - startChar;
+            lineChars.push(off >= 0 ? off : 0);
+        }
+        lines.push({
+            start, count,
+            charStart: startChar,
+            charLen: t.raw.length,
+            lineChars,
+        });
     }
     return lines;
 }
@@ -1234,9 +1279,9 @@ function applyScrollToPreview() {
     const topLine = Math.floor((editor.scrollTop - padTop) / lh);
     const a = anchorAtLine(topLine);
     if (!a) { applyScrollByRatio(true); return; }
-    // 锚点内部的比例（源码行在锚点行区间里的位置）
-    const span = Math.max(1, a.endLine - a.line);
-    const frac = Math.max(0, Math.min((topLine - a.line) / span, 1));
+    // 锚点内部的位置用**字符比例**：长段落里源码几行、预览折成十几行，
+    // 行高完全不成比例，只有字符比例能对上。
+    const frac = fracInBlock(a, topLine);
     const wrapRect = previewScroll.getBoundingClientRect();
     const elRect = a.el.getBoundingClientRect();
     const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + frac * elRect.height;
@@ -1286,11 +1331,10 @@ function applyScrollToEditor() {
     if (!a) { applyScrollByRatio(false); return; }
     const wrapRect = previewScroll.getBoundingClientRect();
     const elRect = a.el.getBoundingClientRect();
-    // 锚点内部的比例（视口顶在这个锚点里往下滑了多少）
+    // 锚点内部的位置（视口顶在这个锚点里往下滑了多少）
     const passed = wrapRect.top - elRect.top;          // 正数 = 视口顶在锚点上方
     const frac = elRect.height > 0 ? Math.max(0, Math.min(passed / elRect.height, 1)) : 0;
-    const span = Math.max(1, a.endLine - a.line);
-    let line = a.line + frac * span;
+    let line = lineOfCharInBlock(a, frac);
     // 源码那边滚不到这么远 → 两边一起到底（否则会分叉）
     const maxLine = Math.floor((maxEdit - padTop) / lh);
     if (line > maxLine) {
@@ -1899,7 +1943,7 @@ function ensureKatex() {
 }
 // 没有公式定界符就整段跳过。KaTeX 的 auto-render 要把预览里所有文本节点
 // 走一遍，长文档白跑一次就是几百毫秒（1MB 文档实测多花约 600ms）。
-const MATH_FENCE_RE = /^[ 	]*(?:```|~~~)[ 	]*(?:latex|math|tex|katex)/m;
+const MATH_FENCE_RE = /^[ 	]*(?:```|~~~)[ 	]*(?:latex|math|tex|katex)\b/m;
 function hasMathSyntax(src) {
     if (src.indexOf('$') >= 0 || src.indexOf('\(') >= 0 || src.indexOf('\[') >= 0) return true;
     return MATH_FENCE_RE.test(src);
