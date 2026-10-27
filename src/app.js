@@ -538,7 +538,7 @@ editor.addEventListener('input', () => {
     // 查找栏开着时文本变了 → 匹配位置也跟着变，重算 + 重画高亮
     if (findBar && findBar.classList.contains('open')) {
         collectMatches();
-        renderFindHighlights();
+        renderEditorHighlights();
     }
 });
 
@@ -1035,6 +1035,103 @@ let lastEditorScrollTop = 0;
 //    块在编辑区里的高度就是 行数 × 行高，精确对应。
 let blockLines = [];
 
+// ============ 行级锚点表 ============
+//
+// 目标：任意滚动位置都能**精确**反查，不用“按比例估算”。
+// 之前按比例映射必然偏 —— 源码一行 ≠ 预览一行（长段落会折行、
+// 表格的 --- 分隔行不渲染、代码块行高不同）。
+//
+// 现在记录：预览里的每个可定位元素 → 它对应的源码行。
+// 块内怎么细分（块与源码行范围的对应是确定的，看 DOM 结构就知道）：
+//   表格 → 每个 tr 一行（跳过 --- 分隔行）
+//   代码块 → hljs 高亮后每行一个 span
+//   其他 → 整个元素对应一行（列表/引用块内部不细分，误差在几十行内）
+let anchorList = [];   // [{el, line, endLine}]，按源码行升序
+
+/** 顶层块 → 真正的内容元素（表格被包进了 .table-wrap，代码块被包进了 .code-block） */
+function contentElementOf(el) {
+    if (el.classList && el.classList.contains('table-wrap')) return el.querySelector('table');
+    if (el.classList && el.classList.contains('code-block')) return el.querySelector('pre');
+    return el;
+}
+
+/** 把一个顶层块拆成若干“可定位元素 → 源码行” */
+function splitRows(el, start) {
+    if (!el) return [];
+    // 表格：每个 tr 一行（thead 后面那个 --- 分隔行不渲染成 tr，要跳过）
+    if (el.tagName === 'TABLE') {
+        const out = [];
+        const trs = Array.from(el.querySelectorAll('tr'));
+        trs.forEach((tr, i) => {
+            const line = i === 0 ? start : start + i + 1;
+            out.push({ el: tr, line, endLine: line });
+        });
+        return out;
+    }
+    // 代码块：hljs 把每行包成一个 span
+    if (el.tagName === 'PRE') {
+        const spans = Array.from(el.querySelectorAll('code > span'));
+        if (spans.length) {
+            const out = [];
+            spans.forEach((sp, i) => {
+                const line = start + 1 + i;   // 跳过开头的 ``` 行
+                out.push({ el: sp, line, endLine: line });
+            });
+            return out;
+        }
+    }
+    // 其他：整个元素一行
+    return [{ el, line: start, endLine: start }];
+}
+
+/** 重建锚点表（预览 DOM 变了就重建） */
+function buildAnchorTable() {
+    anchorList = [];
+    const kids = Array.from(preview.children);
+    for (let k = 0; k < kids.length; k++) {
+        const bl = blockLines[k];
+        if (!bl) continue;
+        const inner = contentElementOf(kids[k]);
+        const rows = splitRows(inner, bl.start);
+        for (const r of rows) anchorList.push(r);
+    }
+    return anchorList;
+}
+
+/** 找“源码行 <= line 的最后一个锚点” */
+function anchorAtLine(line) {
+    let best = null;
+    for (const a of anchorList) {
+        if (a.line <= line) best = a;
+        else break;
+    }
+    return best;
+}
+
+/** 找“预览里第一个在视口顶之上的锚点” */
+function anchorAtViewportTop() {
+    if (!previewScroll) return null;
+    const top = previewScroll.getBoundingClientRect().top;
+    let best = null;
+    for (const a of anchorList) {
+        const r = a.el.getBoundingClientRect();
+        if (r.bottom <= top) best = a;   // 完全在上方
+        else if (!best) best = a;        // 第一个（还在视口内）
+        else break;
+    }
+    return best;
+}
+
+/** 某一行属于第几个顶层块（取“起始行 <= 行”的最后一个块） */
+function blockIndexAtLine(line) {
+    let k = -1;
+    for (let i = 0; i < blockLines.length; i++) {
+        if (blockLines[i].start <= line) k = i;
+        else break;
+    }
+    return k;
+}
+
 /** 数一个字符串里的换行个数 */
 function countNewlines(s) {
     let n = 0;
@@ -1049,16 +1146,33 @@ function countNewlines(s) {
  * ⚠️ marked 的 token.raw **累加 === 源码**（已验证），所以可以直接累加行数。
  *    一个 token 占的行数 = 换行数（raw 以换行结尾时）或 换行数+1（否则）。
  */
-function computeBlockLines(tokens) {
-    const lines = [];
-    let cursor = 0;
-    for (const t of tokens) {
-        const nl = countNewlines(t.raw);
-        const count = t.raw.endsWith('\n') ? nl : nl + 1;
-        if (t.type !== 'space' && t.type !== 'def') {
-            lines.push({ start: cursor, count });
+function computeBlockLines(tokens, sourceText) {
+    // \u26a0\ufe0f \u5fc5\u987b\u6309**\u5b57\u7b26\u504f\u79fb**\u7b97\uff0c\u4e0d\u80fd\u6309\u201craw \u91cc\u7684\u6362\u884c\u6570\u201d\u7d2f\u52a0\uff1a
+    //    \u6362\u884c\u7684\u5f52\u5c5e\u8bf4\u4e0d\u6e05\uff1a\u6bb5\u843d token \u7684 raw \u4e0d\u542b\u7ed3\u5c3e\u6362\u884c\uff0c\u90a3\u4e2a\u6362\u884c\u5f52\u4e0b\u4e00\u4e2a token\uff0c
+    //    \u6309\u6362\u884c\u6570\u7d2f\u52a0\u4f1a\u8d8a\u7b97\u8d8a\u504f\uff08\u5b9e\u6d4b README \u4e0a\u504f\u4e86\u597d\u51e0\u4e2a\u5757\uff09\u3002
+    //    marked \u7684 token.raw \u7d2f\u52a0 === \u6e90\u7801\uff0c\u6240\u4ee5\u5b57\u7b26\u504f\u79fb\u662f\u51c6\u7684\u3002
+    const lineStarts = [0];
+    for (let i = 0; i < sourceText.length; i++) {
+        if (sourceText.charCodeAt(i) === 10) lineStarts.push(i + 1);
+    }
+    // \u5b57\u7b26\u504f\u79fb \u2192 \u884c\u53f7\uff08\u6700\u540e\u4e00\u4e2a <= \u5b83\u7684\u884c\u8d77\u59cb\uff09
+    const lineOf = (charPos) => {
+        let lo = 0, hi = lineStarts.length - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (lineStarts[mid] <= charPos) lo = mid; else hi = mid - 1;
         }
-        cursor += count;
+        return lo;
+    };
+    const lines = [];
+    let charPos = 0;
+    for (const t of tokens) {
+        const startChar = charPos;
+        charPos += t.raw.length;
+        if (t.type === 'space' || t.type === 'def') continue;
+        const start = lineOf(startChar);
+        const end = lineOf(Math.max(startChar, charPos - 1));   // raw \u7684\u6700\u540e\u4e00\u4e2a\u5b57\u7b26\u6240\u5728\u884c
+        lines.push({ start, count: Math.max(1, end - start + 1) });
     }
     return lines;
 }
@@ -1070,48 +1184,6 @@ function editorMetrics() {
     refreshEditorLineHeight();
     const cs = getComputedStyle(editor);
     return { lh: editorLineHeight, padTop: parseFloat(cs.paddingTop) || 0 };
-}
-
-/** 某一行属于第几个顶层块（取“起始行 <= 行”的最后一个块） */
-function blockIndexAtLine(line) {
-    let k = -1;
-    for (let i = 0; i < blockLines.length; i++) {
-        if (blockLines[i].start <= line) k = i;
-        else break;
-    }
-    return k;
-}
-
-// 回弹抑制：程序设置了某个元素的滚动位置后，那个元素接下来发的 scroll 事件
-// 是“回弹”（不是用户在滚），必须忽略，否则两边会互相抽筋。
-//
-// ⚠️ 用**位置匹配**而不是时间窗：时间窗会误伤用户的滚动 ——
-//    程序刚同步过预览（比如光标跟随），用户接着滚预览，
-//    整个手势都被当成回弹忽略掉 → “预览滚了但编辑区没跟”。
-//    现在：记住程序设过的确切位置，scroll 事件的位置跟它一样才算回弹。
-//    同方向的连续滚动**不受影响** —— 一次滚轮手势 5~10 个事件，
-//    全丢的话预览只跟得上第一帧（这正是以前“滚起来跟不上”的原因）。
-const programmaticScrolls = [];   // [{dir, pos, at}]
-
-/** 记下“程序刚把某个元素设到了哪个位置” */
-function noteProgrammaticScroll(dir, pos) {
-    programmaticScrolls.push({ dir, pos, at: performance.now() });
-    if (programmaticScrolls.length > 24) programmaticScrolls.shift();
-}
-
-/**
- * 这个方向的 scroll 是不是回弹？
- * @param dir 当前 scroll 事件的方向（'editor' / 'preview'）
- * @param pos 当前 scroll 位置
- */
-function isEchoScroll(dir, pos) {
-    const now = performance.now();
-    for (let i = programmaticScrolls.length - 1; i >= 0; i--) {
-        const p = programmaticScrolls[i];
-        if (now - p.at > 800) break;          // 太老的就不看了
-        if (p.dir === dir && Math.abs(p.pos - pos) < 1.5) return true;
-    }
-    return false;
 }
 
 /**
@@ -1137,12 +1209,12 @@ function applyScrollByRatio(fromEditor) {
         const target = (editor.scrollTop / maxEdit) * maxPrev;
         const before = previewScroll.scrollTop;
         previewScroll.scrollTop = target;
-        if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
+        if (previewScroll.scrollTop !== before) markSyncLock('preview');
     } else {
         const target = (previewScroll.scrollTop / maxPrev) * maxEdit;
         const before = editor.scrollTop;
         editor.scrollTop = target;
-        if (editor.scrollTop !== before) noteProgrammaticScroll('editor', editor.scrollTop);
+        if (editor.scrollTop !== before) markSyncLock('editor');
     }
 }
 
@@ -1156,29 +1228,22 @@ function applyScrollToPreview() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
     const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
-    // 块数对不上（原始 HTML 展开成多个预览节点）→ 退回按比例
-    if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
-        applyScrollByRatio(true);
-        return;
-    }
-    // 锚点 = 编辑区顶行所在的块（**连续**跟随，不是按章节跳）
+    if (!lh || !anchorList.length) { applyScrollByRatio(true); return; }
+
+    // 锚点 = 源码顶行所在的预览元素（**精确查表**，不是按比例估算）
     const topLine = Math.floor((editor.scrollTop - padTop) / lh);
-    const k = blockIndexAtLine(topLine);
-    if (k < 0) { applyScrollByRatio(true); return; }
-    const el = preview.children[k];
-    if (!el) { applyScrollByRatio(true); return; }
-    const bl = blockLines[k];
-    // 块内偏移（0~1）：源码块内已经过去多少
-    const frac = bl.count > 0 ? Math.max(0, Math.min((topLine - bl.start) / bl.count, 1)) : 0;
+    const a = anchorAtLine(topLine);
+    if (!a) { applyScrollByRatio(true); return; }
+    // 锚点内部的比例（源码行在锚点行区间里的位置）
+    const span = Math.max(1, a.endLine - a.line);
+    const frac = Math.max(0, Math.min((topLine - a.line) / span, 1));
     const wrapRect = previewScroll.getBoundingClientRect();
-    const elRect = el.getBoundingClientRect();
+    const elRect = a.el.getBoundingClientRect();
     const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + frac * elRect.height;
     const want = Math.max(0, Math.min(target, maxPrev));
-    // 幂等保护：**按位置**比（不按章节比 —— 两边的方向可能不同，比章节不可靠）
-    if (Math.abs(previewScroll.scrollTop - want) < 4) { updateAlignedChapter(); return; }
-    const before = previewScroll.scrollTop;
-    previewScroll.scrollTop = want;
-    if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
+    // 幂等保护：已经在位就不动（不然同步→预览滚→回弹→反向同步… 来回拉扯）
+    if (Math.abs(previewScroll.scrollTop - want) < 2) { updateAlignedChapter(); return; }
+    setScrollTop(previewScroll, want);
     updateAlignedChapter();
 }
 
@@ -1205,7 +1270,7 @@ function applyScrollToPreviewByBlock() {
     const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + ratio * elRect.height;
     const before = previewScroll.scrollTop;
     previewScroll.scrollTop = Math.min(target, maxPrev);
-    if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
+    if (previewScroll.scrollTop !== before) markSyncLock('preview');
 }
 
 /** 把预览区的位置应用到编辑区（预览区 → 编辑区）
@@ -1216,48 +1281,37 @@ function applyScrollToEditor() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
     const maxEdit = editor.scrollHeight - editor.clientHeight;
-    if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
-        applyScrollByRatio(false);
-        return;
-    }
-    // 锚点 = 预览区顶部可见的块（**连续**跟随）
+    if (!lh || !anchorList.length) { applyScrollByRatio(false); return; }
+
+    // 锚点 = 预览视口顶部所在的元素（**精确查表**）
+    const a = anchorAtViewportTop();
+    if (!a) { applyScrollByRatio(false); return; }
     const wrapRect = previewScroll.getBoundingClientRect();
-    let k = -1;
-    for (let i = 0; i < preview.children.length; i++) {
-        const r = preview.children[i].getBoundingClientRect();
-        if (r.bottom > wrapRect.top) { k = i; break; }
-    }
-    if (k < 0) { applyScrollByRatio(false); return; }
-    const bl = blockLines[k];
-    if (!bl) { applyScrollByRatio(false); return; }
-    const elRect = preview.children[k].getBoundingClientRect();
-    // 块内偏移：块顶已经在视口上方多少（占块高的比例）
-    const passed = wrapRect.top - elRect.top;
+    const elRect = a.el.getBoundingClientRect();
+    // 锚点内部的比例（视口顶在这个锚点里往下滑了多少）
+    const passed = wrapRect.top - elRect.top;          // 正数 = 视口顶在锚点上方
     const frac = elRect.height > 0 ? Math.max(0, Math.min(passed / elRect.height, 1)) : 0;
-    let line = bl.start + frac * Math.max(0, bl.count - 1);
-    // ⚠️ 源码那边可能滚不到这么远（预览渲染后比源码高，可滚范围对不上）——
-    //    光把编辑区钳制到底会**两边分叉**（编辑区停在末尾，预览还在中间）。
-    //    所以钳制的瞬间**预览也一起滚到对应位置**，两边保持一致。
+    const span = Math.max(1, a.endLine - a.line);
+    let line = a.line + frac * span;
+    // 源码那边滚不到这么远 → 两边一起到底（否则会分叉）
     const maxLine = Math.floor((maxEdit - padTop) / lh);
     if (line > maxLine) {
         line = maxLine;
-        const lastK = blockIndexAtLine(maxLine);
-        const lastEl = lastK >= 0 ? preview.children[lastK] : null;
-        if (lastEl) {
-            const wr = previewScroll.getBoundingClientRect();
-            const t = previewScroll.scrollTop +
-                (lastEl.getBoundingClientRect().top - wr.top) - 8;
+        const last = anchorAtLine(maxLine);
+        if (last) {
+            const lw = previewScroll.getBoundingClientRect();
+            const lr = last.el.getBoundingClientRect();
             const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
-            const beforeP = previewScroll.scrollTop;
-            previewScroll.scrollTop = Math.max(0, Math.min(t, maxPrev));
-            if (previewScroll.scrollTop !== beforeP) {
-                noteProgrammaticScroll('preview', previewScroll.scrollTop);
-            }
+            const t = previewScroll.scrollTop + (lr.top - lw.top) - 8;
+            setScrollTop(previewScroll, Math.max(0, Math.min(t, maxPrev)));
         }
     }
+    // 幂等保护：已经在那一行就不动
+    const wantPos = Math.min(Math.ceil(line * lh + padTop), maxEdit);
+    if (Math.abs(editor.scrollTop - wantPos) < 2) { updateAlignedChapter(); return; }
     const before = editor.scrollTop;
-    scrollEditorToLine(line);          // 它会补上 paddingTop
-    if (editor.scrollTop !== before) noteProgrammaticScroll('editor', editor.scrollTop);
+    scrollEditorToLine(line);
+    if (editor.scrollTop !== before) markSyncLock('editor');
     updateAlignedChapter();
 }
 
@@ -1289,7 +1343,7 @@ function applyScrollToEditorByBlock() {
     if (line > maxLine) line = maxLine;
     const before = editor.scrollTop;
     scrollEditorToLine(line);          // 它会补上 paddingTop
-    if (editor.scrollTop !== before) noteProgrammaticScroll('editor', editor.scrollTop);
+    if (editor.scrollTop !== before) markSyncLock('editor');
 }
 
 editor.addEventListener('scroll', () => {
@@ -1302,14 +1356,14 @@ editor.addEventListener('scroll', () => {
     // 横滚时按比例重置预览区会让预览“跳走”。
     if (editor.scrollTop === lastEditorScrollTop) return;
     lastEditorScrollTop = editor.scrollTop;
-    if (isEchoScroll('editor', editor.scrollTop)) return;   // 预览区回弹引起的
+    if (syncLock === 'editor') return;      // 这是程序自己同步过来的 → 忽略
     noteScrollDir('editor', editor);
     applyScrollToPreview();
 });
 // 反向同步：预览区滚动 → 编辑区
 previewScroll && previewScroll.addEventListener('scroll', () => {
     if (syncing || !editor) return;
-    if (isEchoScroll('preview', previewScroll.scrollTop)) return;
+    if (syncLock === 'preview') return;     // 这是程序自己同步过来的 → 忽略
     noteScrollDir('preview', previewScroll);
     applyScrollToEditor();
 });
@@ -1415,7 +1469,7 @@ function renderPreview() {
     const body = tokens.filter(t => t.type !== 'space' && t.type !== 'def');
     const keys = body.map(t => t.type + '\u0001' + t.raw);
     // 顶层块的行范围表（滚动同步用）：blockLines 与 body / preview.children 一一对应
-    blockLines = computeBlockLines(tokens);
+    blockLines = computeBlockLines(tokens, workText);
 
     // 找出真正变了的块区间（标准的前缀 + 后缀 diff）
     //
@@ -1503,6 +1557,7 @@ function renderPreview() {
     previewRenderedBase = baseDir;
     updateSelToolbar();   // 换文件后选区没了，浮动工具栏要收起来
     followCaretInPreview();   // 光标所在的内容要能在预览里看见
+    buildAnchorTable();   // 预览 DOM 变了 → 重建行级锚点表
 }
 
 /**
@@ -1537,7 +1592,7 @@ function followCaretInPreview() {
     const before = previewScroll.scrollTop;
     previewScroll.scrollTop = target;
     // 被程序设了滚动位置 → 预览接下来的 scroll 事件是回弹，要忽略
-    if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
+    if (previewScroll.scrollTop !== before) markSyncLock('preview');
 }
 
 /** 当前 markdown 文件所在目录（本地相对路径图片的解析基准） */
@@ -2390,6 +2445,27 @@ function headingIndexAtLine(line) {
 //   >0 = 往下滚（内容往上走 → 回看上面的内容）→ 取视口里**最靠上**的
 //   <0 = 往上滚（内容往下走 → 在看新冒出来的内容）→ 取视口里**最靠下**的
 const scrollDir = { editor: 0, preview: 0 };
+// 程序同步引起的滚动 —— 那一侧的 scroll 事件要忽略（它不是用户在滚）
+let syncLock = null;
+
+/**
+ * 程序设置滚动位置 —— 顺带把“这一侧接下来那个 scroll 事件是回弹”标记上。
+ * 下一帧的 scroll 事件会被忽略（它不是用户在滚）。
+ * ⚠️ 用 setTimeout(0) 解锁：scroll 事件在同一帧的“渲染前”派发，
+ *    宏任务在渲染之后 → 顺序是对的。
+ */
+function setScrollTop(el, pos) {
+    const before = el.scrollTop;
+    el.scrollTop = pos;
+    if (el.scrollTop === before) return;      // 没动 → 不会有 scroll 事件
+    markSyncLock(el === editor ? 'editor' : 'preview');
+}
+
+/** 标记“这一侧接下来的 scroll 事件是程序同步引起的，要忽略” */
+function markSyncLock(dir) {
+    syncLock = dir;
+    setTimeout(() => { if (syncLock === dir) syncLock = null; }, 0);
+}
 const lastScrollPos = { editor: 0, preview: 0 };
 
 /** 记下这次的滚动方向（回弹事件不算 —— 那是程序自己弄的） */
@@ -2491,7 +2567,7 @@ function onTocItemClick(e) {
         const maxPrev = previewWrap.scrollHeight - previewWrap.clientHeight;
         if (top <= maxPrev && Math.abs(previewWrap.scrollTop - top) > 4) {
             previewWrap.scrollTop = top;
-            noteProgrammaticScroll('preview', previewWrap.scrollTop);   // 预览自己跳的
+            markSyncLock('preview');   // 预览自己跳的
         }
     };
     previewWrap.addEventListener('scrollend', done);
