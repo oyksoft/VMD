@@ -1027,7 +1027,6 @@ const previewScroll = document.getElementById('preview-wrap');
 // 手动同步（目录跳转）期间完全锁住自动同步 —— 那里要的是“精确落位”，
 // 不能让自动同步的按比例映射把它冲掉。
 let syncing = false;
-let syncGuard = { dir: '', at: 0 };
 let lastEditorScrollTop = 0;
 
 // 顶层块的行范围表：blockLines[k] = { start, count }
@@ -1083,21 +1082,42 @@ function blockIndexAtLine(line) {
     return k;
 }
 
-/** 记下“刚才是哪个方向同步的”（用来识别回弹） */
-function markSynced(dir) {
-    syncGuard = { dir, at: performance.now() };
+// 回弹抑制：程序设置了某个元素的滚动位置后，那个元素接下来发的 scroll 事件
+// 是“回弹”（不是用户在滚），必须忽略，否则两边会互相抽筋。
+//
+// ⚠️ 语义只有一条：**谁被程序设了 scrollTop，就忽略谁的下一个 scroll 事件**。
+//    - 编辑器同步到预览 → 设了预览 → 忽略“预览”的 scroll
+//    - 预览同步到编辑器 → 设了编辑器 → 忽略“编辑器”的 scroll
+//    - 预览自己跳（光标跟随 / 目录校正）→ 忽略“预览”的 scroll
+//    同方向的连续滚动**不受影响** —— 一次滚轮手势 5~10 个事件，
+//    全丢的话预览只跟得上第一帧（这正是以前“滚起来跟不上”的原因）。
+let scrollEcho = { dir: '', at: 0 };
+
+/** 记下“刚刚被程序设了滚动位置的是谁” */
+function suppressScrollEcho(dir) {
+    scrollEcho = { dir, at: performance.now() };
 }
 
 /**
- * 这个方向的 scroll 是不是回弹（由另一方向的同步引起的）？
+ * 这个方向的 scroll 是不是回弹？
  * @param dir 当前 scroll 事件的方向（'editor' / 'preview'）
- * syncGuard.dir 记的是**最近一次主动同步**的方向；
- * 两者不同 → 这次 scroll 是上一次同步弄出来的回弹 → 应该忽略。
- * ⚠️ 方向别传反了 —— 传反了就不抑制回弹，两边会互相抽筋。
  */
 function isEchoScroll(dir) {
-    return !!syncGuard.dir && syncGuard.dir !== dir &&
-           performance.now() - syncGuard.at < 120;
+    return scrollEcho.dir === dir && performance.now() - scrollEcho.at < 150;
+}
+
+/**
+ * 换文件 / 新建后回到顶部。
+ * ⚠️ 改 editor.value **不会**重置滚动位置 —— 浏览器会保留上一次的 scrollTop，
+ *    于是新文件打开时停在上一个文件的那一行（用户反馈过）。
+ * ⚠️ scroll 事件是异步派发的，所以要先把自动同步锁住，延后再解锁。
+ */
+function resetScrollToTop() {
+    if (!editor) return;
+    syncing = true;
+    editor.scrollTop = 0;
+    if (previewScroll) previewScroll.scrollTop = 0;
+    setTimeout(() => { syncing = false; }, 60);
 }
 
 /** 按比例同步（块级锚点算不出来时的兜底） */
@@ -1109,12 +1129,12 @@ function applyScrollByRatio(fromEditor) {
         const target = (editor.scrollTop / maxEdit) * maxPrev;
         const before = previewScroll.scrollTop;
         previewScroll.scrollTop = target;
-        if (previewScroll.scrollTop !== before) markSynced('editor');
+        if (previewScroll.scrollTop !== before) suppressScrollEcho('preview');
     } else {
         const target = (previewScroll.scrollTop / maxPrev) * maxEdit;
         const before = editor.scrollTop;
         editor.scrollTop = target;
-        if (editor.scrollTop !== before) markSynced('preview');
+        if (editor.scrollTop !== before) suppressScrollEcho('editor');
     }
 }
 
@@ -1124,14 +1144,6 @@ function applyScrollToPreview() {
     const { lh, padTop } = editorMetrics();
     const maxEdit = editor.scrollHeight - editor.clientHeight;
     const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
-    // ⚠️ 一边到底时另一边可能还没到底（预览渲染后高度和源码不同）——
-    //    这时“到底对齐”：一边到文档末尾，另一边也到末尾。
-    if (maxEdit > 0 && maxPrev > 0 && editor.scrollTop >= maxEdit - 2) {
-        const before = previewScroll.scrollTop;
-        previewScroll.scrollTop = maxPrev;
-        if (previewScroll.scrollTop !== before) markSynced('editor');
-        return;
-    }
     // 块数对不上（原始 HTML 展开成多个预览节点）→ 退回按比例
     if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
         applyScrollByRatio(true);
@@ -1149,17 +1161,11 @@ function applyScrollToPreview() {
     const wrapRect = previewScroll.getBoundingClientRect();
     const elRect = el.getBoundingClientRect();
     const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + ratio * elRect.height;
-    // ⚠️ 预览这边已经到底 → 编辑区也到底（两边一起到文档末尾）
-    if (target > maxPrev) {
-        const before = editor.scrollTop;
-        editor.scrollTop = maxEdit;
-        if (editor.scrollTop !== before) markSynced('preview');
-        return;
-    }
+    // ⚠️ 预览这边已经到底 → 预览滚到它能到的最底，**编辑区保持不动**
+    //    （之前是“编辑区也到底” → 预览直接跳绝对底部，用户会看到预览跑飞了）
     const before = previewScroll.scrollTop;
-    previewScroll.scrollTop = target;
-    // 真的动了才记 —— 目标位置没变就不会有回弹事件
-    if (previewScroll.scrollTop !== before) markSynced('editor');
+    previewScroll.scrollTop = Math.min(target, maxPrev);
+    if (previewScroll.scrollTop !== before) suppressScrollEcho('preview');
 }
 
 /** 把预览区的位置应用到编辑区（预览区 → 编辑区） */
@@ -1168,13 +1174,6 @@ function applyScrollToEditor() {
     const { lh, padTop } = editorMetrics();
     const maxEdit = editor.scrollHeight - editor.clientHeight;
     const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
-    // 一边到底 → 另一边也到底（跟上面反方向对称）
-    if (maxEdit > 0 && maxPrev > 0 && previewScroll.scrollTop >= maxPrev - 2) {
-        const before = editor.scrollTop;
-        editor.scrollTop = maxEdit;
-        if (editor.scrollTop !== before) markSynced('preview');
-        return;
-    }
     if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
         applyScrollByRatio(false);
         return;
@@ -1194,19 +1193,15 @@ function applyScrollToEditor() {
     const passed = wrapRect.top - elRect.top;
     const frac = elRect.height > 0 ? passed / elRect.height : 0;
     const ratio = Math.max(0, Math.min(frac, 1));
-    const line = bl.start + ratio * Math.max(0, bl.count - 1);
-    // ⚠️ 源码那边已经到底（预览渲染后比源码高，两边的可滚范围不一样）→
-    //    预览也到底，两边一起到文档末尾
+    let line = bl.start + ratio * Math.max(0, bl.count - 1);
+    // ⚠️ 源码那边滚不到这么远（物理限制：预览渲染后比源码高，可滚范围不一样）→
+    //    用最远能到的那行，**预览保持在当前位置**
+    //    （之前是“预览也到底” → 预览直接跳绝对底部，看着像跑飞了）
     const maxLine = Math.floor((maxEdit - padTop) / lh);
-    if (line > maxLine) {
-        const before = previewScroll.scrollTop;
-        previewScroll.scrollTop = maxPrev;
-        if (previewScroll.scrollTop !== before) markSynced('preview');
-        return;
-    }
+    if (line > maxLine) line = maxLine;
     const before = editor.scrollTop;
     scrollEditorToLine(line);          // 它会补上 paddingTop
-    if (editor.scrollTop !== before) markSynced('preview');
+    if (editor.scrollTop !== before) suppressScrollEcho('editor');
 }
 
 editor.addEventListener('scroll', () => {
@@ -1225,7 +1220,7 @@ editor.addEventListener('scroll', () => {
 // 反向同步：预览区滚动 → 编辑区
 previewScroll && previewScroll.addEventListener('scroll', () => {
     if (syncing || !editor) return;
-    if (isEchoScroll('preview')) return;  // 编辑区回弹引起的
+    if (isEchoScroll('preview')) return;
     applyScrollToEditor();
 });
 
@@ -1451,9 +1446,8 @@ function followCaretInPreview() {
         : previewScroll.scrollTop + (r.bottom - wrapRect.bottom) + 12;
     const before = previewScroll.scrollTop;
     previewScroll.scrollTop = target;
-    // 标记成“回弹” → 预览区的 scroll 事件不会反过来拽动编辑区。
-    // ⚠️ 主动方是**编辑器**（光标在这儿），不是预览区 —— 方向别写反。
-    if (previewScroll.scrollTop !== before) markSynced('editor');
+    // 被程序设了滚动位置 → 预览接下来的 scroll 事件是回弹，要忽略
+    if (previewScroll.scrollTop !== before) suppressScrollEcho('preview');
 }
 
 /** 当前 markdown 文件所在目录（本地相对路径图片的解析基准） */
@@ -2240,7 +2234,9 @@ function refreshEditorLineHeight() {
 
 /** 把编辑区精确滚动到第 line 行（0 起） */
 function scrollEditorToLine(line) {
-    if (!editorLineHeight) refreshEditorLineHeight();
+    // ⚠️ 每次都刷新行高 —— 文字缩放会改行高，用旧值算出来的位置是错的
+    //    （缓存只在启动时刷新过一次，缩放后就过期了）
+    refreshEditorLineHeight();
     const cs = getComputedStyle(editor);
     const padTop = parseFloat(cs.paddingTop) || 0;   // 滚动的原点是 padding 顶边，要补上
     editor.scrollTop = line * editorLineHeight + padTop;
@@ -2281,6 +2277,13 @@ function onTocItemClick(e) {
         previewWrap.removeEventListener('scrollend', done);
         clearTimeout(fallback);
         syncing = false;
+        // ⚠️ 校正：smooth 滚动可能没到位（被钳制 / 被打断 / 行高算错），
+        //    这里按目标再对一次，直接跳到位（不再 smooth）。
+        const maxPrev = previewWrap.scrollHeight - previewWrap.clientHeight;
+        if (top <= maxPrev && Math.abs(previewWrap.scrollTop - top) > 4) {
+            previewWrap.scrollTop = top;
+            suppressScrollEcho('preview');   // 预览自己跳的 → 别反过来拽编辑区
+        }
     };
     previewWrap.addEventListener('scrollend', done);
     // 兜底：位置没变（不会触发 scrollend）或动画被打断
@@ -2569,6 +2572,7 @@ document.getElementById('btn-new').addEventListener('click', async () => {
     // （只改"当前模式"，不覆盖设置里的"默认模式"）
     if (!editMode) setEditMode(true);
     renderPreview();
+    resetScrollToTop();                 // 新建也是从顶部开始
     updateFilename();
     editor.focus();   // 光标直接落在编辑区，接着就能打字
 });
@@ -2628,11 +2632,13 @@ document.getElementById('btn-auto-reload').addEventListener('click', toggleAutoR
 async function openPath(path) {
     const file = await invoke('read_file', { path });
     editor.value = file.content;
+    editor.setSelectionRange(0, 0);     // 光标回到开头
     currentFile = path;
     currentEncoding = file.encoding || 'utf-8';
     dirty = false;
     fileMissing = false;
     renderPreview();
+    resetScrollToTop();                 // 换文件后回到顶部（别停在上个文件那行）
     updateFilename();
     setExternalChange(false);       // 换了文件，之前的"外部已修改"标记作废
     await recordStamp();
