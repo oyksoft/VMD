@@ -4291,6 +4291,17 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         ctxMenu.style.display = 'block';
         const w = ctxMenu.offsetWidth;
         const h = ctxMenu.offsetHeight;
+        // 量一下二级菜单的尺寸（临时显示，量完就藏）——
+        // 用实际尺寸判断往哪边展开，比拍脑袋估一个 210px 准得多
+        // （“链接 [文字](url)”那一行比预想的宽）。
+        let subW = 0, subH = 0;
+        const sub = ctxMenu.querySelector('.ctx-submenu');
+        if (sub) {
+            sub.style.display = 'block';
+            subW = sub.offsetWidth;
+            subH = sub.offsetHeight;
+            sub.style.display = '';
+        }
         const winW = window.innerWidth;
         const winH = window.innerHeight;
         let newX = x, newY = y;
@@ -4298,8 +4309,17 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         if (newY + h > winH) newY = y - h - 4;       // 下边不够 → 菜单画在鼠标上方（而不是贴窗底，避免鼠标在菜单内）
         if (newX < 4) newX = 4;
         if (newY < 4) newY = 4;
-        // 二级菜单往右展开 → 右边得再留出 ~210px，否则会跑出屏幕点不到
-        ctxMenu.classList.toggle('ctx-sub-left', newX + w + 210 > winW);
+        // 二级菜单往右展开 → 右边得再留出它的宽度，否则会跑出屏幕点不到
+        let subLeft = false;
+        if (subW > 0 && newX + w + subW + 4 > winW) {
+            subLeft = true;
+            // 翻到左侧后子菜单占 [newX+8-subW, newX+8]，得在屏幕内
+            if (newX < subW - 8) newX = Math.max(4, subW - 8);
+        }
+        ctxMenu.classList.toggle('ctx-sub-left', subLeft);
+        // 二级菜单往下展开 → 下方得留出它的高度；“插入”在菜单最后一项，
+        // 菜单靠下时子菜单会跑出屏幕底部 → 改成向上展开
+        ctxMenu.classList.toggle('ctx-sub-up', subH > 0 && newY + h + subH + 4 > winH);
         ctxMenu.style.left = newX + 'px';
         ctxMenu.style.top = newY + 'px';
         ctxMenu.style.visibility = 'visible';
@@ -4440,6 +4460,8 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     });
     document.addEventListener('scroll', () => closeMenu(), true);
     window.addEventListener('blur', () => closeMenu());
+    // 窗口尺寸变了 → 菜单（fixed 定位）会停在旧位置，可能跑到屏幕外 → 直接关掉
+    window.addEventListener('resize', () => closeMenu());
 
     // ESC 关闭
     document.addEventListener('keydown', (e) => {

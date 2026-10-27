@@ -1342,6 +1342,13 @@ body.drag-over #drop-hint { display: flex; }
     left: auto;
     right: calc(100% - 4px);
 }
+/* 翻到左侧时箭头也跟着朝左 */
+.ctx-menu.ctx-sub-left .ctx-item-arrow { transform: scaleX(-1); }
+/* 下方空间不够时，二级菜单改到向上展开（否则会跑出屏幕底部看不全） */
+.ctx-menu.ctx-sub-up .ctx-submenu {
+    top: auto;
+    bottom: -5px;
+}
 
 .ctx-separator {
     height: 1px;
