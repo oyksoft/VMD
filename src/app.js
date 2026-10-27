@@ -1552,6 +1552,58 @@ function applyScrollByRatio(fromEditor) {
  *  同一个章节里滚动时预览区不动（不抖），跳章节时才动。
  *  两边对齐到章节起点，位置永远可预测。
  */
+// ---- 诊断：滚动同步调用计数 + 熔断 ----
+// 如果两边在来回拉扯（乒乓循环），一帧内会被调用几百次 → 主线程 100% CPU。
+// 这里数一下，超过阈值就**停止同步**（宁可不同步，也不能卡死），
+// 并把计数写进窗口标题 —— 外部读进程标题就能看到。
+let scrollSyncCount = 0;
+let scrollSyncBurst = false;
+/** 诊断信息（会拼进窗口标题，外部读进程标题就能看到） */
+let diagInfo = '';
+let scrollSyncRaf = 0;
+function scrollSyncTick() {
+    if (scrollSyncRaf) return;
+    scrollSyncRaf = requestAnimationFrame(() => {
+        scrollSyncRaf = 0;
+        if (scrollSyncCount > 0) {
+            const n = scrollSyncCount;
+            scrollSyncCount = 0;
+            if (n > 40 && !scrollSyncBurst) {
+                scrollSyncBurst = true;
+                diagInfo = 'BURST' + n;
+            }
+        }
+    });
+}
+/**
+ * 滚动同步的**节流调度** —— 一帧最多做一次。
+ *
+ * ⚠️ 为什么必须节流：滚动事件可以每秒触发几十次（IME 组字时 Chromium
+ *    会滚动 textarea；用户快速滚动也是）。而每次同步都要查锚点表 +
+ *    更新目录高亮 + 写对边的 scrollTop → 几十次/秒 × 每次几十毫秒
+ *    = 主线程 100% CPU → 输入卡死。节流到一帧一次后开销降到 1/60。
+ */
+let scrollSyncThrottleRaf = 0;
+function scheduleScrollSync(side) {
+    if (scrollSyncThrottleRaf) return;
+    scrollSyncThrottleRaf = requestAnimationFrame(() => {
+        scrollSyncThrottleRaf = 0;
+        if (side === 'editor') applyScrollToPreview();
+        else applyScrollToEditor();
+    });
+}
+function scrollSyncGuard() {
+    scrollSyncCount++;
+    scrollSyncTick();
+    if (scrollSyncBurst) return false;   // 已经熔断
+    if (scrollSyncCount > 60) {         // 一帧内 60 次 → 一定在拉扯
+        scrollSyncBurst = true;
+        diagInfo = 'BURST' + scrollSyncCount;
+        return false;
+    }
+    return true;
+}
+
 function applyScrollToPreview() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
@@ -1708,8 +1760,9 @@ editor.addEventListener('scroll', () => {
     lastEditorScrollTop = editorScrollTop;
     if (isEchoScrollEvent(editor)) return;   // 这是程序自己同步过来的 → 忽略
     if (!settings.scrollSync) return;        // 设置里关掉了同步
+    if (!scrollSyncGuard()) return;          // 诊断：熔断
     noteScrollDir('editor', editor);
-    applyScrollToPreview();
+    scheduleScrollSync('editor');
 });
 
 /**
@@ -1726,6 +1779,7 @@ function scheduleImeScrollSync() {
         syncHlScroll();
         if (syncing || !previewScroll) return;
         if (!settings.scrollSync) return;
+        if (!scrollSyncGuard()) return;
         applyScrollToPreview();
     });
 }
@@ -1734,8 +1788,9 @@ previewScroll && previewScroll.addEventListener('scroll', () => {
     if (syncing || !editor) return;
     if (isEchoScrollEvent(previewScroll)) return;  // 这是程序自己同步过来的 → 忽略
     if (!settings.scrollSync) return;        // 设置里关掉了同步
+    if (!scrollSyncGuard()) return;          // 诊断：熔断
     noteScrollDir('preview', previewScroll);
-    applyScrollToEditor();
+    scheduleScrollSync('preview');
 });
 
 // ============ 预览 HTML 消毒 ============
@@ -2836,21 +2891,45 @@ function updateTocHighlight() {
     tocActiveId = id;
     // 只改「上一项 + 这一项」，不要遍历整个目录 —— 5000 项全写一次 style
     // 会触发整条目录重排，实测几百毫秒。
-    const prev = tocList.querySelector('.toc-item.active');
-    if (prev) prev.classList.remove('active');
+    // ⚠️ **不要用 querySelector('.toc-item.active') 找上一个高亮项**：
+    //    目录有 2000 项时每次查询都要遍历整条目录，样式脏时还会触发
+    //    整条目录的样式重算（实测几十毫秒）。而滚动同步每秒调本函数几十次
+    //    → 主线程 100% CPU → 输入卡死。改成**记住上一次高亮的节点**。
+    if (tocActiveEl) tocActiveEl.classList.remove('active');
+    tocActiveEl = null;
     // 目录项按预览里标题的顺序排（用 domIndex，配对失败也不会错位）
     const next = tocList.children[pair.domIndex];
-    if (next && next.classList && next.classList.contains('toc-item')) next.classList.add('active');
+    if (next && next.classList && next.classList.contains('toc-item')) {
+        next.classList.add('active');
+        tocActiveEl = next;
+    }
 }
 
 /** 源码的某一行属于哪个标题（向上找最近的标题） */
+/**
+ * 光标行所属的章节下标。
+ *
+ * ⚠️ **必须二分**：headingPairs 有几千项（一个标题一个），
+ *    线性扫描每次几千次 —— 而滚动同步每秒调它几十次 → 主线程 100% CPU。
+ *    headingPairs 按源码行递增 → 可以二分（配对失败时可能不递增 → 退回线性）。
+ */
 function headingIndexAtLine(line) {
-    let k = -1;
-    for (let i = 0; i < headingPairs.length; i++) {
-        if (headingPairs[i].line <= line) k = i;
-        else break;
+    const a = headingPairs;
+    if (!a.length) return -1;
+    if (a.length > 1 && a[1].line < a[0].line) {
+        let k = -1;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i].line <= line) k = i; else break;
+        }
+        return k;
     }
-    return k;
+    if (a[0].line > line) return -1;
+    let lo = 0, hi = a.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (a[mid].line <= line) lo = mid; else hi = mid - 1;
+    }
+    return lo;
 }
 
 // 滚动方向（决定取视口里哪一端的节点做锚点）
@@ -2896,7 +2975,10 @@ function setScrollTop(el, pos) {
     // ⚠️ **只写不读** —— 读 el.scrollTop 会强制重排（布局脏时 = 几百毫秒）。
     //    这里原本还要读一次来判断「有没有真的动」，那个判断不值得付这个代价。
     el.scrollTop = pos;
-    if (el === editor) { editorScrollTop = pos; editorScrollLeft = el.scrollLeft; }
+    // ⚠️ **不要**在这里更新 editorScrollTop —— pos 是「想设到哪」，
+    //    浏览器可能钳制它（超出范围时会变成边界值）→ 缓存和真实值对不上
+    //    → 同步逻辑会反复"纠正" → 乒乓循环。
+    //    真实值由 scroll 事件里的读取来更新（那时布局已算好，读是免费的）。
     pendingEcho.push({ el, pos });
     if (pendingEcho.length > 12) pendingEcho.shift();
 }
@@ -2992,6 +3074,8 @@ function scrollEditorToLine(line) {
 let tocSignature = null;   // null 而非 ''：空文档的签名也是 ''，得能区分「还没渲染过」
 // 当前高亮的目录项 id（updateTocHighlight 用，定义在文件末尾）
 let tocActiveId = '';
+/** 当前高亮的目录项（缓存住，免得每次 querySelector 遍历 2000 项） */
+let tocActiveEl = null;
 
 /** 目录最多列这么多项（再多就没法看了，而且建 DOM 的时间会大到影响手速） */
 const TOC_MAX_ITEMS = 2000;
@@ -3240,7 +3324,8 @@ function updateFilename() {
     }
     // 窗口标题也带上文件名，方便多文档时区分
     const title = (currentFile ? name + (dirty ? ' ●' : '') : '未命名') + ' - VMD';
-    document.title = title;
+    // ⚠️ 诊断信息要带上 —— 不然每次 updateFilename 都会把它冲掉
+    document.title = diagInfo ? diagInfo + ' ' + title : title;
     // 真正的窗口标题（标题栏那个）得让 Rust 改，网页的 document.title 管不到它
     if (title !== lastWindowTitle) {
         lastWindowTitle = title;
@@ -3570,8 +3655,9 @@ function renderEditorHighlights() {
 /** 高亮层跟着编辑区滚动 */
 function syncHlScroll() {
     if (!editorHl) return;
-    editorHl.scrollTop = editor.scrollTop;
-    editorHl.scrollLeft = editor.scrollLeft;
+    // ⚠️ 用缓存值（读 editor.scrollTop 在布局脏时 = 强制重排 288ms）
+    editorHl.scrollTop = editorScrollTop;
+    editorHl.scrollLeft = editorScrollLeft;
 }
 
 // ---- 预览区高亮：直接改 DOM，把匹配包成 <mark> ----
