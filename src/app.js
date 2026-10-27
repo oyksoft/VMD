@@ -530,11 +530,39 @@ function renderDelayFor(text) {
     if (n >= 50000) return RENDER_DELAY_MID;
     return RENDER_DELAY_SHORT;
 }
-editor.addEventListener('input', () => {
-    dirty = true;
-    updateFilename();
+/**
+ * 调度一次预览渲染（防抖）。
+ * 多次调用只会保留最后一次 —— 输入法组字时会连续触发几十次 input，
+ * 每次都排一个定时器会让预览一直渲染不出来。
+ */
+function schedulePreviewRender() {
     if (renderTimer) clearTimeout(renderTimer);
-    renderTimer = setTimeout(renderPreview, renderDelayFor(editor.value));
+    renderTimer = setTimeout(() => { renderTimer = null; renderPreview(); },
+        renderDelayFor(editor.value));
+}
+
+editor.addEventListener('input', (e) => {
+    dirty = true;
+    // ⚠️ **输入法组字期间要什么都不做**（中文/日文输入法最明显）。
+    //
+    // 组字时（compositionstart → compositionend）每个拼音键都会触发一次 input，
+    // 而且：
+    //   1. 预编辑文字（拼音）进入 value → 选区覆盖它 → 选区浮动工具栏
+    //      不再早退 → 去读编辑区的几何信息 → 浏览器被迫把整个 textarea
+    //      （可能几百 KB / 几万行）重新排版一次，并**同步阻塞**输入事件
+    //      （实测每次 ~250ms，输入法因此被拖到十几秒才出一个字）。
+    //   2. 拼音进了 value，如果这时渲染预览，浏览器要重排整个预览 DOM
+    //      （1MB 文档 = 1.1 万个元素，几百毫秒到几秒）。
+    //   3. updateFilename() → 更新状态标签 → getDocStats() 全文重建行首表。
+    //
+    // 所以：组字期间**一律跳过**，等 compositionend（字已经成形）再一次性处理。
+    if (imeComposing || (e && e.isComposing)) {
+        imePendingRender = true;
+        if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+        return;
+    }
+    updateFilename();
+    schedulePreviewRender();
     // 查找栏开着时文本变了 → 匹配位置也跟着变，重算 + 重画高亮
     if (findBar && findBar.classList.contains('open')) {
         collectMatches();
@@ -667,9 +695,59 @@ const selToolbar = document.getElementById('sel-toolbar');
 let charWidthCache = 0;
 let charWidthFont = '';
 
-/** 编辑区里一个字符的宽度（等宽字体，用 canvas 量） */
-function editorCharWidth() {
+// ============ 输入法（IME）组字状态 ============
+// 组字期间浏览器会连续触发 input（每个拼音键一次），而且选区覆盖着预编辑文字。
+// 这两点都会把"重活"引进输入路径 → 大文档上输入法被拖到十几秒才出一个字。
+// 所以要显式跟踪组字状态，组字期间只标记"待处理"，不做任何重活。
+let imeComposing = false;      // 组字中
+let imePendingRender = false;  // 组字期间内容变了 → 组完要渲染一次
+
+/**
+ * 选区浮动工具栏的更新 —— **一律走 rAF**。
+ *
+ * ⚠️ 原因：算工具栏位置要读编辑区的几何信息（getBoundingClientRect），
+ *    这会**强制浏览器重新排版**。如果放在 input 事件里同步做，
+ *    就会阻塞输入事件的返回 → 输入法被拖慢（实测大文档上每键 ~200ms）。
+ *    挪到 rAF 里 = 跟浏览器自己的绘制节奏对齐，不阻塞输入。
+ */
+let selToolbarRaf = 0;
+function scheduleSelToolbar() {
+    if (selToolbarRaf) return;
+    selToolbarRaf = requestAnimationFrame(() => {
+        selToolbarRaf = 0;
+        updateSelToolbar();
+    });
+}
+
+/**
+ * 编辑区的排版度量 —— **全部缓存**。
+ *
+ * ⚠️ 为什么必须缓存：getComputedStyle() / getBoundingClientRect() 会触发
+ *    样式重算，布局脏的时候还会**强制整个文档重排**。
+ *    实测 1MB 文档（3 万行 textarea + 1.1 万个预览元素）上，
+ *    一次强制重排要 **250~400ms**；中文输入法组字时每个拼音键都会走到
+ *    这里 → 一个汉字要十几秒。
+ *
+ *    这些值**只在窗口 resize / 拖分隔条 / 缩放时**才变，
+ *    平时（尤其是打字时）用缓存值即可。
+ */
+const editorBox = { left: 0, top: 0, padLeft: 0, padTop: 0, lh: 20, cw: 10, valid: false };
+/** 浮动工具栏的尺寸（6 个固定按钮 → 尺寸固定，缓存住别反复问浏览器） */
+const selToolbarBox = { w: 0, h: 0 };
+
+/**
+ * 重新量编辑区的几何信息和样式。
+ * 只在会影响排版的时候调用：启动、窗口 resize、拖分隔条、缩放。
+ */
+function refreshEditorBox() {
     const cs = getComputedStyle(editor);
+    const rect = editor.getBoundingClientRect();
+    editorBox.left = rect.left;
+    editorBox.top = rect.top;
+    editorBox.padLeft = parseFloat(cs.paddingLeft) || 0;
+    editorBox.padTop = parseFloat(cs.paddingTop) || 0;
+    editorBox.lh = parseFloat(cs.lineHeight) || 20;
+    // 字符宽度：等宽字体，用 canvas 量（canvas 不触发布局）
     const font = cs.fontSize + ' ' + cs.fontFamily;
     if (font !== charWidthFont) {
         const canvas = document.createElement('canvas');
@@ -678,23 +756,53 @@ function editorCharWidth() {
         charWidthCache = ctx.measureText('M').width;
         charWidthFont = font;
     }
-    return charWidthCache;
+    editorBox.cw = charWidthCache;
+    editorBox.valid = true;
 }
 
-/** 选区在视口里的位置和尺寸 */
+/** 编辑区里一个字符的宽度（等宽字体，用 canvas 量） */
+function editorCharWidth() {
+    if (!editorBox.valid) refreshEditorBox();
+    return editorBox.cw;
+}
+
+/**
+ * 光标位置所在的行（0 起）。
+ *
+ * ⚠️ **不要**用 `value.slice(0, pos).split('\n').length` ——
+ *    那是把光标前的**整个前缀**拷一份再拆成上万个数组元素
+ *    （1MB 文档 = 几十万个字符串），每次按键都做一遍纯属浪费。
+ *    行首表 getDocStats() 已经建好了，二分查就行。
+ */
+function lineIndexAtPos(text, pos) {
+    const starts = getDocStats(text).lineStarts;
+    let lo = 0, hi = starts.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (starts[mid] <= pos) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+/**
+ * 选区在视口里的位置和尺寸。
+ *
+ * ⚠️ 这里**不能**调 getBoundingClientRect() / getComputedStyle()：
+ *    那会强制文档重排（1MB 文档 = 250~400ms），中文输入法组字时
+ *    每个拼音键都走这里 → 一个汉字卡十几秒。
+ *    改用 editorBox 缓存（只在 resize / 拖分隔条 / 缩放时刷新）。
+ *    scrollTop / scrollLeft 读的是滚动容器的现成值，不触发布局。
+ */
 function selectionRect() {
+    if (!editorBox.valid) refreshEditorBox();
     const value = editor.value;
     const s = editor.selectionStart, e = editor.selectionEnd;
-    const before = value.slice(0, s);
-    const line = before.split('\n').length - 1;
-    const lineStart = before.lastIndexOf('\n') + 1;
-    const col = s - lineStart;
-    const cs = getComputedStyle(editor);
-    const lh = parseFloat(cs.lineHeight) || 20;
-    const cw = editorCharWidth();
-    const rect = editor.getBoundingClientRect();
-    const x = rect.left + parseFloat(cs.paddingLeft) + col * cw - editor.scrollLeft;
-    const y = rect.top + parseFloat(cs.paddingTop) + line * lh - editor.scrollTop;
+    const line = lineIndexAtPos(value, s);
+    const col = s - getDocStats(value).lineStarts[line];
+    const lh = editorBox.lh;
+    const cw = editorBox.cw;
+    const x = editorBox.left + editorBox.padLeft + col * cw - editor.scrollLeft;
+    const y = editorBox.top + editorBox.padTop + line * lh - editor.scrollTop;
     // 宽度：到本行行尾为止（跨行时只取第一行那段）
     const nl = value.indexOf('\n', s);
     const endCol = (nl === -1 ? value.length : nl) - s;
@@ -714,9 +822,33 @@ function selectionInCodeBlock() {
     return fences ? fences.length % 2 === 1 : false;
 }
 
+/**
+ * 量一次浮动工具栏的尺寸（之后缓存着用）。
+ * 只在窗口 resize / 缩放后需要重新量 —— 平时尺寸不变。
+ */
+function measureSelToolbarBox() {
+    if (!selToolbar) return;
+    const wasShown = selToolbar.classList.contains('show');
+    if (!wasShown) {
+        // display:none 时量不到尺寸 → 临时显示一下，量完再藏
+        selToolbar.style.visibility = 'hidden';
+        selToolbar.classList.add('show');
+    }
+    selToolbarBox.w = selToolbar.offsetWidth;
+    selToolbarBox.h = selToolbar.offsetHeight;
+    if (!wasShown) selToolbar.classList.remove('show');
+}
+
 /** 显示 / 隐藏 / 移动浮动工具栏 */
 function updateSelToolbar() {
     if (!selToolbar) return;
+    // ⚠️ 组字期间（预编辑文字 = 选区）不弹工具栏：
+    //    拼音还没成字，给用户"加粗/斜体"按钮没意义；
+    //    而且算位置要读布局 → 强制重排 → 拖慢输入法。
+    if (imeComposing) {
+        selToolbar.classList.remove('show');
+        return;
+    }
     const show = editMode && !editor.readOnly
         && document.activeElement === editor
         && editor.selectionStart !== editor.selectionEnd;
@@ -732,7 +864,9 @@ function updateSelToolbar() {
     for (const btn of selToolbar.querySelectorAll('button[data-fmt]')) {
         btn.classList.toggle('on', unwrapFormat(sel, btn.dataset.fmt) !== null);
     }
-    const tw = selToolbar.offsetWidth, th = selToolbar.offsetHeight;
+    // ⚠️ offsetWidth/offsetHeight 也会强制布局 —— 工具栏尺寸是固定的
+    //    （6 个按钮，样式不变尺寸就不变），缓存起来，别每次都问浏览器要。
+    const tw = selToolbarBox.w, th = selToolbarBox.h;
     // 水平：居中于选区，但不超出窗口
     let left = r.x + r.w / 2 - tw / 2;
     left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
@@ -759,17 +893,46 @@ if (selToolbar) {
 editor.addEventListener('mousedown', () => {
     if (selToolbar) selToolbar.classList.remove('show');
 });
-editor.addEventListener('scroll', updateSelToolbar);
-window.addEventListener('resize', updateSelToolbar);
+editor.addEventListener('scroll', scheduleSelToolbar);
+window.addEventListener('resize', scheduleSelToolbar);
+// 窗口尺寸变了 → 编辑区的几何信息和排版都变了 → 重新量
+window.addEventListener('resize', () => {
+    refreshEditorBox();
+    refreshEditorLineHeight();
+    measureSelToolbarBox();
+    refreshFilenameTarget();
+});
 // 失焦 → 工具栏要收起来
-editor.addEventListener('blur', updateSelToolbar);
+editor.addEventListener('blur', scheduleSelToolbar);
 // ⚠️ 程序性的 setSelectionRange / 改 value **不一定会触发 selectionchange**
 //    （浏览器只在用户操作时发），所以再兜几个：
 //    select = 选区变化的标准事件（程序性 setSelectionRange 也会发，最准）
 //    input = 打字后；keyup = 方向键等（虽然 selectionchange 一般也会跟着）
-editor.addEventListener('select', updateSelToolbar);
-editor.addEventListener('input', updateSelToolbar);
-editor.addEventListener('keyup', updateSelToolbar);
+editor.addEventListener('select', scheduleSelToolbar);
+editor.addEventListener('input', scheduleSelToolbar);
+editor.addEventListener('keyup', scheduleSelToolbar);
+
+// ============ 输入法组字：开始 / 结束 ============
+// 组字开始 → 进入"只标记不干活"模式；组字结束 → 把攒下的活一次做完。
+editor.addEventListener('compositionstart', () => {
+    imeComposing = true;
+    imePendingRender = false;
+    if (selToolbar) selToolbar.classList.remove('show');
+});
+editor.addEventListener('compositionend', () => {
+    imeComposing = false;
+    // 组完字：内容变了 → 补上组字期间攒下的活（标题/状态、预览、查找高亮）
+    if (imePendingRender) {
+        imePendingRender = false;
+        updateFilename();
+        schedulePreviewRender();
+        if (findBar && findBar.classList.contains('open')) {
+            collectMatches();
+            renderEditorHighlights();
+        }
+    }
+    scheduleSelToolbar();
+});
 
 // ============ 插入图片 ============
 /** 图片路径转成相对于当前 markdown 文件的路径（markdown 里统一用 / 分隔） */
@@ -1131,6 +1294,9 @@ function scheduleAnchorMeasure() {
     if (anchorMeasureRaf) return;
     anchorMeasureRaf = requestAnimationFrame(() => {
         anchorMeasureRaf = 0;
+        // 这一帧浏览器已经把预览排好版了 → 现在读 scrollHeight 是免费的
+        //（此时布局已干净，不触发强制重排）
+        refreshPreviewScrollMax();
         buildAnchorTable();      // 预览 DOM 变了 → 重建行级锚点表
         ensureAnchorPositions(); // 顺带测位置（浏览器这一帧本来就要重排）
     });
@@ -1292,11 +1458,16 @@ function computeBlockLines(tokens, sourceText) {
 
 /** 编辑区的行高（px）和顶部内边距。
  *  ⚠️ 滚动的原点是 **padding 顶边**（跟 scrollEditorToLine() 一致）——
- *     所以 scrollTop → 行号的换算要减掉 paddingTop。 */
+ *     所以 scrollTop → 行号的换算要减掉 paddingTop。
+ *
+ * ⚠️ **必须用缓存**：getComputedStyle() 会触发样式重算，
+ *    布局脏的时候还会连带强制重排（1MB 文档 = 几百毫秒）。
+ *    这个函数在滚动同步路径上被反复调用 —— 每次都重算等于每次都强制重排。
+ *    缓存由 refreshEditorLineHeight() 维护（缩放 / 窗口大小变化时才刷新）。
+ */
 function editorMetrics() {
-    refreshEditorLineHeight();
-    const cs = getComputedStyle(editor);
-    return { lh: editorLineHeight, padTop: parseFloat(cs.paddingTop) || 0 };
+    if (!editorLineHeight) refreshEditorLineHeight();
+    return { lh: editorLineHeight, padTop: editorPadTop };
 }
 
 /**
@@ -1313,10 +1484,27 @@ function resetScrollToTop() {
     setTimeout(() => { syncing = false; }, 60);
 }
 
+/**
+ * 预览区可滚动的高度 —— **缓存**。
+ *
+ * ⚠️ previewScroll.scrollHeight 会强制重排整个预览 DOM
+ *    （1MB 文档 = 1.1 万个元素）。这个函数在**每次编辑区滚动**时都跑
+ *    → 每次滚动都强制重排一遍 → 大文档上滚动会卡。
+ *    预览内容变了才需要重算（renderPreview 之后），平时用缓存。
+ */
+let previewScrollMax = 0;
+/** 重新量预览区的可滚动高度（渲染完预览后调用） */
+function refreshPreviewScrollMax() {
+    if (!previewScroll) return;
+    previewScrollMax = Math.max(0, previewScroll.scrollHeight - previewScroll.clientHeight);
+}
+
 /** 按比例同步（块级锚点算不出来时的兜底） */
 function applyScrollByRatio(fromEditor) {
+    // ⚠️ 用缓存值，别在这里读 scrollHeight —— 那会强制重排整个预览 DOM。
+    if (!previewScrollMax) refreshPreviewScrollMax();
     const maxEdit = editor.scrollHeight - editor.clientHeight;
-    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+    const maxPrev = previewScrollMax;
     if (maxEdit <= 0 || maxPrev <= 0) return;
     if (fromEditor) {
         const target = (editor.scrollTop / maxEdit) * maxPrev;
@@ -1336,7 +1524,8 @@ function applyScrollByRatio(fromEditor) {
 function applyScrollToPreview() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
-    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+    if (!previewScrollMax) refreshPreviewScrollMax();
+    const maxPrev = previewScrollMax;
     if (!lh || !anchorList.length) { applyScrollByRatio(true); return; }
 
     // 锚点 = 源码顶行所在的预览元素（**精确查表**，不是按比例估算）
@@ -1705,8 +1894,8 @@ function followCaretInPreview() {
     if (anchorsDirty) return;
     const { lh } = editorMetrics();
     if (!lh) return;
-    // ⚠️ selectionStart 是**字符偏移**，不是行号 —— 得数前面的换行符
-    const line = countNewlines(editor.value.slice(0, editor.selectionStart));
+    // ⚠️ selectionStart 是**字符偏移**，不是行号 —— 用行首表二分查（别 slice 整个前缀）
+    const line = lineIndexAtPos(editor.value, editor.selectionStart);
     const k = blockIndexAtLine(line);
     if (k < 0) return;
     const el = preview.children[k];
@@ -2656,9 +2845,18 @@ function pickAnchor(items, dir) {
 
 /** 编辑区一行的像素高度（不折行时，行高固定，scrollTop = 行号 × 行高） */
 let editorLineHeight = 0;
+/** 编辑区的顶部内边距（滚动原点要减掉它，见 editorMetrics） */
+let editorPadTop = 0;
+/**
+ * 重新量编辑区的行高和内边距。
+ * 只在**会影响排版**的时候调用（缩放、窗口尺寸变化、启动时）——
+ * 别的场合一律用缓存值，别去 getComputedStyle（会触发样式重算 / 强制重排）。
+ */
 function refreshEditorLineHeight() {
-    const lh = parseFloat(getComputedStyle(editor).lineHeight);
+    const cs = getComputedStyle(editor);
+    const lh = parseFloat(cs.lineHeight);
     editorLineHeight = isNaN(lh) ? 16 : lh;
+    editorPadTop = parseFloat(cs.paddingTop) || 0;
 }
 
 /** 把编辑区精确滚动到第 line 行（0 起） */
@@ -2854,8 +3052,19 @@ function measureText(s) {
     return measureCtx.measureText(s).width;
 }
 
-/** 工具栏里留给文件名的空间 */
-function filenameTargetWidth() {
+/**
+ * 工具栏里留给文件名的空间 —— **缓存**。
+ *
+ * ⚠️ 这里要对工具栏的**每个子元素**调 getBoundingClientRect()，
+ *    会强制整个文档重排（1MB 文档 = 250~400ms）。
+ *    而它被 updateFilename() 调用，而 updateFilename() **每次输入都调**！
+ *    实测这是组字卡顿的第二个大头（268ms/次）。
+ *
+ *    工具栏的布局只在**窗口 resize / 拖分隔条 / 缩放**时变，
+ *    平时（打字时）用缓存值即可。
+ */
+let filenameTargetCache = -1;
+function refreshFilenameTarget() {
     const cs = getComputedStyle(toolbarEl);
     const gap = parseFloat(cs.columnGap) || 0;
     const kids = Array.from(toolbarEl.children);
@@ -2870,7 +3079,13 @@ function filenameTargetWidth() {
             : k.getBoundingClientRect().width;
         w -= width + (parseFloat(ks.marginLeft) || 0) + (parseFloat(ks.marginRight) || 0);
     }
-    return Math.min(FILENAME_MAX_W, w);
+    filenameTargetCache = Math.min(FILENAME_MAX_W, w);
+}
+
+/** 工具栏里留给文件名的空间（用缓存值，不触发重排） */
+function filenameTargetWidth() {
+    if (filenameTargetCache < 0) refreshFilenameTarget();
+    return filenameTargetCache;
 }
 
 /** 把文件名裁成「头部…尾部」，扩展名始终保留 */
@@ -3042,6 +3257,10 @@ document.addEventListener('keydown', (e) => {
 
 // 光标移动 → 更新编辑区右下角的状态（行号 / 字数）
 document.addEventListener('selectionchange', () => {
+    // ⚠️ 组字期间不更新状态：组字时每个拼音键都会改选区 → selectionchange 频繁触发
+    //    → 状态标签要重建全文统计（3 万行）→ 白白浪费。
+    //    等 compositionend 再更新一次。
+    if (imeComposing) return;
     if (document.activeElement === editor) scheduleEditorStatus();
 });
 
@@ -3593,6 +3812,17 @@ if (findBar) {
 let statusRaf = 0;
 let docStatsCache = { text: null, lines: 1, chars: 0 };
 
+/**
+ * 文档统计：行数 / 字数 / 行首偏移表。
+ *
+ * 行首表用于二分查光标行号（否则每次光标移动都要 O(n) 扫一遍）。
+ * 全文重建一次 590KB 只要 ~2ms，不算瓶颈 —— 所以就用简单的全量实现，
+ * 不搞增量（增量容易算错行号，而行号错了会让状态栏和滚动同步都错位）。
+ *
+ * ⚠️ 真正要避免的是**在组字期间调用它**：
+ *    组字时每个拼音键都改 text → 缓存失效 → 重建。
+ *    所以 input / selectionchange 处理里都在组字期间跳过状态更新。
+ */
 function getDocStats(text) {
     if (docStatsCache.text === text) return docStatsCache;
     let lines = 1, chars = 0;
@@ -3619,6 +3849,14 @@ function lineAtPos(text, pos) {
     return lo + 1;
 }
 
+/**
+ * 右下角的状态标签：行号 / 总行数 / 字数。
+ *
+ * ⚠️ 这里**不能**读布局（editor.clientHeight 之类）——
+ *    浏览器本来要把整个 textarea（3 万行）重排一遍，
+ *    我们一读就把这次重排**同步**拉进当前帧的关键路径。
+ *    这个标签是纯信息，滞后一帧完全无感 → 什么都不读，只算文本。
+ */
 function updateEditorStatus() {
     const el = document.getElementById('editor-status');
     if (!el) return;
@@ -4041,6 +4279,11 @@ function applyZoom(percent) {
     // 这里先统一，免得按钮文字和滑块位置对不上。
     const z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(percent / ZOOM_STEP) * ZOOM_STEP));
     document.documentElement.style.setProperty('--ui-zoom', z / 100);
+    // 字号变了 → 行高、内边距、字符宽度、工具栏尺寸的缓存值都过期了
+    refreshEditorLineHeight();
+    refreshEditorBox();
+    measureSelToolbarBox();
+    refreshFilenameTarget();
     const btn = document.getElementById('btn-zoom');
     if (btn) btn.textContent = '🔍 ' + z + '%';
     const val = document.getElementById('zoom-value');
@@ -4806,6 +5049,11 @@ let tocW = DEFAULT_TOC;
 let editorW = 0;  // 0 = 用 flex 自适应初始宽度
 
 function applyWidths(clearEditor) {
+    // 面板宽度变了 → 工具栏布局变了 → 文件名可用宽度要重算
+    refreshFilenameTarget();
+    // ⚠️ 编辑区在视口里的位置也跟着变了 → 浮动工具栏的位置缓存要刷新
+    //    （否则拖完分隔条，选区工具栏会出现在错误的地方）
+    refreshEditorBox();
     const total = content.clientWidth;
     const t = Math.max(MIN_TOC, Math.min(tocW, total - MIN_EDITOR - MIN_PREVIEW));
     tocEl.style.width = t + 'px';
