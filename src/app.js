@@ -1146,11 +1146,43 @@ function applyScrollByRatio(fromEditor) {
     }
 }
 
-/** 把编辑区的位置应用到预览区（编辑区 → 预览区） */
+/** 把编辑区的位置应用到预览区（编辑区 → 预览区）
+ *
+ *  锚点是**标题节点**（当前章节），不是任意一个块 ——
+ *  同一个章节里滚动时预览区不动（不抖），跳章节时才动。
+ *  两边对齐到章节起点，位置永远可预测。
+ */
 function applyScrollToPreview() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
-    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    if (!lh) { applyScrollByRatio(true); return; }
+    const topLine = Math.floor((editor.scrollTop - padTop) / lh);
+
+    // 当前章节的标题 → 预览里的那个标题元素
+    const hi = headingIndexAtLine(topLine);
+    const h = hi >= 0 ? headingPairs[hi].el : null;
+    if (!h) {
+        // 文档里没有标题（或者标题对不上）→ 退回按块对齐
+        applyScrollToPreviewByBlock();
+        return;
+    }
+    // ⚠️ **幂等保护**：已经在这一节了就不动。
+    //    不这样的话：同步 → 预览滚 → 回弹事件 → 反向同步 → 编辑区滚 → 再同步…
+    //    来回拉扯，每次都多偏一点（实测偏 8px，章节差一节）。
+    if (currentHeadingElement() === h) return;
+    const wrapRect = previewScroll.getBoundingClientRect();
+    const target = previewScroll.scrollTop +
+        (h.getBoundingClientRect().top - wrapRect.top) - 8;
+    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+    const before = previewScroll.scrollTop;
+    previewScroll.scrollTop = Math.max(0, Math.min(target, maxPrev));
+    if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
+}
+
+/** 块级对齐（文档没有标题时的兜底） */
+function applyScrollToPreviewByBlock() {
+    if (!editor || !previewScroll) return;
+    const { lh, padTop } = editorMetrics();
     const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
     // 块数对不上（原始 HTML 展开成多个预览节点）→ 退回按比例
     if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
@@ -1163,21 +1195,44 @@ function applyScrollToPreview() {
     const el = preview.children[k];
     if (!el) { applyScrollByRatio(true); return; }
     const bl = blockLines[k];
-    // 块内相对位置（0~1）：源码块内已经过去多少
     const frac = bl.count > 0 ? (topLine - bl.start) / bl.count : 0;
     const ratio = Math.max(0, Math.min(frac, 1));
     const wrapRect = previewScroll.getBoundingClientRect();
     const elRect = el.getBoundingClientRect();
     const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + ratio * elRect.height;
-    // ⚠️ 预览这边已经到底 → 预览滚到它能到的最底，**编辑区保持不动**
-    //    （之前是“编辑区也到底” → 预览直接跳绝对底部，用户会看到预览跑飞了）
     const before = previewScroll.scrollTop;
     previewScroll.scrollTop = Math.min(target, maxPrev);
     if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
 }
 
-/** 把预览区的位置应用到编辑区（预览区 → 编辑区） */
+/** 把预览区的位置应用到编辑区（预览区 → 编辑区）
+ *
+ *  同样按**标题节点**对齐：当前章节的标题 → 源码里那一行。
+ */
 function applyScrollToEditor() {
+    if (!editor || !previewScroll) return;
+    const { lh, padTop } = editorMetrics();
+    if (!lh) { applyScrollByRatio(false); return; }
+    const h = currentHeadingElement();
+    const idx = h ? headingPairs.findIndex(p => p.el === h) : -1;
+    if (idx < 0) {
+        // 没有标题 → 退回按块对齐
+        applyScrollToEditorByBlock();
+        return;
+    }
+    // 幂等保护：编辑区已经在这一节了就不动（见上面）
+    const curLine = Math.floor((editor.scrollTop - padTop) / lh);
+    if (headingIndexAtLine(curLine) === idx) return;
+    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    const maxLine = Math.floor((maxEdit - padTop) / lh);
+    const target = Math.min(headingPairs[idx].line, Math.max(0, maxLine));
+    const before = editor.scrollTop;
+    scrollEditorToLine(target);          // 它会补上 paddingTop
+    if (editor.scrollTop !== before) noteProgrammaticScroll('editor', editor.scrollTop);
+}
+
+/** 块级对齐（文档没有标题时的兜底） */
+function applyScrollToEditorByBlock() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
     const maxEdit = editor.scrollHeight - editor.clientHeight;
@@ -1186,7 +1241,6 @@ function applyScrollToEditor() {
         applyScrollByRatio(false);
         return;
     }
-    // 找出预览区顶部可见的块
     const wrapRect = previewScroll.getBoundingClientRect();
     let k = -1;
     for (let i = 0; i < preview.children.length; i++) {
@@ -1197,14 +1251,10 @@ function applyScrollToEditor() {
     const bl = blockLines[k];
     if (!bl) { applyScrollByRatio(false); return; }
     const elRect = preview.children[k].getBoundingClientRect();
-    // 块内相对位置：块顶已经在视口上方多少（占块高的比例）
     const passed = wrapRect.top - elRect.top;
     const frac = elRect.height > 0 ? passed / elRect.height : 0;
     const ratio = Math.max(0, Math.min(frac, 1));
     let line = bl.start + ratio * Math.max(0, bl.count - 1);
-    // ⚠️ 源码那边滚不到这么远（物理限制：预览渲染后比源码高，可滚范围不一样）→
-    //    用最远能到的那行，**预览保持在当前位置**
-    //    （之前是“预览也到底” → 预览直接跳绝对底部，看着像跑飞了）
     const maxLine = Math.floor((maxEdit - padTop) / lh);
     if (line > maxLine) line = maxLine;
     const before = editor.scrollTop;
@@ -2213,9 +2263,14 @@ function normalizeHeadingText(s) {
 
 /** 渲染后：把预览区的每个标题和源码行号对应起来 */
 let headingLines = new Map();   // heading 元素 → 源码行号
+let headingPairs = [];         // [{line, el}]：源码标题 ↔ 预览元素，按文档顺序
 
 function mapHeadingLines(sourceText) {
     headingLines = new Map();
+    // ⚠️ 用**一份有序数组**（源码标题 ↔ 预览元素，按文档顺序），
+    //    不要搞“两套映射”（源码列表 + 反向表）—— 两套会各自错位，
+    //    表现为“编辑区和预览区差一节”。
+    headingPairs = [];
     const src = scanHeadings(sourceText);
     const doms = Array.from(preview.querySelectorAll('h1, h2, h3, h4, h5, h6'));
     let si = 0;
@@ -2226,11 +2281,41 @@ function mapHeadingLines(sourceText) {
         for (let k = si; k < src.length; k++) {
             if (src[k].level === level && normalizeHeadingText(src[k].text) === text) {
                 headingLines.set(h, src[k].line);
+                headingPairs.push({ line: src[k].line, el: h });
                 si = k + 1;
                 break;
             }
         }
     }
+}
+
+/**
+ * 当前章节 = 视口顶部往上最近的那个标题。
+ * 滚动同步、目录高亮**都用这一个定义** → 两边永远一致。
+ */
+function currentHeadingElement() {
+    if (!previewScroll || !headingPairs.length) return null;
+    const boxTop = previewScroll.getBoundingClientRect().top;
+    let cur = null;
+    for (const p of headingPairs) {
+        // 标题是有序的，一旦某个还在视口下方，后面的都在下面 → break
+        // ⚠️ 容差要**大于对齐时的偏移**（下面 applyScrollToPreview 会把标题往上提 8px，
+        //    滚完它就落在视口顶下方 8px 处）——
+        //    容差比它小的话，“当前章节”永远判不出来 → 死循环 → 章节错位一节（踩过）。
+        if (p.el.getBoundingClientRect().top <= boxTop + 24) cur = p.el;
+        else break;
+    }
+    return cur || headingPairs[0].el;
+}
+
+/** 源码的某一行属于哪个标题（向上找最近的标题） */
+function headingIndexAtLine(line) {
+    let k = -1;
+    for (let i = 0; i < headingPairs.length; i++) {
+        if (headingPairs[i].line <= line) k = i;
+        else break;
+    }
+    return k;
 }
 
 /** 编辑区一行的像素高度（不折行时，行高固定，scrollTop = 行号 × 行高） */
@@ -2247,7 +2332,9 @@ function scrollEditorToLine(line) {
     refreshEditorLineHeight();
     const cs = getComputedStyle(editor);
     const padTop = parseFloat(cs.paddingTop) || 0;   // 滚动的原点是 padding 顶边，要补上
-    editor.scrollTop = line * editorLineHeight + padTop;
+    // ⚠️ **向上取整**：行高是小数（如 22.95），算出来的位置会被浏览器量化，
+    //    少零点几像素就落在**上一行** → 章节判定差一节（实测踩过）。
+    editor.scrollTop = Math.ceil(line * editorLineHeight + padTop);
 }
 
 // 上一次渲染目录时的「标题结构」签名。每次输入都会重跑 renderPreview()，
@@ -4307,18 +4394,11 @@ let tocHighlightPending = false;
 /** 标出当前读到的章节（预览区滚到哪个标题下面了） */
 function updateTocHighlight() {
     if (!previewScroll) return;
-    const headings = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
-    if (headings.length === 0) return;
-    const boxTop = previewScroll.getBoundingClientRect().top;
-    let idx = -1;
-    for (let i = 0; i < headings.length; i++) {
-        // 标题线滚到容器顶部往下 100px 以内 → 就算读到这个章节了。
-        // 标题在文档里是按顺序排的，第一个不满足就说明后面都不满足，直接 break。
-        if (headings[i].getBoundingClientRect().top - boxTop < 100) idx = i;
-        else break;
-    }
-    if (idx < 0) return;   // 还没到第一个标题 → 保持原来的高亮
-    const id = headings[idx].id;
+    // ⚠️ 和滚动同步用**同一个**“当前章节”定义（视口顶部往上最近的那个标题）——
+    //    两边定义不一致的话，目录高亮和实际滚动位置会对不上。
+    const h = currentHeadingElement();
+    if (!h) return;
+    const id = h.id;
     if (id === tocActiveId) return;   // 章节没变就别动 DOM（滚动时一帧一次）
     tocActiveId = id;
     // 只改「上一项 + 这一项」，不要遍历整个目录 —— 5000 项全写一次 style
@@ -4326,7 +4406,8 @@ function updateTocHighlight() {
     const prev = tocList.querySelector('.toc-item.active');
     if (prev) prev.classList.remove('active');
     // 目录项和标题一一对应（截断时超出部分没有对应的项）
-    const next = tocList.children[idx];
+    const idx = headingPairs.findIndex(p => p.el === h);
+    const next = idx >= 0 ? tocList.children[idx] : null;
     if (next && next.classList && next.classList.contains('toc-item')) next.classList.add('active');
 }
 
