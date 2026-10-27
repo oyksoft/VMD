@@ -2568,6 +2568,7 @@ document.getElementById('btn-new').addEventListener('click', async () => {
     // 有未保存的修改时先问 —— 和打开/拖放走同一套检查
     if (!(await confirmDiscardCurrent())) return;
     editor.value = '';
+    editor.scrollTop = 0;               // 先归零
     currentFile = null;
     dirty = false;
     dropDraft();                    // 新建 = 主动丢掉未保存内容，草稿也一起清
@@ -2641,6 +2642,7 @@ async function openPath(path) {
     const file = await invoke('read_file', { path });
     editor.value = file.content;
     editor.setSelectionRange(0, 0);     // 光标回到开头
+    editor.scrollTop = 0;               // 先归零（渲染和后续同步都以顶部为基准）
     currentFile = path;
     currentEncoding = file.encoding || 'utf-8';
     dirty = false;
@@ -2652,6 +2654,7 @@ async function openPath(path) {
     await recordStamp();
     applyReadOnly();                // 自动重载开着 → 只读
     await dropDraft();              // 换了文件，之前那个文件的草稿作废
+    resetScrollToTop();             // 保险：期间可能有滚动事件把位置带跑了
     showToast('已打开');
 }
 
@@ -3421,6 +3424,7 @@ async function dropDraft() {
 /** 把草稿灌回编辑器（恢复上次未保存的内容） */
 async function restoreDraft(draft) {
     editor.value = draft.content;
+    editor.scrollTop = 0;               // 恢复的是上次的内容 → 从顶部开始看
     currentFile = draft.path || null;
     currentEncoding = draft.encoding || 'utf-8';
     dirty = true;          // 内容还是“未保存”状态，标题栏要有 ●
