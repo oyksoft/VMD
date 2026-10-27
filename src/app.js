@@ -562,6 +562,8 @@ editor.addEventListener('input', (e) => {
         return;
     }
     updateFilename();
+    // 内容变了 → 编辑区的可滚动高度也变了 → 下一帧（浏览器排好版之后）重算缓存
+    scheduleEditorScrollMax();
     schedulePreviewRender();
     // 查找栏开着时文本变了 → 匹配位置也跟着变，重算 + 重画高亮
     if (findBar && findBar.classList.contains('open')) {
@@ -731,7 +733,29 @@ function scheduleSelToolbar() {
  *    这些值**只在窗口 resize / 拖分隔条 / 缩放时**才变，
  *    平时（尤其是打字时）用缓存值即可。
  */
-const editorBox = { left: 0, top: 0, padLeft: 0, padTop: 0, lh: 20, cw: 10, valid: false };
+const editorBox = { left: 0, top: 0, padLeft: 0, padTop: 0, lh: 20, cw: 10, clientH: 0, valid: false };
+/**
+ * 编辑区的可滚动高度（scrollHeight - clientHeight）—— **缓存**。
+ *
+ * ⚠️ editor.scrollHeight 会**强制重排整个 textarea**（1MB 文档 = 3 万行 = 244ms），
+ *    而滚动同步每次都要用到它 → 每秒几十次 → 主线程被占满 → 输入彻底卡死。
+ *    这就是「先滚动到靠后位置、再输入中文就卡死」的直接原因：
+ *    滚动 → 同步 → 读 scrollHeight → 强制重排 → 慢 → 更多 scroll 事件 → 更多重排（正反馈）。
+ *
+ *    高度只在**内容变化**时才会变 → 改完内容后的下一帧（浏览器已排好版）读一次即可。
+ */
+let editorScrollMax = 0;
+/** 内容变了 → 高度缓存失效 → 下一帧（浏览器重排完之后）重新量 */
+let editorScrollMaxRaf = 0;
+function scheduleEditorScrollMax() {
+    if (editorScrollMaxRaf) return;
+    editorScrollMaxRaf = requestAnimationFrame(() => {
+        editorScrollMaxRaf = 0;
+        if (!editor) return;
+        // 此刻浏览器已经把 textarea 排好版了 → 读 scrollHeight 是免费的
+        editorScrollMax = Math.max(0, editor.scrollHeight - editor.clientHeight);
+    });
+}
 /** 浮动工具栏的尺寸（6 个固定按钮 → 尺寸固定，缓存住别反复问浏览器） */
 const selToolbarBox = { w: 0, h: 0 };
 
@@ -757,6 +781,7 @@ function refreshEditorBox() {
         charWidthFont = font;
     }
     editorBox.cw = charWidthCache;
+    editorBox.clientH = editor.clientHeight;
     editorBox.valid = true;
 }
 
@@ -925,6 +950,7 @@ editor.addEventListener('compositionend', () => {
     if (imePendingRender) {
         imePendingRender = false;
         updateFilename();
+        scheduleEditorScrollMax();
         schedulePreviewRender();
         if (findBar && findBar.classList.contains('open')) {
             collectMatches();
@@ -1493,17 +1519,19 @@ function resetScrollToTop() {
  *    预览内容变了才需要重算（renderPreview 之后），平时用缓存。
  */
 let previewScrollMax = 0;
+let previewClientH = 0;
 /** 重新量预览区的可滚动高度（渲染完预览后调用） */
 function refreshPreviewScrollMax() {
     if (!previewScroll) return;
     previewScrollMax = Math.max(0, previewScroll.scrollHeight - previewScroll.clientHeight);
+    previewClientH = previewScroll.clientHeight;
 }
 
 /** 按比例同步（块级锚点算不出来时的兜底） */
 function applyScrollByRatio(fromEditor) {
     // ⚠️ 用缓存值，别在这里读 scrollHeight —— 那会强制重排整个预览 DOM。
     if (!previewScrollMax) refreshPreviewScrollMax();
-    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    const maxEdit = editorScrollMax;
     const maxPrev = previewScrollMax;
     if (maxEdit <= 0 || maxPrev <= 0) return;
     if (fromEditor) {
@@ -1551,7 +1579,8 @@ function applyScrollToPreview() {
 function applyScrollToPreviewByBlock() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
-    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+    if (!previewScrollMax) refreshPreviewScrollMax();
+    const maxPrev = previewScrollMax;
     // 块数对不上（原始 HTML 展开成多个预览节点）→ 退回按比例
     if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
         applyScrollByRatio(true);
@@ -1578,7 +1607,7 @@ function applyScrollToPreviewByBlock() {
 function applyScrollToEditor() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
-    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    const maxEdit = editorScrollMax;
     if (!lh || !anchorList.length) { applyScrollByRatio(false); return; }
 
     // 锚点 = 预览视口顶部所在的元素（**精确查表**）
@@ -1610,8 +1639,9 @@ function applyScrollToEditor() {
 function applyScrollToEditorByBlock() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
-    const maxEdit = editor.scrollHeight - editor.clientHeight;
-    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+    const maxEdit = editorScrollMax;
+    if (!previewScrollMax) refreshPreviewScrollMax();
+    const maxPrev = previewScrollMax;
     if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
         applyScrollByRatio(false);
         return;
@@ -1640,7 +1670,7 @@ function applyScrollToEditorByBlock() {
 //    只靠 scroll 事件是收不到这个信号的，必须监听 wheel。
 editor.addEventListener('wheel', (e) => {
     if (!settings.scrollSync) return;
-    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    const maxEdit = editorScrollMax;
     if (e.deltaY > 0 && maxEdit > 0 && editor.scrollTop >= maxEdit - 1) {
         // 编辑区到底了 → 把这次滚动交给预览区
         previewScroll.scrollTop += e.deltaY;
@@ -1862,6 +1892,8 @@ function renderPreview() {
     previewBlockKeys = keys;
     previewRenderedSource = text;
     previewRenderedBase = baseDir;
+    // 内容整个换了 → 编辑区高度缓存失效
+    scheduleEditorScrollMax();
     // 预览 DOM 刚变 → 位置表已失效，**立刻标脏**（必须在 followCaretInPreview 之前，
     // 否则它会以为位置还是准的 → 同步测位置 → 强制全局重排 → 卡死）
     anchorsDirty = true;
@@ -1908,11 +1940,11 @@ function followCaretInPreview() {
     const rTop = elTopInContent(el);
     const rBottom = rTop + (elHeightInContent(el) || 0);
     // 已经能看到这个块 → 不动（别打断用户）
-    const visible = rBottom > wrapTop && rTop < wrapTop + previewScroll.clientHeight;
+    const visible = rBottom > wrapTop && rTop < wrapTop + previewClientH;
     if (visible) return;
     const target = rTop < wrapTop
         ? rTop - 12
-        : rBottom - previewScroll.clientHeight + 12;
+        : rBottom - previewClientH + 12;
     // 被程序设了滚动位置 → 预览接下来的 scroll 事件是回弹，要忽略
     setScrollTop(previewScroll, target);
 }
@@ -2681,23 +2713,45 @@ function mapHeadingLines(sourceText) {
     //    表现为“编辑区和预览区差一节”。
     headingPairs = [];
     const src = scanHeadings(sourceText);
+
+    // ⚠️⚠️ **必须建索引，不能逐个往后扫**。
+    //
+    // 原来的写法是「对每个预览标题，从 si 开始往后逐个比对源码标题」，
+    // 而**每次比对都重新跑一遍 normalizeHeadingText（6 个正则）**。
+    // 1000 个标题 → 最坏 100 万次比较 × 6 个正则 → **几秒**，
+    // 而且只要有**一个**标题匹配不上（si 不前进），后面每个标题都要扫全表。
+    // 这就是「标题到 1000 个就必卡、几百个还能接受」的原因（n² 增长）。
+    //
+    // 现在：预先把源码标题按「层级 + 规范化文字」分组，查找 O(1)。
+    const byKey = new Map();     // "层级 文字" → 源码标题下标队列（按出现顺序）
+    for (let k = 0; k < src.length; k++) {
+        const key = src[k].level + '\u0001' + normalizeHeadingText(src[k].text);
+        let q = byKey.get(key);
+        if (!q) { q = []; byKey.set(key, q); }
+        q.push(k);
+    }
+
     const doms = Array.from(preview.querySelectorAll('h1, h2, h3, h4, h5, h6'));
-    let si = 0;
+    // 保持「按文档顺序配对」的语义：配对的下标必须单调递增
+    const cursor = new Map();    // key → 该队列中下一个可用位置
+    let lastK = -1;
     for (let di = 0; di < doms.length; di++) {
         const h = doms[di];
         const level = parseInt(h.tagName.charAt(1));
-        const text = normalizeHeadingText(h.textContent);
-        // 按顺序往后找：层级和文字都要对得上
-        for (let k = si; k < src.length; k++) {
-            if (src[k].level === level && normalizeHeadingText(src[k].text) === text) {
-                headingLines.set(h, src[k].line);
-                // domIndex = 这个标题在“预览所有标题”里的位置
-                // （配对失败时 headingPairs 会少项，不能拿它的索引去取目录项）
-                headingPairs.push({ line: src[k].line, el: h, domIndex: di });
-                si = k + 1;
-                break;
-            }
-        }
+        const key = level + '\u0001' + normalizeHeadingText(h.textContent);
+        const q = byKey.get(key);
+        if (!q) continue;
+        // 跳过已经配对过的（保持单调）
+        let ci = cursor.get(key) || 0;
+        while (ci < q.length && q[ci] <= lastK) ci++;
+        cursor.set(key, ci);
+        if (ci >= q.length) continue;
+        const k = q[ci];
+        lastK = k;
+        headingLines.set(h, src[k].line);
+        // domIndex = 这个标题在“预览所有标题”里的位置
+        // （配对失败时 headingPairs 会少项，不能拿它的索引去取目录项）
+        headingPairs.push({ line: src[k].line, el: h, domIndex: di });
     }
 }
 
@@ -2828,7 +2882,7 @@ function visibleHeadingsEditor() {
     const { lh, padTop } = editorMetrics();
     if (!lh) return [];
     const top = (editor.scrollTop - padTop) / lh;
-    const bot = (editor.scrollTop - padTop + editor.clientHeight) / lh;
+    const bot = (editor.scrollTop - padTop + editorBox.clientH) / lh;
     return headingPairs.filter(p => p.line >= top - 1 && p.line <= bot);
 }
 
@@ -3610,7 +3664,7 @@ function scrollEditorToPos(pos) {
         if (editor.value.charCodeAt(i) === 10) line++;
     }
     const y = line * editorLineHeight + padTop;
-    const h = editor.clientHeight;
+    const h = editorBox.clientH;
     // 不在中间区域就滚过去（已经在眼前就别动）
     if (y < editor.scrollTop + h * 0.3 || y > editor.scrollTop + h * 0.75) {
         editor.scrollTop = Math.max(0, y - h * 0.4);
