@@ -1108,16 +1108,20 @@ function anchorAtLine(line) {
     return best;
 }
 
-/** 找“预览里第一个在视口顶之上的锚点” */
+/**
+ * 找“预览视口顶切在哪个锚点上”。
+ * ⚠️ 是**第一个底边还在视口顶下方**的锚点（部分可见）——
+ *    不是“最后一个完全在上方的”。视口顶通常切在某个锚点内部，
+ *    用“完全在上方的最后一个”会差一整个锚点（实测差十几行）。
+ */
 function anchorAtViewportTop() {
     if (!previewScroll) return null;
     const top = previewScroll.getBoundingClientRect().top;
     let best = null;
     for (const a of anchorList) {
         const r = a.el.getBoundingClientRect();
-        if (r.bottom <= top) best = a;   // 完全在上方
-        else if (!best) best = a;        // 第一个（还在视口内）
-        else break;
+        best = a;
+        if (r.bottom > top) break;      // 这个还跨着视口顶 → 就是它
     }
     return best;
 }
@@ -1207,14 +1211,10 @@ function applyScrollByRatio(fromEditor) {
     if (maxEdit <= 0 || maxPrev <= 0) return;
     if (fromEditor) {
         const target = (editor.scrollTop / maxEdit) * maxPrev;
-        const before = previewScroll.scrollTop;
-        previewScroll.scrollTop = target;
-        if (previewScroll.scrollTop !== before) markSyncLock('preview');
+        setScrollTop(previewScroll, target);
     } else {
         const target = (previewScroll.scrollTop / maxPrev) * maxEdit;
-        const before = editor.scrollTop;
-        editor.scrollTop = target;
-        if (editor.scrollTop !== before) markSyncLock('editor');
+        setScrollTop(editor, target);
     }
 }
 
@@ -1268,9 +1268,7 @@ function applyScrollToPreviewByBlock() {
     const wrapRect = previewScroll.getBoundingClientRect();
     const elRect = el.getBoundingClientRect();
     const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + ratio * elRect.height;
-    const before = previewScroll.scrollTop;
-    previewScroll.scrollTop = Math.min(target, maxPrev);
-    if (previewScroll.scrollTop !== before) markSyncLock('preview');
+    setScrollTop(previewScroll, Math.min(target, maxPrev));
 }
 
 /** 把预览区的位置应用到编辑区（预览区 → 编辑区）
@@ -1309,9 +1307,7 @@ function applyScrollToEditor() {
     // 幂等保护：已经在那一行就不动
     const wantPos = Math.min(Math.ceil(line * lh + padTop), maxEdit);
     if (Math.abs(editor.scrollTop - wantPos) < 2) { updateAlignedChapter(); return; }
-    const before = editor.scrollTop;
     scrollEditorToLine(line);
-    if (editor.scrollTop !== before) markSyncLock('editor');
     updateAlignedChapter();
 }
 
@@ -1341,9 +1337,7 @@ function applyScrollToEditorByBlock() {
     let line = bl.start + ratio * Math.max(0, bl.count - 1);
     const maxLine = Math.floor((maxEdit - padTop) / lh);
     if (line > maxLine) line = maxLine;
-    const before = editor.scrollTop;
     scrollEditorToLine(line);          // 它会补上 paddingTop
-    if (editor.scrollTop !== before) markSyncLock('editor');
 }
 
 editor.addEventListener('scroll', () => {
@@ -1356,14 +1350,16 @@ editor.addEventListener('scroll', () => {
     // 横滚时按比例重置预览区会让预览“跳走”。
     if (editor.scrollTop === lastEditorScrollTop) return;
     lastEditorScrollTop = editor.scrollTop;
-    if (syncLock === 'editor') return;      // 这是程序自己同步过来的 → 忽略
+    if (isEchoScrollEvent(editor)) return;   // 这是程序自己同步过来的 → 忽略
+    if (!settings.scrollSync) return;        // 设置里关掉了同步
     noteScrollDir('editor', editor);
     applyScrollToPreview();
 });
 // 反向同步：预览区滚动 → 编辑区
 previewScroll && previewScroll.addEventListener('scroll', () => {
     if (syncing || !editor) return;
-    if (syncLock === 'preview') return;     // 这是程序自己同步过来的 → 忽略
+    if (isEchoScrollEvent(previewScroll)) return;  // 这是程序自己同步过来的 → 忽略
+    if (!settings.scrollSync) return;        // 设置里关掉了同步
     noteScrollDir('preview', previewScroll);
     applyScrollToEditor();
 });
@@ -1589,10 +1585,8 @@ function followCaretInPreview() {
     const target = r.top < wrapRect.top
         ? previewScroll.scrollTop + (r.top - wrapRect.top) - 12
         : previewScroll.scrollTop + (r.bottom - wrapRect.bottom) + 12;
-    const before = previewScroll.scrollTop;
-    previewScroll.scrollTop = target;
     // 被程序设了滚动位置 → 预览接下来的 scroll 事件是回弹，要忽略
-    if (previewScroll.scrollTop !== before) markSyncLock('preview');
+    setScrollTop(previewScroll, target);
 }
 
 /** 当前 markdown 文件所在目录（本地相对路径图片的解析基准） */
@@ -2445,8 +2439,14 @@ function headingIndexAtLine(line) {
 //   >0 = 往下滚（内容往上走 → 回看上面的内容）→ 取视口里**最靠上**的
 //   <0 = 往上滚（内容往下走 → 在看新冒出来的内容）→ 取视口里**最靠下**的
 const scrollDir = { editor: 0, preview: 0 };
-// 程序同步引起的滚动 —— 那一侧的 scroll 事件要忽略（它不是用户在滚）
-let syncLock = null;
+// 程序同步引起的滚动 —— 那一侧的 scroll 事件要忽略（它不是用户在滚）。
+//
+// ⚠️ **必须用“位置匹配”，不能用标志位 + 定时清零**：
+//    定时器会在 scroll 事件**之前**执行 → 回弹没被抑制 → 反向同步把位置拽回去
+//    → “往下滚动滚动不了”（踩过）。
+//    纯位置匹配：程序设了哪个位置，之后落在那个位置上的 scroll 事件才算回弹。
+//    用户滚动的位置几乎不会正好等于它 → 不会误伤。
+let pendingEcho = [];   // [{el, pos}]
 
 /**
  * 程序设置滚动位置 —— 顺带把“这一侧接下来那个 scroll 事件是回弹”标记上。
@@ -2458,13 +2458,20 @@ function setScrollTop(el, pos) {
     const before = el.scrollTop;
     el.scrollTop = pos;
     if (el.scrollTop === before) return;      // 没动 → 不会有 scroll 事件
-    markSyncLock(el === editor ? 'editor' : 'preview');
+    pendingEcho.push({ el, pos: el.scrollTop });
+    if (pendingEcho.length > 12) pendingEcho.shift();
 }
 
-/** 标记“这一侧接下来的 scroll 事件是程序同步引起的，要忽略” */
-function markSyncLock(dir) {
-    syncLock = dir;
-    setTimeout(() => { if (syncLock === dir) syncLock = null; }, 0);
+/** 这个 scroll 事件是不是程序同步引起的回弹？是的话吃掉它并返回 true */
+function isEchoScrollEvent(el) {
+    for (let i = pendingEcho.length - 1; i >= 0; i--) {
+        const p = pendingEcho[i];
+        if (p.el === el && Math.abs(el.scrollTop - p.pos) < 2) {
+            pendingEcho.splice(i, 1);     // 一次性消费
+            return true;
+        }
+    }
+    return false;
 }
 const lastScrollPos = { editor: 0, preview: 0 };
 
@@ -2524,7 +2531,7 @@ function scrollEditorToLine(line) {
     const padTop = parseFloat(cs.paddingTop) || 0;   // 滚动的原点是 padding 顶边，要补上
     // ⚠️ **向上取整**：行高是小数（如 22.95），算出来的位置会被浏览器量化，
     //    少零点几像素就落在**上一行** → 章节判定差一节（实测踩过）。
-    editor.scrollTop = Math.ceil(line * editorLineHeight + padTop);
+    setScrollTop(editor, Math.ceil(line * editorLineHeight + padTop));
 }
 
 // 上一次渲染目录时的「标题结构」签名。每次输入都会重跑 renderPreview()，
@@ -2566,8 +2573,7 @@ function onTocItemClick(e) {
         //    这里按目标再对一次，直接跳到位（不再 smooth）。
         const maxPrev = previewWrap.scrollHeight - previewWrap.clientHeight;
         if (top <= maxPrev && Math.abs(previewWrap.scrollTop - top) > 4) {
-            previewWrap.scrollTop = top;
-            markSyncLock('preview');   // 预览自己跳的
+            setScrollTop(previewWrap, top);   // 预览自己跳的
         }
     };
     previewWrap.addEventListener('scrollend', done);
@@ -3950,6 +3956,7 @@ let settings = {
     zoom: 100,          // 文字缩放（%）
     codeWrap: true,     // 预览区代码自动换行
     followCaret: true,  // 输入时预览区跟着光标走
+    scrollSync: true,   // 编辑区与预览区滚动同步
 };
 
 function loadSettings() {
@@ -3976,6 +3983,8 @@ function loadSettings() {
     settings.codeWrap = settings.codeWrap !== false;
     // 光标跟随默认开
     settings.followCaret = settings.followCaret !== false;
+    // 滚动同步默认开
+    settings.scrollSync = settings.scrollSync !== false;
     let z = Number(settings.zoom);
     if (!isFinite(z)) z = 100;
     z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));   // 超出范围就钳到边界
@@ -4035,6 +4044,13 @@ function setFollowCaret(v) {
     syncSettingsUI();
 }
 
+/** 编辑区与预览区的滚动同步（立即生效） */
+function setScrollSync(v) {
+    settings.scrollSync = v === '1';
+    saveSettings();
+    syncSettingsUI();
+}
+
 function saveSettings() {
     // 存到设置文件（Rust 写），下次启动时 Rust 会读它来决定窗口底色
     invoke('save_settings', { settings: settings }).catch((e) => {
@@ -4058,6 +4074,9 @@ function syncSettingsUI() {
     });
     document.querySelectorAll('#set-follow .seg-btn').forEach(b => {
         b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.followCaret);
+    });
+    document.querySelectorAll('#set-sync .seg-btn').forEach(b => {
+        b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.scrollSync);
     });
 }
 
@@ -4123,6 +4142,10 @@ document.querySelectorAll('#set-wrap .seg-btn').forEach(b => {
 // 输入时预览跟着光标走（立即生效）
 document.querySelectorAll('#set-follow .seg-btn').forEach(b => {
     b.addEventListener('click', () => setFollowCaret(b.dataset.v));
+});
+// 编辑区与预览区的滚动同步（立即生效）
+document.querySelectorAll('#set-sync .seg-btn').forEach(b => {
+    b.addEventListener('click', () => setScrollSync(b.dataset.v));
 });
 // 系统右键菜单项（.md 文件右键时多一个「用 VMD 打开」）
 document.getElementById('menu-on').addEventListener('click', async () => {
