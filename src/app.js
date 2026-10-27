@@ -1155,34 +1155,31 @@ function applyScrollByRatio(fromEditor) {
 function applyScrollToPreview() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
-    if (!lh) { applyScrollByRatio(true); return; }
-
-    // 锚点：编辑区顶行所属的章节。
-    // ⚠️ 编辑区是**主动方**（用户正在滚它），它不能自己跳 —— 所以这里不能用
-    //    “按方向取的那一端”（那会让两边分叉：预览跑到另一节，编辑区还在原地）。
-    //    方向只用在**预览→编辑**方向（那时预览才是主动方）。
-    const hi = headingIndexAtLine(editorTopLine());
-    const anchor = hi >= 0 ? headingPairs[hi] : null;
-    if (!anchor) {
-        // 文档里没有标题（或者标题对不上）→ 退回按块对齐
-        applyScrollToPreviewByBlock();
+    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+    // 块数对不上（原始 HTML 展开成多个预览节点）→ 退回按比例
+    if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
+        applyScrollByRatio(true);
         return;
     }
-    alignedIdx = hi;      // 两边对齐到这一节（目录高亮跟着它）
-    // 幂等保护：**按位置**比（不按章节比 —— 两边的方向可能不同，比章节不可靠）。
-    // 已经在位就不动，否则：同步 → 预览滚 → 回弹 → 反向同步 → …
-    // 来回拉扯，每次都多偏一点。
-    const h = anchor.el;
+    // 锚点 = 编辑区顶行所在的块（**连续**跟随，不是按章节跳）
+    const topLine = Math.floor((editor.scrollTop - padTop) / lh);
+    const k = blockIndexAtLine(topLine);
+    if (k < 0) { applyScrollByRatio(true); return; }
+    const el = preview.children[k];
+    if (!el) { applyScrollByRatio(true); return; }
+    const bl = blockLines[k];
+    // 块内偏移（0~1）：源码块内已经过去多少
+    const frac = bl.count > 0 ? Math.max(0, Math.min((topLine - bl.start) / bl.count, 1)) : 0;
     const wrapRect = previewScroll.getBoundingClientRect();
-    const target = previewScroll.scrollTop +
-        (h.getBoundingClientRect().top - wrapRect.top) - 8;
-    const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+    const elRect = el.getBoundingClientRect();
+    const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + frac * elRect.height;
     const want = Math.max(0, Math.min(target, maxPrev));
-    if (Math.abs(previewScroll.scrollTop - want) < 4) { scheduleTocHighlight(); return; }
+    // 幂等保护：**按位置**比（不按章节比 —— 两边的方向可能不同，比章节不可靠）
+    if (Math.abs(previewScroll.scrollTop - want) < 4) { updateAlignedChapter(); return; }
     const before = previewScroll.scrollTop;
     previewScroll.scrollTop = want;
     if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
-    scheduleTocHighlight();
+    updateAlignedChapter();
 }
 
 /** 块级对齐（文档没有标题时的兜底） */
@@ -1218,26 +1215,50 @@ function applyScrollToPreviewByBlock() {
 function applyScrollToEditor() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
-    if (!lh) { applyScrollByRatio(false); return; }
-    // 锚点：预览区视口里可见的标题，按**滚动方向**取哪一端
-    const items = visibleHeadingsPreview();
-    const anchor = pickAnchor(items, scrollDir.preview);
-    if (!anchor) {
-        applyScrollToEditorByBlock();
+    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
+        applyScrollByRatio(false);
         return;
     }
-    const anchorIdx = headingPairs.indexOf(anchor);
-    alignedIdx = anchorIdx;      // 两边对齐到这一节（目录高亮跟着它）
-    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    // 锚点 = 预览区顶部可见的块（**连续**跟随）
+    const wrapRect = previewScroll.getBoundingClientRect();
+    let k = -1;
+    for (let i = 0; i < preview.children.length; i++) {
+        const r = preview.children[i].getBoundingClientRect();
+        if (r.bottom > wrapRect.top) { k = i; break; }
+    }
+    if (k < 0) { applyScrollByRatio(false); return; }
+    const bl = blockLines[k];
+    if (!bl) { applyScrollByRatio(false); return; }
+    const elRect = preview.children[k].getBoundingClientRect();
+    // 块内偏移：块顶已经在视口上方多少（占块高的比例）
+    const passed = wrapRect.top - elRect.top;
+    const frac = elRect.height > 0 ? Math.max(0, Math.min(passed / elRect.height, 1)) : 0;
+    let line = bl.start + frac * Math.max(0, bl.count - 1);
+    // ⚠️ 源码那边可能滚不到这么远（预览渲染后比源码高，可滚范围对不上）——
+    //    光把编辑区钳制到底会**两边分叉**（编辑区停在末尾，预览还在中间）。
+    //    所以钳制的瞬间**预览也一起滚到对应位置**，两边保持一致。
     const maxLine = Math.floor((maxEdit - padTop) / lh);
-    const target = Math.min(anchor.line, Math.max(0, maxLine));
-    // 幂等保护：按位置比（编辑区已经在那一行就不动）
-    const wantPos = Math.min(Math.ceil(target * lh + padTop), maxEdit);
-    if (Math.abs(editor.scrollTop - wantPos) < 4) { scheduleTocHighlight(); return; }
+    if (line > maxLine) {
+        line = maxLine;
+        const lastK = blockIndexAtLine(maxLine);
+        const lastEl = lastK >= 0 ? preview.children[lastK] : null;
+        if (lastEl) {
+            const wr = previewScroll.getBoundingClientRect();
+            const t = previewScroll.scrollTop +
+                (lastEl.getBoundingClientRect().top - wr.top) - 8;
+            const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
+            const beforeP = previewScroll.scrollTop;
+            previewScroll.scrollTop = Math.max(0, Math.min(t, maxPrev));
+            if (previewScroll.scrollTop !== beforeP) {
+                noteProgrammaticScroll('preview', previewScroll.scrollTop);
+            }
+        }
+    }
     const before = editor.scrollTop;
-    scrollEditorToLine(target);          // 它会补上 paddingTop
+    scrollEditorToLine(line);          // 它会补上 paddingTop
     if (editor.scrollTop !== before) noteProgrammaticScroll('editor', editor.scrollTop);
-    scheduleTocHighlight();
+    updateAlignedChapter();
 }
 
 /** 块级对齐（文档没有标题时的兜底） */
@@ -2328,9 +2349,17 @@ function editorTopLine() {
 let alignedIdx = -1;
 
 /**
- * 目录高亮跟**对齐到的那一节**走 —— 那才是两边真正对应的章节。
- * 预览和编辑区同步后对齐的是同一节，所以目录高亮和预览内容必然对得上。
+ * 目录高亮跟**当前对齐位置的章节**走。
+ * 两边同步后对齐的是同一个位置 → 目录高亮和预览内容必然对得上。
  */
+function updateAlignedChapter() {
+    // 对齐位置的章节 = 编辑区顶行所属的章节
+    // （编辑区和预览区是同步的，顶行变了就是章节变了）
+    const k = headingIndexAtLine(editorTopLine());
+    if (k >= 0) alignedIdx = k;
+    updateTocHighlight();
+}
+
 function updateTocHighlight() {
     if (!previewScroll) return;
     const pair = alignedIdx >= 0 ? headingPairs[alignedIdx] : null;
