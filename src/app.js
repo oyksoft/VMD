@@ -1085,25 +1085,33 @@ function blockIndexAtLine(line) {
 // 回弹抑制：程序设置了某个元素的滚动位置后，那个元素接下来发的 scroll 事件
 // 是“回弹”（不是用户在滚），必须忽略，否则两边会互相抽筋。
 //
-// ⚠️ 语义只有一条：**谁被程序设了 scrollTop，就忽略谁的下一个 scroll 事件**。
-//    - 编辑器同步到预览 → 设了预览 → 忽略“预览”的 scroll
-//    - 预览同步到编辑器 → 设了编辑器 → 忽略“编辑器”的 scroll
-//    - 预览自己跳（光标跟随 / 目录校正）→ 忽略“预览”的 scroll
+// ⚠️ 用**位置匹配**而不是时间窗：时间窗会误伤用户的滚动 ——
+//    程序刚同步过预览（比如光标跟随），用户接着滚预览，
+//    整个手势都被当成回弹忽略掉 → “预览滚了但编辑区没跟”。
+//    现在：记住程序设过的确切位置，scroll 事件的位置跟它一样才算回弹。
 //    同方向的连续滚动**不受影响** —— 一次滚轮手势 5~10 个事件，
 //    全丢的话预览只跟得上第一帧（这正是以前“滚起来跟不上”的原因）。
-let scrollEcho = { dir: '', at: 0 };
+const programmaticScrolls = [];   // [{dir, pos, at}]
 
-/** 记下“刚刚被程序设了滚动位置的是谁” */
-function suppressScrollEcho(dir) {
-    scrollEcho = { dir, at: performance.now() };
+/** 记下“程序刚把某个元素设到了哪个位置” */
+function noteProgrammaticScroll(dir, pos) {
+    programmaticScrolls.push({ dir, pos, at: performance.now() });
+    if (programmaticScrolls.length > 24) programmaticScrolls.shift();
 }
 
 /**
  * 这个方向的 scroll 是不是回弹？
  * @param dir 当前 scroll 事件的方向（'editor' / 'preview'）
+ * @param pos 当前 scroll 位置
  */
-function isEchoScroll(dir) {
-    return scrollEcho.dir === dir && performance.now() - scrollEcho.at < 150;
+function isEchoScroll(dir, pos) {
+    const now = performance.now();
+    for (let i = programmaticScrolls.length - 1; i >= 0; i--) {
+        const p = programmaticScrolls[i];
+        if (now - p.at > 800) break;          // 太老的就不看了
+        if (p.dir === dir && Math.abs(p.pos - pos) < 1.5) return true;
+    }
+    return false;
 }
 
 /**
@@ -1129,12 +1137,12 @@ function applyScrollByRatio(fromEditor) {
         const target = (editor.scrollTop / maxEdit) * maxPrev;
         const before = previewScroll.scrollTop;
         previewScroll.scrollTop = target;
-        if (previewScroll.scrollTop !== before) suppressScrollEcho('preview');
+        if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
     } else {
         const target = (previewScroll.scrollTop / maxPrev) * maxEdit;
         const before = editor.scrollTop;
         editor.scrollTop = target;
-        if (editor.scrollTop !== before) suppressScrollEcho('editor');
+        if (editor.scrollTop !== before) noteProgrammaticScroll('editor', editor.scrollTop);
     }
 }
 
@@ -1165,7 +1173,7 @@ function applyScrollToPreview() {
     //    （之前是“编辑区也到底” → 预览直接跳绝对底部，用户会看到预览跑飞了）
     const before = previewScroll.scrollTop;
     previewScroll.scrollTop = Math.min(target, maxPrev);
-    if (previewScroll.scrollTop !== before) suppressScrollEcho('preview');
+    if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
 }
 
 /** 把预览区的位置应用到编辑区（预览区 → 编辑区） */
@@ -1201,7 +1209,7 @@ function applyScrollToEditor() {
     if (line > maxLine) line = maxLine;
     const before = editor.scrollTop;
     scrollEditorToLine(line);          // 它会补上 paddingTop
-    if (editor.scrollTop !== before) suppressScrollEcho('editor');
+    if (editor.scrollTop !== before) noteProgrammaticScroll('editor', editor.scrollTop);
 }
 
 editor.addEventListener('scroll', () => {
@@ -1214,13 +1222,13 @@ editor.addEventListener('scroll', () => {
     // 横滚时按比例重置预览区会让预览“跳走”。
     if (editor.scrollTop === lastEditorScrollTop) return;
     lastEditorScrollTop = editor.scrollTop;
-    if (isEchoScroll('editor')) return;   // 预览区回弹引起的
+    if (isEchoScroll('editor', editor.scrollTop)) return;   // 预览区回弹引起的
     applyScrollToPreview();
 });
 // 反向同步：预览区滚动 → 编辑区
 previewScroll && previewScroll.addEventListener('scroll', () => {
     if (syncing || !editor) return;
-    if (isEchoScroll('preview')) return;
+    if (isEchoScroll('preview', previewScroll.scrollTop)) return;
     applyScrollToEditor();
 });
 
@@ -1447,7 +1455,7 @@ function followCaretInPreview() {
     const before = previewScroll.scrollTop;
     previewScroll.scrollTop = target;
     // 被程序设了滚动位置 → 预览接下来的 scroll 事件是回弹，要忽略
-    if (previewScroll.scrollTop !== before) suppressScrollEcho('preview');
+    if (previewScroll.scrollTop !== before) noteProgrammaticScroll('preview', previewScroll.scrollTop);
 }
 
 /** 当前 markdown 文件所在目录（本地相对路径图片的解析基准） */
@@ -2282,7 +2290,7 @@ function onTocItemClick(e) {
         const maxPrev = previewWrap.scrollHeight - previewWrap.clientHeight;
         if (top <= maxPrev && Math.abs(previewWrap.scrollTop - top) > 4) {
             previewWrap.scrollTop = top;
-            suppressScrollEcho('preview');   // 预览自己跳的 → 别反过来拽编辑区
+            noteProgrammaticScroll('preview', previewWrap.scrollTop);   // 预览自己跳的
         }
     };
     previewWrap.addEventListener('scrollend', done);
