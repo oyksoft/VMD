@@ -1034,6 +1034,8 @@ let lastEditorScrollTop = 0;
 // ⚠️ 编辑区是不折行的（wrap="off"），所以一个块的 raw 文本**原样**占那些行 ——
 //    块在编辑区里的高度就是 行数 × 行高，精确对应。
 let blockLines = [];
+// 源码每一行的起始字符偏移（全局一份，所有块共用）
+let srcLineStarts = [];
 
 // ============ 行级锚点表 ============
 //
@@ -1046,7 +1048,10 @@ let blockLines = [];
 //   表格 → 每个 tr 一行（跳过 --- 分隔行）
 //   代码块 → hljs 高亮后每行一个 span
 //   其他 → 整个元素对应一行（列表/引用块内部不细分，误差在几十行内）
-let anchorList = [];   // [{el, line, endLine}]，按源码行升序
+let anchorList = [];   // [{el, line, endLine, block, top, height}]
+// 目录的滚动位置（scroll 事件里缓存 —— 那时布局已算好，读 scrollTop 是免费的）
+let tocKeepScroll = 0;
+let anchorsDirty = true;   // 渲染后位置会变 → 滚动时再重测，按源码行升序
 
 /** 顶层块 → 真正的内容元素（表格被包进了 .table-wrap，代码块被包进了 .code-block） */
 function contentElementOf(el) {
@@ -1068,18 +1073,11 @@ function splitRows(el, start) {
         });
         return out;
     }
-    // 代码块：hljs 把每行包成一个 span
-    if (el.tagName === 'PRE') {
-        const spans = Array.from(el.querySelectorAll('code > span'));
-        if (spans.length) {
-            const out = [];
-            spans.forEach((sp, i) => {
-                const line = start + 1 + i;   // 跳过开头的 ``` 行
-                out.push({ el: sp, line, endLine: line });
-            });
-            return out;
-        }
-    }
+    // 代码块：**不按行细分**。
+    // ⚠️ 细分的话，大文档里每个代码行都是一个锚点（1MB 文档实测 16538 个）——
+    //    每次滚动都要遍历一遍取布局，19ms/次 → 直接卡死。
+    //    代码块内部改用**字符比例**定位（源码第 k 行在块内的字符占比），
+    //    精度和按行细分差不多，但锚点数少两个数量级。
     // 其他：整个元素一行
     return [{ el, line: start, endLine: start }];
 }
@@ -1095,7 +1093,68 @@ function buildAnchorTable() {
         const rows = splitRows(inner, bl.start);
         for (const r of rows) { r.block = k; anchorList.push(r); }
     }
+    // 顺带测位置（一次布局就够，后面的读取都走缓存）。
+    // ⚠️ 必须在**渲染之外**做（下一帧）—— 渲染后布局是脏的，
+    //    这时候测会强制整个预览（1.2 万个元素）重新布局 → 几百毫秒 → 卡死。
+    if (previewScroll) {
+        const wrapRect = previewScroll.getBoundingClientRect();
+        const base = previewScroll.scrollTop;
+        for (const a of anchorList) {
+            const r = a.el.getBoundingClientRect();
+            a.top = r.top - wrapRect.top + base;     // 在预览内容里的位置
+            a.height = r.height;
+        }
+    }
+    anchorsDirty = false;
     return anchorList;
+}
+
+/**
+ * 重测所有锚点在预览内容里的位置（top）和高度（height）。
+ * ⚠️ 懒执行：渲染时不测，只在滚动同步要用时才测 ——
+ *    一次 getBoundingClientRect 触发一次布局，之后的读取都走缓存，
+ *    所以 N 个锚点只花一次布局的时间。
+ */
+/** 目录渲染挪到下一帧（脏布局下做会触发全局重排 → 卡死） */
+let tocRenderRaf = 0;
+function scheduleTocRender() {
+    if (tocRenderRaf) return;
+    tocRenderRaf = requestAnimationFrame(() => {
+        tocRenderRaf = 0;
+        renderToc();
+    });
+}
+
+/** 渲染后延后一帧测位置（浏览器那一帧本来就要重排） */
+let anchorMeasureRaf = 0;
+function scheduleAnchorMeasure() {
+    if (anchorMeasureRaf) return;
+    anchorMeasureRaf = requestAnimationFrame(() => {
+        anchorMeasureRaf = 0;
+        buildAnchorTable();      // 预览 DOM 变了 → 重建行级锚点表
+        ensureAnchorPositions(); // 顺带测位置（浏览器这一帧本来就要重排）
+    });
+}
+
+/** 位置在 buildAnchorTable() 里已经测好了，这里只是保证表不是空的 */
+function ensureAnchorPositions() {
+    if (!anchorList.length) buildAnchorTable();
+}
+
+/** 某个预览元素在预览内容里的顶部位置（用锚点表缓存，避免读布局） */
+function elTopInContent(el) {
+    ensureAnchorPositions();
+    for (const a of anchorList) {
+        if (a.el === el) return a.top;
+    }
+    return 0;
+}
+function elHeightInContent(el) {
+    ensureAnchorPositions();
+    for (const a of anchorList) {
+        if (a.el === el) return a.height;
+    }
+    return 0;
 }
 
 /** 锚点对应的块 */
@@ -1111,8 +1170,10 @@ function blockOfAnchor(a) {
 function fracInBlock(a, topLine) {
     const bl = blockOfAnchor(a);
     if (!bl || !bl.charLen) return 0;
-    const i = Math.max(0, Math.min(topLine - bl.start, bl.lineChars.length - 1));
-    const charInBlock = bl.lineChars[i] || 0;
+    const i = Math.max(0, topLine - bl.start);
+    const lineStart = srcLineStarts[bl.start + i];
+    if (lineStart === undefined) return 0;
+    const charInBlock = Math.max(0, lineStart - bl.charStart);
     return Math.max(0, Math.min(charInBlock / bl.charLen, 1));
 }
 
@@ -1121,10 +1182,11 @@ function lineOfCharInBlock(a, frac) {
     const bl = blockOfAnchor(a);
     if (!bl) return a ? a.line : 0;
     const charInBlock = frac * bl.charLen;
-    const chars = bl.lineChars;
     let li = 0;
-    for (let i = 0; i < chars.length; i++) {
-        if (chars[i] <= charInBlock) li = i; else break;
+    const maxI = Math.min(bl.count - 1, srcLineStarts.length - bl.start - 1);
+    for (let i = 0; i <= maxI; i++) {
+        const off = srcLineStarts[bl.start + i] - bl.charStart;
+        if (off <= charInBlock) li = i; else break;
     }
     return bl.start + li;
 }
@@ -1146,15 +1208,18 @@ function anchorAtLine(line) {
  *    用“完全在上方的最后一个”会差一整个锚点（实测差十几行）。
  */
 function anchorAtViewportTop() {
-    if (!previewScroll) return null;
-    const top = previewScroll.getBoundingClientRect().top;
-    let best = null;
-    for (const a of anchorList) {
-        const r = a.el.getBoundingClientRect();
-        best = a;
-        if (r.bottom > top) break;      // 这个还跨着视口顶 → 就是它
+    if (!previewScroll || !anchorList.length) return null;
+    // 位置表还没测好（刚渲染完）→ 先用比例兜底，别为了精确把输入卡住
+    if (anchorsDirty) return null;
+    ensureAnchorPositions();
+    const top = previewScroll.scrollTop;
+    // 二分：最后一个“顶边在视口顶之上”的锚点（视口顶通常切在它内部）
+    let lo = 0, hi = anchorList.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (anchorList[mid].top <= top) lo = mid; else hi = mid - 1;
     }
-    return best;
+    return anchorList[lo] || null;
 }
 
 /** 某一行属于第几个顶层块（取“起始行 <= 行”的最后一个块） */
@@ -1186,7 +1251,12 @@ function computeBlockLines(tokens, sourceText) {
     //    换行的归属说不清：段落 token 的 raw 不含结尾换行，那个换行归下一个 token，
     //    按换行数累加会越算越偏（实测 README 上偏了好几个块）。
     //    marked 的 token.raw 累加 === 源码，所以字符偏移是准的。
-    const lineStarts = [0];
+    // 行起始字符偏移表（全局一份，所有块共用）
+    // ⚠️ 别给每个块各建一个 lineChars 数组 —— 1MB 文档 1.2 万个块就是 1.2 万个小数组，
+    //    每次渲染重建 → GC 压力，实测慢好几百毫秒。
+    const lineStarts = srcLineStarts;
+    lineStarts.length = 0;
+    lineStarts.push(0);
     for (let i = 0; i < sourceText.length; i++) {
         if (sourceText.charCodeAt(i) === 10) lineStarts.push(i + 1);
     }
@@ -1211,16 +1281,10 @@ function computeBlockLines(tokens, sourceText) {
         // 块内每一行的起始字符偏移（相对块首）——
         // 长段落（源码几行、预览折成十几行）必须按**字符比例**定位，
         // 按行比例会偏很多（行高完全不成比例）。
-        const lineChars = [];
-        for (let ln = start; ln <= end; ln++) {
-            const off = lineStarts[ln] - startChar;
-            lineChars.push(off >= 0 ? off : 0);
-        }
         lines.push({
             start, count,
             charStart: startChar,
             charLen: t.raw.length,
-            lineChars,
         });
     }
     return lines;
@@ -1282,9 +1346,11 @@ function applyScrollToPreview() {
     // 锚点内部的位置用**字符比例**：长段落里源码几行、预览折成十几行，
     // 行高完全不成比例，只有字符比例能对上。
     const frac = fracInBlock(a, topLine);
-    const wrapRect = previewScroll.getBoundingClientRect();
-    const elRect = a.el.getBoundingClientRect();
-    const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + frac * elRect.height;
+    // 位置表还没测好（刚渲染完）→ 按比例兜底，别在输入路径里强制重排
+    if (anchorsDirty) { applyScrollByRatio(true); return; }
+    ensureAnchorPositions();
+    // 目标位置 = 锚点在内容里的位置 + 块内比例偏移
+    const target = a.top + frac * (a.height || 0);
     const want = Math.max(0, Math.min(target, maxPrev));
     // 幂等保护：已经在位就不动（不然同步→预览滚→回弹→反向同步… 来回拉扯）
     if (Math.abs(previewScroll.scrollTop - want) < 2) { updateAlignedChapter(); return; }
@@ -1328,12 +1394,11 @@ function applyScrollToEditor() {
 
     // 锚点 = 预览视口顶部所在的元素（**精确查表**）
     const a = anchorAtViewportTop();
-    if (!a) { applyScrollByRatio(false); return; }
-    const wrapRect = previewScroll.getBoundingClientRect();
-    const elRect = a.el.getBoundingClientRect();
+    if (!a) { applyScrollByRatio(false); return; }   // 位置表还没测好 → 按比例
+    ensureAnchorPositions();
     // 锚点内部的位置（视口顶在这个锚点里往下滑了多少）
-    const passed = wrapRect.top - elRect.top;          // 正数 = 视口顶在锚点上方
-    const frac = elRect.height > 0 ? Math.max(0, Math.min(passed / elRect.height, 1)) : 0;
+    const passed = previewScroll.scrollTop - a.top;     // 正数 = 视口顶在锚点上方
+    const frac = a.height > 0 ? Math.max(0, Math.min(passed / a.height, 1)) : 0;
     let line = lineOfCharInBlock(a, frac);
     // 源码那边滚不到这么远（预览渲染后比源码高）→ **编辑区原地不动，预览继续走**
     // ⚠️ 这里**不能**把编辑区钳制到底再往下设：
@@ -1600,14 +1665,25 @@ function renderPreview() {
     if (tocCount > 0) renderInlineToc(tocTypes);
     queueMath(changed);
     mapHeadingLines(text);   // 把预览区的标题和源码行号对应起来（目录跳转要精确落行）
-    renderToc();
+    // ⚠️ 目录渲染挪到下一帧 —— 渲染后布局是脏的，renderToc 里任何读布局的操作
+    //    都会强制**整个预览**（1MB 文档 = 1.2 万个元素）重新布局 → 几百毫秒 → 卡死。
+    //    下一帧浏览器本来就要重排（画面要更新），那时做这些事不额外花钱。
+    scheduleTocRender();
     updateFilename();
     previewBlockKeys = keys;
     previewRenderedSource = text;
     previewRenderedBase = baseDir;
+    // 预览 DOM 刚变 → 位置表已失效，**立刻标脏**（必须在 followCaretInPreview 之前，
+    // 否则它会以为位置还是准的 → 同步测位置 → 强制全局重排 → 卡死）
+    anchorsDirty = true;
     updateSelToolbar();   // 换文件后选区没了，浮动工具栏要收起来
     followCaretInPreview();   // 光标所在的内容要能在预览里看见
-    buildAnchorTable();   // 预览 DOM 变了 → 重建行级锚点表
+    // ⚠️ 锚点表 + 位置测量**都不能在输入路径里同步做**：
+    //    - 遍历 1.2 万个块建表：几百毫秒
+    //    - 测位置会强制整个预览（1.2 万个元素）重新布局：几百毫秒
+    //    两者都会把打字卡死。全部挪到下一帧 ——
+    //    浏览器那一帧本来就要重排（画面要更新），顺带做不额外花钱。
+    scheduleAnchorMeasure();
 }
 
 /**
@@ -1623,6 +1699,10 @@ function renderPreview() {
 function followCaretInPreview() {
     if (!settings.followCaret || !previewScroll) return;
     if (!blockLines.length || preview.children.length !== blockLines.length) return;
+    // ⚠️ 位置表还没测好（刚渲染完）→ 别在这里同步测位置：
+    //    那会强制整个预览（1.2 万个元素）重新布局 → 几百毫秒 → 打字卡死。
+    //    下一帧（scheduleAnchorMeasure）测好后会自动跟上。
+    if (anchorsDirty) return;
     const { lh } = editorMetrics();
     if (!lh) return;
     // ⚠️ selectionStart 是**字符偏移**，不是行号 —— 得数前面的换行符
@@ -1631,14 +1711,19 @@ function followCaretInPreview() {
     if (k < 0) return;
     const el = preview.children[k];
     if (!el) return;
-    const wrapRect = previewScroll.getBoundingClientRect();
-    const r = el.getBoundingClientRect();
+    // ⚠️ 用锚点表里缓存的位置，**不要**在这里调 getBoundingClientRect ——
+    //    渲染后布局是脏的，读它会强制整个预览（1.2 万个元素）重新布局 → 几百毫秒 → 卡死。
+    if (anchorsDirty) return;      // 位置表还没测好 → 下一帧再跟随
+    ensureAnchorPositions();
+    const wrapTop = previewScroll.scrollTop;
+    const rTop = elTopInContent(el);
+    const rBottom = rTop + (elHeightInContent(el) || 0);
     // 已经能看到这个块 → 不动（别打断用户）
-    const visible = r.bottom > wrapRect.top && r.top < wrapRect.bottom;
+    const visible = rBottom > wrapTop && rTop < wrapTop + previewScroll.clientHeight;
     if (visible) return;
-    const target = r.top < wrapRect.top
-        ? previewScroll.scrollTop + (r.top - wrapRect.top) - 12
-        : previewScroll.scrollTop + (r.bottom - wrapRect.bottom) + 12;
+    const target = rTop < wrapTop
+        ? rTop - 12
+        : rBottom - previewScroll.clientHeight + 12;
     // 被程序设了滚动位置 → 预览接下来的 scroll 事件是回弹，要忽略
     setScrollTop(previewScroll, target);
 }
@@ -2641,11 +2726,21 @@ function renderToc() {
     const headings = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
 
     // 先补 id：签名要用，点击跳转也依赖它
+    // ⚠️ **id 不要用 slugify** —— 1MB 文档有 1.5 万个标题，
+    //    每个都跑一次正则替换（全文级）就是几百毫秒（实测 renderToc 占 458ms）。
+    //    目录项显示的是标题文字，id 只是定位用的 key → 用索引就够。
     headings.forEach((h, i) => {
-        if (!h.id) h.id = 'h-' + i + '-' + slugify(h.textContent);
+        if (!h.id) h.id = 'h-' + i;
     });
 
-    const items = Array.prototype.map.call(headings, h => ({
+    // ⚠️ **只处理要显示的前 N 个** ——
+    //    1MB 文档可能有 1.5 万个标题，全部算 sig / 建 items / 更新 DOM 就是几百毫秒
+    //    （实测 262ms，输入时直接卡死）。目录本来就只显示前 TOC_MAX_ITEMS 个。
+    const truncated = headings.length > TOC_MAX_ITEMS;
+    const shownHeads = truncated
+        ? Array.prototype.slice.call(headings, 0, TOC_MAX_ITEMS)
+        : headings;
+    const items = Array.prototype.map.call(shownHeads, h => ({
         h,
         level: parseInt(h.tagName.charAt(1)),   // H4 → 4
         id: h.id,
@@ -2665,12 +2760,15 @@ function renderToc() {
     }
     tocSignature = sig;
 
-    const keepScroll = tocList.scrollTop;   // 重建会把 scrollTop 归零，先记下来
+    // ⚠️ **不要在这里读 tocList.scrollTop** ——
+    //    渲染后布局是脏的，读 scrollTop 会强制**整个预览**（1MB 文档 = 1.2 万个元素）
+    //    重新布局 → 几百毫秒 → 输入直接卡死（实测 258ms）。
+    //    滚动位置用 scroll 事件里缓存的值（那时布局已经算好了，读起来是免费的）。
+    const keepScroll = tocKeepScroll;
 
     // 极端文档（1MB、1.4 万个标题）光建目录就要近 1 秒，滚动和高亮也跟着变慢。
     // 超过上限只列前 N 项，并在末尾说明还有多少（真实文档几乎碰不到）。
-    const truncated = items.length > TOC_MAX_ITEMS;
-    const shown = truncated ? items.slice(0, TOC_MAX_ITEMS) : items;
+    const shown = items;
 
     // 项数对得上就逐项改，别整段重建 —— 重建 2000 个目录项要重排整个目录，
     // 1MB 文档实测 1 秒以上（改一个标题字就要付这个代价）。
@@ -4684,6 +4782,8 @@ function scheduleTocHighlight() {
 // 目录高亮跟着**编辑区顶行**走（编辑区是“真相”）——
 // 预览区滚动时编辑区会跟着同步，一样会触发这个。
 if (previewScroll) previewScroll.addEventListener('scroll', scheduleTocHighlight, { passive: true });
+// 目录滚动位置缓存（scroll 事件里布局已算好，读 scrollTop 不会触发重排）
+tocList.addEventListener('scroll', () => { tocKeepScroll = tocList.scrollTop; }, { passive: true });
 editor.addEventListener('scroll', scheduleTocHighlight, { passive: true });
 
 // ============ 面板拖拽调整宽度 ============
