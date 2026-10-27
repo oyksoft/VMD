@@ -2723,7 +2723,7 @@ function mapHeadingLines(sourceText) {
     // 这就是「标题到 1000 个就必卡、几百个还能接受」的原因（n² 增长）。
     //
     // 现在：预先把源码标题按「层级 + 规范化文字」分组，查找 O(1)。
-    const byKey = new Map();     // "层级 文字" → 源码标题下标队列（按出现顺序）
+    const byKey = new Map();     // "层级\u0000文字" → 源码标题下标队列（按出现顺序）
     for (let k = 0; k < src.length; k++) {
         const key = src[k].level + '\u0001' + normalizeHeadingText(src[k].text);
         let q = byKey.get(key);
