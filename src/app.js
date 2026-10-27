@@ -1335,18 +1335,15 @@ function applyScrollToEditor() {
     const passed = wrapRect.top - elRect.top;          // 正数 = 视口顶在锚点上方
     const frac = elRect.height > 0 ? Math.max(0, Math.min(passed / elRect.height, 1)) : 0;
     let line = lineOfCharInBlock(a, frac);
-    // 源码那边滚不到这么远 → 两边一起到底（否则会分叉）
+    // 源码那边滚不到这么远（预览渲染后比源码高）→ **编辑区原地不动，预览继续走**
+    // ⚠️ 这里**不能**把编辑区钳制到底再往下设：
+    //    钳制会让 scrollTop 变一点点 → 触发编辑区的 scroll 事件 → 预览又被拽回去
+    //    → 滚轮溢出只生效一次（实测 +120 而不是 +960）。
+    //    编辑区反正已经到底了，保持原样最干净。
     const maxLine = Math.floor((maxEdit - padTop) / lh);
     if (line > maxLine) {
-        line = maxLine;
-        const last = anchorAtLine(maxLine);
-        if (last) {
-            const lw = previewScroll.getBoundingClientRect();
-            const lr = last.el.getBoundingClientRect();
-            const maxPrev = previewScroll.scrollHeight - previewScroll.clientHeight;
-            const t = previewScroll.scrollTop + (lr.top - lw.top) - 8;
-            setScrollTop(previewScroll, Math.max(0, Math.min(t, maxPrev)));
-        }
+        updateAlignedChapter();
+        return;                      // 编辑区不动 → 不会触发反向同步 → 预览自由滚
     }
     // 幂等保护：已经在那一行就不动
     const wantPos = Math.min(Math.ceil(line * lh + padTop), maxEdit);
@@ -1383,6 +1380,19 @@ function applyScrollToEditorByBlock() {
     if (line > maxLine) line = maxLine;
     scrollEditorToLine(line);          // 它会补上 paddingTop
 }
+
+// 编辑区已经到底、但预览区还有内容时，滚轮要能继续往下走。
+// ⚠️ 编辑区到底后 scrollTop 不再变 → 浏览器**不再触发 scroll 事件** →
+//    只靠 scroll 事件是收不到这个信号的，必须监听 wheel。
+editor.addEventListener('wheel', (e) => {
+    if (!settings.scrollSync) return;
+    const maxEdit = editor.scrollHeight - editor.clientHeight;
+    if (e.deltaY > 0 && maxEdit > 0 && editor.scrollTop >= maxEdit - 1) {
+        // 编辑区到底了 → 把这次滚动交给预览区
+        previewScroll.scrollTop += e.deltaY;
+        e.preventDefault();
+    }
+}, { passive: false });
 
 editor.addEventListener('scroll', () => {
     // 高亮层要跟着滚（单独一个 listener：滚动同步有回弹抑制，
