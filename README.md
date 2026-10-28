@@ -1,6 +1,6 @@
 # VMD · 一个轻量的 Markdown 编辑器（带实时预览）
 
-[![version](https://img.shields.io/badge/version-0.2.7-blue)](https://github.com/oyksoft/VMD)
+[![version](https://img.shields.io/badge/version-0.2.8-blue)](https://github.com/oyksoft/VMD)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4?logo=windows)](https://github.com/oyksoft/VMD)
 [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/oyksoft/VMD)
 
@@ -341,7 +341,7 @@ cargo build --release
 mkdir ..\release -Force | Out-Null
 copy /y target\release\vmd.exe ..\release\VMD.exe
 cd ..\release
-Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.7-win64-portable.zip -Force
+Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.8-win64-portable.zip -Force
 ```
 
 > touch `tauri.conf.json` 这步别漏 —— `tauri-build` 只监听配置文件的变化，

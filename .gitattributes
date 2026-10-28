@@ -1,0 +1,21 @@
+# 统一按文本处理 —— 避免个别文件被 git 误判成二进制。
+#
+# ⚠️ app.js 之前被 git 当成二进制（w/-text）：后果是**行尾不会被规范化**，
+#    仓库里存的是 CRLF、工作区也是 CRLF，而 diff 是逐字节比较的
+#    → 每次改几行，diff 却显示全文变更（6100+ 行），根本看不出改了什么。
+#
+# 显式声明 text eol=lf 之后：
+#   - 仓库里统一存 LF（不依赖 core.autocrlf 的启发式）
+#   - 工作区也用 LF，跨平台一致
+#   - diff 永远只显示真实改动
+* text=auto
+
+*.js   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+*.rs   text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf

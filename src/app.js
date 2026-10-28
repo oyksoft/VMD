@@ -6128,4 +6128,4 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         sel.removeAllRanges();
         sel.addRange(range);
     }
-})();
+})();
