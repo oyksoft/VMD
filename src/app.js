@@ -552,43 +552,50 @@ function readSelection() {
 }
 
 /** 字符偏移 → DOM Range */
-function rangeOfOffset(off) {
+function locateOffset(off) {
     const line = lineOfOffset(off);
     const el = editorLineEls[line];
-    const r = document.createRange();
-    if (!el) { r.selectNodeContents(edEl); r.collapse(true); return r; }
+    if (!el) return { node: edEl, offset: 0 };
     const lineStart = editorLineStarts[line] || 0;
-    let col = Math.max(0, off - lineStart);
+    const col = Math.max(0, off - lineStart);
     // 行内找到第 col 个字符
     const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
     let n, acc = 0;
     while ((n = walker.nextNode())) {
         const len = n.nodeValue.length;
-        if (acc + len >= col) {
-            r.setStart(n, col - acc);
-            r.setEnd(n, col - acc);
-            return r;
-        }
+        if (acc + len >= col) return { node: n, offset: col - acc };
         acc += len;
     }
-    r.selectNodeContents(el);
-    r.collapse(false);
-    return r;
+    const last = el.lastChild;
+    if (last && last.nodeType === 3) return { node: last, offset: last.nodeValue.length };
+    return { node: el, offset: 0 };
 }
 
 /** 设置选区（字符偏移） */
+/**
+ * 设置选区（字符偏移）。
+ *
+ * ⚠️ **必须用一个「跨越起止」的 Range**。
+ *    之前是两个**折叠**的 Range（起点一个、终点一个）→ 浏览器只保留最后一个
+ *    → 选区塌缩成零宽 → 「加粗后选中的文字不再选中，没法再点一次取消加粗」。
+ *    （<textarea> 的 setSelectionRange(a,b) 天然有范围，所以改造前没这问题。）
+ */
 function setSelRange(start, end) {
     const sel = window.getSelection();
     if (!sel) return;
     try {
-        sel.removeAllRanges();
-        sel.addRange(rangeOfOffset(start));
-        if (end !== start) {
-            const r2 = rangeOfOffset(end);
-            sel.removeAllRanges();
-            sel.addRange(rangeOfOffset(start));
-            sel.addRange(r2);
+        const a = locateOffset(start);
+        const b = locateOffset(end);
+        const r = document.createRange();
+        if (b.node === a.node && b.offset < a.offset) {
+            r.setStart(b.node, b.offset);
+            r.setEnd(a.node, a.offset);
+        } else {
+            r.setStart(a.node, a.offset);
+            r.setEnd(b.node, b.offset);
         }
+        sel.removeAllRanges();
+        sel.addRange(r);
     } catch (e) { /* 忽略 */ }
     selStartOff = start; selEndOff = end;
 }
@@ -655,10 +662,26 @@ function syncModelFromDom() {
 const editor = {
     // ⚠️ 读之前先同步 —— 保证调用方拿到的永远是 DOM 的真实内容
     get value() { syncModelNow(); return editorText; },
+    /** 只读地取文本（不触发同步）—— 内部自用，避免递归 */
+    get rawValue() { return editorText; },
     set value(v) { setEditorText(String(v)); },
     get selectionStart() { syncModelNow(); readSelection(); return selStartOff; },
     get selectionEnd() { syncModelNow(); readSelection(); return selEndOff; },
-    setSelectionRange(a, b) { setSelRange(a, b); },
+    /**
+     * 设置选区（字符偏移）。
+     *
+     * ⚠️ **必须先同步模型**。
+     *    典型场景：格式化（加粗/斜体…）是
+     *        execCommand('insertText', '**') → DOM 立刻变了（多了 4 个字符）
+     *        → 但模型是 rAF 延后同步的，**此刻还是旧的**
+     *        → 用旧 offset 去新 DOM 里定位 → **选区错位或直接丢失**
+     *        （表现：点完加粗，选中的文字不再选中，没法再点一次取消加粗）。
+     *    同步之后再算位置，offset 才对应得上。
+     */
+    setSelectionRange(a, b) {
+        syncModelNow();
+        setSelRange(a, b);
+    },
     select() { setSelRange(0, editorText.length); },
     focus(o) { edEl.focus(o); },
     blur() { edEl.blur(); },
@@ -998,6 +1021,8 @@ function formatSelection(kind) {
     const unwrapped = unwrapFormat(sel, kind);
     if (unwrapped !== null) {
         replaceSelectionKeepingUndo(unwrapped, s, e);
+        // ⚠️ setSelectionRange 内部会先同步模型 → offset 对应新 DOM ✓
+        //    （原来这里用旧模型的 offset → 选区跑掉了，用户没法再点一次取消加粗）
         editor.setSelectionRange(s, s + unwrapped.length);
         editor.focus({ preventScroll: true });
         return true;
