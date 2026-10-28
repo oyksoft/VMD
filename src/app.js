@@ -3361,27 +3361,47 @@ let editorScrollLeft = 0;
  * ⚠️ 用 setTimeout(0) 解锁：scroll 事件在同一帧的“渲染前”派发，
  *    宏任务在渲染之后 → 顺序是对的。
  */
+/**
+ * 程序设置某个滚动容器的位置。
+ *
+ * ⚠️ 读 el.scrollTop 会强制重排（布局脏时几百毫秒）——
+ *    **但这里的调用点全在 scroll handler / 用户手势里**，
+ *    那时浏览器已经算好布局，读是**免费**的。
+ *    ⚠️ 千万别为了"省一次读"把位置校验去掉：
+ *    那样用户的滚动会被误判成"程序同步的回弹"而**吞掉**
+ *    → 预览区滚动了但编辑区不跟随（这个 bug 犯过一次）。
+ *
+ * @param el   滚动容器
+ * @param pos  想设到的位置
+ */
 function setScrollTop(el, pos) {
-    // ⚠️ **只写不读** —— 读 el.scrollTop 会强制重排（布局脏时 = 几百毫秒）。
-    //    这里原本还要读一次来判断「有没有真的动」，那个判断不值得付这个代价。
+    const before = el.scrollTop;
     el.scrollTop = pos;
-    // ⚠️ **不要**在这里更新 editorScrollTop —— pos 是「想设到哪」，
-    //    浏览器可能钳制它（超出范围时会变成边界值）→ 缓存和真实值对不上
-    //    → 同步逻辑会反复"纠正" → 乒乓循环。
-    //    真实值由 scroll 事件里的读取来更新（那时布局已算好，读是免费的）。
-    pendingEcho.push({ el, pos });
+    const after = el.scrollTop;
+    if (after === before) return;      // 没动 → 不会有 scroll 事件 → 不用记
+    // ⚠️ 记**实际值**（不是目标值）—— 浏览器可能钳制它（超出范围时变成边界值）。
+    //    记目标值会让回弹的位置对不上 → 回弹抑制失效 → 乒乓循环。
+    if (el === editor) { editorScrollTop = after; editorScrollLeft = el.scrollLeft; }
+    pendingEcho.push({ el, pos: after });
     if (pendingEcho.length > 12) pendingEcho.shift();
 }
 
 /** 这个 scroll 事件是不是程序同步引起的回弹？是的话吃掉它并返回 true */
+/**
+ * 这次 scroll 事件是不是「程序自己同步过来的回弹」？
+ *
+ * ⚠️ **必须校验位置**：只按「谁被设置过」判定的话，
+ *    程序同步过一次之后，用户接下来的滚动会被误判成回弹而**吞掉**
+ *    → 预览区滚动了但编辑区不跟随。
+ *
+ * ⚠️ 读 el.scrollTop 会不会强制重排？—— **不会**：
+ *    本函数**只在 scroll handler 里调用**，那时浏览器已经算好布局，读是免费的。
+ *    （真正会强制重排的是在 input handler 里读 —— 那是另一回事，别混。）
+ */
 function isEchoScrollEvent(el) {
-    // ⚠️ **不读 el.scrollTop** —— 那是强制重排的元凶（见 editorScrollTop 的注释）。
-    //    改成按「谁被设置过」判定：pendingEcho 里记的是我们要设到哪，
-    //    对应的那次 scroll 事件就是回弹。
-    //    ⚠️ 位置不再校验 → 极端情况下可能把一次用户滚动误判成回弹（丢一次滚动），
-    //    这比卡死好得多；正常情况下回弹位置就是我们要设的位置。
     for (let i = pendingEcho.length - 1; i >= 0; i--) {
-        if (pendingEcho[i].el === el) {
+        const p = pendingEcho[i];
+        if (p.el === el && Math.abs(el.scrollTop - p.pos) < 2) {
             pendingEcho.splice(i, 1);     // 一次性消费
             return true;
         }
