@@ -1623,8 +1623,6 @@ let anchorList = [];   // [{el, line, endLine, block, top, height}]
 // 目录的滚动位置（scroll 事件里缓存 —— 那时布局已算好，读 scrollTop 是免费的）
 let tocKeepScroll = 0;
 let anchorsDirty = true;   // 渲染后位置会变 → 滚动时再重测，按源码行升序
-/** 光标所在行（渲染时算好，等位置表测好后用来跟随）—— -1 = 没有待跟随的光标 */
-let pendingCaretLine = -1;
 
 /** 顶层块 → 真正的内容元素（表格被包进了 .table-wrap，代码块被包进了 .code-block） */
 function contentElementOf(el) {
@@ -1709,15 +1707,6 @@ function scheduleAnchorMeasure() {
         refreshPreviewScrollMax();
         buildAnchorTable();      // 预览 DOM 变了 → 重建行级锚点表
         ensureAnchorPositions(); // 顺带测位置（浏览器这一帧本来就要重排）
-        // ★ **光标跟随必须在这里补一次** ——
-        //   渲染时（renderPreview）位置表还是脏的，followCaretInPreview() 直接 return，
-        //   当时的位置表测好后**没人再调用它** → 「光标跟随」设置项形同虚设。
-        //   现在位置表测好了（anchorsDirty 已被 buildAnchorTable 清掉）→ 跟得上。
-        if (pendingCaretLine >= 0) {
-            const ln = pendingCaretLine;
-            pendingCaretLine = -1;
-            followCaretInPreview(ln);
-        }
     });
 }
 
@@ -2394,15 +2383,9 @@ function renderPreview() {
     previewRenderedBase = baseDir;
     // 内容整个换了 → 编辑区高度缓存失效
     scheduleEditorScrollMax();
-    // 预览 DOM 刚变 → 位置表已失效，**立刻标脏**（必须在 followCaretInPreview 之前，
-    // 否则它会以为位置还是准的 → 同步测位置 → 强制全局重排 → 卡死）
+    // 预览 DOM 刚变 → 位置表已失效，**立刻标脏**
     anchorsDirty = true;
     updateSelToolbar();   // 换文件后选区没了，浮动工具栏要收起来
-    // ⚠️ **光标行号要在标脏之前算好**（用缓存的模型 + 行首表二分，O(log n)，
-    //    不读 DOM —— 读 DOM 会强制同步整个编辑区，几百毫秒）。
-    //    位置表还没测好（anchorsDirty）→ 现在跟不了 → 存下来，下一帧测好再用。
-    pendingCaretLine = lineIndexAtPos(editorText, selStartOff);
-    followCaretInPreview(pendingCaretLine);   // 光标所在的内容要能在预览里看见
     // ⚠️ 锚点表 + 位置测量**都不能在输入路径里同步做**：
     //    - 遍历 1.2 万个块建表：几百毫秒
     //    - 测位置会强制整个预览（1.2 万个元素）重新布局：几百毫秒
@@ -2411,52 +2394,6 @@ function renderPreview() {
     scheduleAnchorMeasure();
 }
 
-/**
- * 光标跟随：输入后，预览区滚到光标所在的那个块（不在视口内时才动）。
- *
- * 为什么要这个：块级锚点解决的是“滚动时两边对齐”，
- * 但用户**输入**时预览不会自己跟过去 —— 写着写着，预览停在了老地方，
- * 看不到自己刚写的内容（这正是“编辑了但阅读区不在那个区域”）。
- *
- * 只在光标块**完全不在视口内**时才动 —— 用户主动滚去看别处时，
- * 只要光标那块还看得见，就不去打断他。
- */
-function followCaretInPreview(caretLine) {
-    if (!settings.followCaret || !previewScroll) return;
-    if (!blockLines.length || preview.children.length !== blockLines.length) return;
-    // ⚠️ 位置表还没测好（刚渲染完）→ 别在这里同步测位置：
-    //    那会强制整个预览（1.2 万个元素）重新布局 → 几百毫秒 → 打字卡死。
-    //    下一帧（scheduleAnchorMeasure）测好后会自动跟上。
-    if (anchorsDirty) return;
-    const { lh } = editorMetrics();
-    if (!lh) return;
-    // ⚠️ 光标行号由调用方给（渲染时算好存下来）。
-    //    这里**不能**自己读 editor.selectionStart —— 那会触发 syncModelNow()
-    //    → readTextFromDom() 遍历整个编辑区 DOM（1MB 文档 = 30458 个行元素）
-    //    → 几百毫秒 → 打字卡死。
-    const line = (caretLine != null && caretLine >= 0)
-        ? caretLine
-        : lineIndexAtPos(editorText, selStartOff);
-    const k = blockIndexAtLine(line);
-    if (k < 0) return;
-    const el = preview.children[k];
-    if (!el) return;
-    // ⚠️ 用锚点表里缓存的位置，**不要**在这里调 getBoundingClientRect ——
-    //    渲染后布局是脏的，读它会强制整个预览（1.2 万个元素）重新布局 → 几百毫秒 → 卡死。
-    if (anchorsDirty) return;      // 位置表还没测好 → 下一帧再跟随
-    ensureAnchorPositions();
-    const wrapTop = previewScroll.scrollTop;
-    const rTop = elTopInContent(el);
-    const rBottom = rTop + (elHeightInContent(el) || 0);
-    // 已经能看到这个块 → 不动（别打断用户）
-    const visible = rBottom > wrapTop && rTop < wrapTop + previewClientH;
-    if (visible) return;
-    const target = rTop < wrapTop
-        ? rTop - 12
-        : rBottom - previewClientH + 12;
-    // 被程序设了滚动位置 → 预览接下来的 scroll 事件是回弹，要忽略
-    setScrollTop(previewScroll, target);
-}
 
 /** 当前 markdown 文件所在目录（本地相对路径图片的解析基准） */
 function currentBaseDir() {
@@ -5046,7 +4983,6 @@ let settings = {
     ctxMenu: true,      // VMD 自己的右键菜单
     zoom: 100,          // 文字缩放（%）
     codeWrap: true,     // 预览区代码自动换行
-    followCaret: true,  // 输入时预览区跟着光标走
     scrollSync: true,   // 编辑区与预览区滚动同步
 };
 
@@ -5073,7 +5009,6 @@ function loadSettings() {
     // 代码换行默认开（旧设置文件里没这个字段 → 当作开）
     settings.codeWrap = settings.codeWrap !== false;
     // 光标跟随默认开
-    settings.followCaret = settings.followCaret !== false;
     // 滚动同步默认开
     settings.scrollSync = settings.scrollSync !== false;
     let z = Number(settings.zoom);
@@ -5128,12 +5063,6 @@ function applyCodeWrap() {
     document.documentElement.classList.toggle('code-wrap', !!settings.codeWrap);
 }
 
-/** 光标跟随（立即生效） */
-function setFollowCaret(v) {
-    settings.followCaret = v === '1';
-    saveSettings();
-    syncSettingsUI();
-}
 
 /** 编辑区与预览区的滚动同步（立即生效） */
 function setScrollSync(v) {
@@ -5162,9 +5091,6 @@ function syncSettingsUI() {
     });
     document.querySelectorAll('#set-wrap .seg-btn').forEach(b => {
         b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.codeWrap);
-    });
-    document.querySelectorAll('#set-follow .seg-btn').forEach(b => {
-        b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.followCaret);
     });
     document.querySelectorAll('#set-sync .seg-btn').forEach(b => {
         b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.scrollSync);
@@ -5229,10 +5155,6 @@ document.querySelectorAll('#set-ctx .seg-btn').forEach(b => {
 // 预览区代码自动换行（立即生效）
 document.querySelectorAll('#set-wrap .seg-btn').forEach(b => {
     b.addEventListener('click', () => setCodeWrap(b.dataset.v));
-});
-// 输入时预览跟着光标走（立即生效）
-document.querySelectorAll('#set-follow .seg-btn').forEach(b => {
-    b.addEventListener('click', () => setFollowCaret(b.dataset.v));
 });
 // 编辑区与预览区的滚动同步（立即生效）
 document.querySelectorAll('#set-sync .seg-btn').forEach(b => {
