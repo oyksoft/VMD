@@ -351,7 +351,7 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.8-win64-porta
 
 ## 更新日志
 
-### 0.2.8（当前）
+### 0.2.8
 
 **中文输入法卡死的根治** —— 编辑区从 `<textarea>` 换成了 `contenteditable`。
 
@@ -380,6 +380,10 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.8-win64-porta
 - 🐛 **浮动工具栏不显示 / 位置跑到别处** —— 三个独立原因：
   选区变化事件（`selectionchange`）、焦点判断、空行高度。
 - 🐛 **CRLF 行尾的文件，所有字符偏移都错位** —— 模型里留着 `\r`，DOM 里没有。
+- 🐛 **编辑区遇到 HTML 标签就中断** —— 打开含 `<textarea>` 这类标签的文档（比如本文件的更新日志），
+  编辑区从那一行开始后面的内容全被吞进去，整个编辑区错乱。
+  原因是文件里有两个同名 `escapeHtml` 函数，生效的是那个**没做转义**的空操作版本 →
+  含标签的行被浏览器当成真标签解析（`<textarea>` 是原始文本元素，后面全被吞）。
 
 **弹窗重新设计** —— 关闭询问的「不保存 / 取消 / 保存」三个按钮原来大小、字重完全不一致，
 并排看着歪歪扭扭。现在**统一尺寸**，靠语义分层：主操作实心主题色、次操作描边、
