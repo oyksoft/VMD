@@ -3739,10 +3739,6 @@ function updateFilename() {
     scheduleEditorStatus();
 }
 
-function escapeHtml(s) {
-    return s.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>');
-}
-
 // ============ 文件 I/O ============
 
 // ---- 阅读 / 编辑模式切换（分段控件）----
