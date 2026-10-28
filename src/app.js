@@ -895,7 +895,11 @@ editor.addEventListener('input', (e) => {
     }
     updateFilename();
     // 内容变了 → 编辑区的可滚动高度也变了 → 下一帧（浏览器排好版之后）重算缓存
-    scheduleEditorScrollMax();
+    // ⚠️ **必须包一层 rAF** —— setEditorText() 会被**模块顶层**的
+    //    `editor.value = ...` 触发，那时 `let editorScrollMaxRaf`（声明在后面）
+    //    **还没初始化** → TDZ 报错 → 整个脚本挂掉、界面全白。
+    //    rAF 回调在整个脚本执行完之后才跑，那时所有 let/const 都已就绪。
+    requestAnimationFrame(() => scheduleEditorScrollMax());
     schedulePreviewRender();
     // 查找栏开着时文本变了 → 匹配位置也跟着变，重算 + 重画高亮
     if (findBar && findBar.classList.contains('open')) {
@@ -1909,7 +1913,13 @@ function refreshPreviewScrollMax() {
 function applyScrollByRatio(fromEditor) {
     // ⚠️ 用缓存值，别在这里读 scrollHeight —— 那会强制重排整个预览 DOM。
     if (!previewScrollMax) refreshPreviewScrollMax();
-    const maxEdit = editorScrollMax;
+    // ⚠️ 缓存可能是 0（刚打开文件 / 刚切模式，还没量过）→ 实时算一次。
+    //    不然这里直接 return → 预览区滚动了编辑区却不动。
+    let maxEdit = editorScrollMax;
+    if (maxEdit <= 0 && editor) {
+        maxEdit = Math.max(0, editor.scrollHeight - editor.clientHeight);
+        editorScrollMax = maxEdit;
+    }
     const maxPrev = previewScrollMax;
     if (maxEdit <= 0 || maxPrev <= 0) return;
     if (fromEditor) {
@@ -2042,7 +2052,14 @@ function applyScrollToPreviewByBlock() {
 function applyScrollToEditor() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
-    const maxEdit = editorScrollMax;
+    // ⚠️ 缓存还没算出来（刚打开文件 / 刚切模式）→ 实时算一次。
+    //    不然 maxLine = (0 - padTop) / lh = -1 → `line > maxLine` 永远成立
+    //    → 预览区滚动时编辑区永远不动。
+    let maxEdit = editorScrollMax;
+    if (maxEdit <= 0) {
+        maxEdit = Math.max(0, editor.scrollHeight - editor.clientHeight);
+        editorScrollMax = maxEdit;
+    }
     if (!lh || !anchorList.length) { applyScrollByRatio(false); return; }
 
     // 锚点 = 预览视口顶部所在的元素（**精确查表**）
@@ -3772,6 +3789,18 @@ function setEditMode(on) {
     document.documentElement.classList.toggle('read-mode', !on);
     segBtns.forEach(b => b.classList.toggle('is-active', (b.dataset.mode === 'edit') === on));
     applyWidths();
+    // ⚠️ 阅读 ↔ 编辑切换时，编辑区从隐藏变回来（尺寸、位置、
+    //    可滚动高度全都变了）→ 缓存必须刷新，否则：
+    //      - editorScrollMax 还是旧值/0 → 滚动同步里 maxLine 算错
+    //        → 预览区滚动时编辑区不跟随
+    //      - editorBox 还是旧位置 → 浮动工具栏位置错
+    //    ⚠️ 用 setTimeout 而不是 rAF：rAF 回调在**渲染前**执行，
+    //    这时 display 刚切回来、布局还没重算 → 读 scrollHeight 仍是旧值(0)。
+    setTimeout(() => {
+        refreshEditorBox();
+        refreshEditorLineHeight();
+        scheduleEditorScrollMax();
+    }, 0);
     // 查找栏开着时，目标区域跟着模式变（编辑→查源码，阅读→查正文）
     const fb = document.getElementById('find-bar');
     if (fb && fb.classList.contains('open')) {
