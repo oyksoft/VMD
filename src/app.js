@@ -1878,9 +1878,13 @@ function applyScrollByRatio(fromEditor) {
     if (fromEditor) {
         const target = (editorScrollTop / maxEdit) * maxPrev;
         setScrollTop(previewScroll, target);
+        updateAlignedChapter();     // 兜底路径也要更新目录高亮
     } else {
         const target = (previewScroll.scrollTop / maxPrev) * maxEdit;
         setScrollTop(editor, target);
+        // 反向：按比例推算出的源码行 → 更新目录高亮
+        const { lh, padTop } = editorMetrics();
+        if (lh) updateAlignedChapter(Math.floor((target - padTop) / lh));
     }
 }
 
@@ -2019,14 +2023,16 @@ function applyScrollToEditor() {
     //    编辑区反正已经到底了，保持原样最干净。
     const maxLine = Math.floor((maxEdit - padTop) / lh);
     if (line > maxLine) {
-        updateAlignedChapter();
+        updateAlignedChapter(line);
         return;                      // 编辑区不动 → 不会触发反向同步 → 预览自由滚
     }
     // 幂等保护：已经在那一行就不动
     const wantPos = Math.min(Math.ceil(line * lh + padTop), maxEdit);
-    if (Math.abs(editorScrollTop - wantPos) < 2) { updateAlignedChapter(); return; }
+    if (Math.abs(editorScrollTop - wantPos) < 2) { updateAlignedChapter(line); return; }
     scrollEditorToLine(line);
-    updateAlignedChapter();
+    // ⚠️ 用刚算出的 line —— 编辑区的 scroll 事件还没派发，
+    //    editorScrollTop 还是旧值，用它算章节会得到错的高亮。
+    updateAlignedChapter(line);
 }
 
 /** 块级对齐（文档没有标题时的兜底） */
@@ -3212,10 +3218,19 @@ let alignedIdx = -1;
  * 目录高亮跟**当前对齐位置的章节**走。
  * 两边同步后对齐的是同一个位置 → 目录高亮和预览内容必然对得上。
  */
-function updateAlignedChapter() {
-    // 对齐位置的章节 = 编辑区顶行所属的章节
-    // （编辑区和预览区是同步的，顶行变了就是章节变了）
-    const k = headingIndexAtLine(editorTopLine());
+/**
+ * 更新「当前对齐到哪一节」并刷新目录高亮。
+ *
+ * ⚠️ **line 参数很重要**：从**预览区**方向同步过来时，
+ *    我们刚算出对应的源码行（line），但编辑区的滚动位置**还没更新**
+ *    （scroll 事件是异步派发的，editorScrollTop 缓存还是旧的）。
+ *    这时如果用 editorTopLine() 去算章节，拿到的是旧位置 → **目录高亮不动**
+ *    （实测：预览区滚动后目录高亮卡在原处）。
+ *    所以方向不同就传对应的行号。
+ */
+function updateAlignedChapter(line) {
+    const ln = (line === undefined) ? editorTopLine() : line;
+    const k = headingIndexAtLine(ln);
     if (k >= 0) alignedIdx = k;
     updateTocHighlight();
 }
