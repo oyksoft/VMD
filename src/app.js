@@ -221,7 +221,7 @@ async function askSaveChanges() {
     rest.textContent = '有未保存的修改。';
     body.appendChild(rest);
     const choice = await showDialog({
-        title: '要保存修改吗？',
+        title: '要保存这些修改吗？',
         icon: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>',
         body: body,
         okText: '保存',
@@ -5280,20 +5280,27 @@ function renderDialog(opts) {
     const alwaysBtn = document.getElementById('modal-always');
     okBtn.textContent = opts.okText || '确定';
     cancelBtn.textContent = opts.cancelText || '取消';
-    // 第三个按钮（"以后自动重载"）只在需要时显示
+    // 第三个按钮（"不保存" / "以后自动重载"）只在需要时显示
     if (opts.alwaysText) {
         alwaysBtn.textContent = opts.alwaysText;
         alwaysBtn.style.display = 'inline-block';
     } else {
         alwaysBtn.style.display = 'none';
     }
-    // 「不保存」这类会丢数据的操作 → 红色描边（默认是弱化的文字按钮）
-    alwaysBtn.classList.toggle('modal-btn-danger', !!opts.alwaysDanger);
-    alwaysBtn.classList.toggle('modal-btn-text', !opts.alwaysDanger);
-    // 只有一个按钮的面板（设置面板用）
+    // ⚠️ 三个按钮**大小一致**，靠语义分层（不是靠大小）：
+    //    主动作「保存」= 实心主题色；「取消」= 描边；「不保存」= 无框文字 + 红色。
+    alwaysBtn.classList.toggle('dlg-btn-danger', !!opts.alwaysDanger);
+    alwaysBtn.classList.toggle('dlg-btn-ghost', !opts.alwaysDanger);
+    // 只有一个按钮的面板（错误提示用）
     cancelBtn.style.display = opts.hideCancel ? 'none' : 'inline-block';
+    // 主按钮默认聚焦（键盘用户按回车就是它），
+    // 但「不保存」这种破坏性操作**不聚焦** —— 免得手一抖回车就把改动丢了。
+    if (opts.alwaysDanger && opts.hideCancel) {
+        cancelBtn.focus();
+    } else {
+        okBtn.focus();
+    }
     mask.style.display = 'flex';
-    okBtn.focus();
 }
 
 /** 弹出队列里的下一个（当前没有弹窗在显示时才会调） */

@@ -1146,21 +1146,47 @@ html.code-wrap #preview table th code {
     -webkit-backdrop-filter: blur(2px);
 }
 .modal {
-    min-width: 340px;
-    max-width: 460px;
-    padding: 22px 24px 18px;
+    position: relative;
+    min-width: 400px;
+    max-width: 520px;
+    padding: 30px 32px 24px;
+    overflow: hidden;              /* 让顶部高光条不溢出圆角 */
     /* 玻璃质感：半透明底 + 高光渐变 + 顶部内高光边（玻璃感主要来自这三处） */
     background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.14), transparent 60%),
-        color-mix(in srgb, var(--bg-elevated) 88%, transparent);
+        linear-gradient(180deg, rgba(255, 255, 255, 0.16), transparent 55%),
+        color-mix(in srgb, var(--bg-elevated) 90%, transparent);
     border: 1px solid var(--border-soft);
-    border-radius: 14px;
+    border-radius: 18px;
     box-shadow:
-        0 18px 48px rgba(0, 0, 0, 0.38),
-        inset 0 1px 0 rgba(255, 255, 255, 0.16);
+        0 32px 80px rgba(0, 0, 0, 0.42),
+        0 8px 24px rgba(0, 0, 0, 0.28),
+        inset 0 1px 0 rgba(255, 255, 255, 0.18);
     color: var(--text);
-    backdrop-filter: blur(20px) saturate(180%);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    backdrop-filter: blur(28px) saturate(190%);
+    -webkit-backdrop-filter: blur(28px) saturate(190%);
+    /* 弹窗出现：轻微浮起 + 淡入（不是主题切换，所以可以有动画） */
+    animation: modal-in .18s cubic-bezier(.2, .9, .3, 1);
+}
+@keyframes modal-in {
+    from { opacity: 0; transform: translateY(10px) scale(.97); }
+    to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .modal { animation: none; }
+}
+/* 顶部一道极细的渐变高光条 —— "浮在内容之上"的精致感主要来自它 */
+.modal-sheen {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg,
+        transparent,
+        color-mix(in srgb, var(--accent) 70%, transparent) 22%,
+        color-mix(in srgb, var(--accent) 95%, white 20%) 50%,
+        color-mix(in srgb, var(--accent) 70%, transparent) 78%,
+        transparent);
+    opacity: .8;
+    pointer-events: none;
 }
 /* 浅色主题：白底高光压亮一点，不然整个面板看着发灰、字也不够清楚。
    主题是用 CSS 变量挂在 :root 上的（没有主题类名），所以靠 --bg-elevated
@@ -1168,17 +1194,18 @@ html.code-wrap #preview table th code {
 .modal {
     background:
         linear-gradient(180deg,
-            color-mix(in srgb, white 14%, transparent), transparent 60%),
-        color-mix(in srgb, var(--bg-elevated) 88%, transparent);
+            color-mix(in srgb, white 16%, transparent), transparent 55%),
+        color-mix(in srgb, var(--bg-elevated) 90%, transparent);
 }
 .modal-title {
     display: flex;
     align-items: center;
-    gap: 10px;
-    font-size: 15px;
-    font-weight: 600;
+    gap: 12px;
+    font-size: 16.5px;
+    font-weight: 650;
+    letter-spacing: .2px;
     color: var(--text-strong);
-    margin-bottom: 12px;
+    margin-bottom: 14px;
 }
 .modal-title-text { flex: 1 1 auto; }
 /* 标题图标：圆形底 + 居中字形。用 mask 渲染 → 单色、跟随主题色、任意尺寸都清晰 */
@@ -1187,22 +1214,34 @@ html.code-wrap #preview table th code {
     display: none;
     align-items: center;
     justify-content: center;
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    width: 34px;
+    height: 34px;
+    border-radius: 11px;
+    background:
+        linear-gradient(160deg,
+            color-mix(in srgb, var(--accent) 26%, transparent),
+            color-mix(in srgb, var(--accent) 10%, transparent));
+    border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+    box-shadow:
+        0 2px 8px color-mix(in srgb, var(--accent) 18%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, .22);
     color: var(--accent);
 }
-.modal-title-icon svg { width: 14px; height: 14px; display: block; }
+.modal-title-icon svg { width: 18px; height: 18px; display: block; }
 .modal-title-icon.danger {
-    background: color-mix(in srgb, var(--danger) 15%, transparent);
-    border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+    background:
+        linear-gradient(160deg,
+            color-mix(in srgb, var(--danger) 26%, transparent),
+            color-mix(in srgb, var(--danger) 10%, transparent));
+    border-color: color-mix(in srgb, var(--danger) 36%, transparent);
+    box-shadow:
+        0 2px 8px color-mix(in srgb, var(--danger) 18%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, .22);
     color: var(--danger);
 }
 .modal-body {
-    font-size: 13px;
-    line-height: 1.7;
+    font-size: 14px;
+    line-height: 1.85;
     color: var(--text);
     word-break: break-all;
 }
@@ -1230,16 +1269,17 @@ html.code-wrap #preview table th code {
 .modal-actions {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-top: 20px;
+    gap: 10px;
+    margin-top: 26px;
+    padding-top: 18px;
+    /* 按钮区和正文之间一条极淡的分隔线 —— 让层次更清楚 */
+    border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
 }
-.modal-btn-text {
-    border-color: transparent;
-    color: var(--text-dim);
-    font-size: 12px;
-    padding: 5px 6px;
-}
-.modal-btn-text:hover { color: var(--accent); background: transparent; }
+/* 左侧的破坏性按钮和右侧主动作之间的弹性间隔 */
+.modal-actions-gap { flex: 1 1 auto; }
+/* .modal-btn —— 设置面板的按钮（"关联/添加/移除"…）在用。
+   ⚠️ 别改它的尺寸：设置面板的排版是按这个尺寸算好的。
+   弹窗自己的按钮用下面的 .dlg-btn。 */
 .modal-btn {
     padding: 6px 16px;
     border: 1px solid var(--border);
@@ -1263,15 +1303,95 @@ html.code-wrap #preview table th code {
     font-weight: 500;
 }
 .modal-btn-primary:hover { filter: brightness(1.1); background: var(--accent); }
-/* 「不保存」这类会丢数据的操作：红色描边，鼠标移上去才明显 */
-.modal-btn-danger {
-    border-color: color-mix(in srgb, var(--danger) 55%, transparent);
-    color: var(--danger);
+
+/* ============ 弹窗按钮 ============
+   三个按钮**大小、字重完全一致**，靠"语义"分层而不是靠大小区分：
+     主操作（保存）→ 实心主题色，最突出
+     次操作（取消）→ 描边
+     弱操作（不保存 / 以后自动重载）→ 无框文字按钮，鼠标移上去才显形
+   这样三个按钮并排时不会显得"大小不一、歪歪扭扭"。
+
+   ⚠️ 用**专属的 .dlg-btn**，不要复用 .modal-btn ——
+      设置面板的按钮也用了 .modal-btn，改它会连带把设置面板撑大。 */
+.dlg-btn {
+    /* 统一的尺寸：三者的 padding / 字号 / 字重完全相同 */
+    padding: 8px 20px;
+    min-height: 34px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 500;
+    line-height: 1.4;
+    letter-spacing: .3px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background .13s, border-color .13s, color .13s, box-shadow .13s, transform .08s;
 }
-.modal-btn-danger:hover {
-    background: color-mix(in srgb, var(--danger) 16%, transparent);
-    border-color: var(--danger);
+.dlg-btn:hover { background: var(--bg-elevated); }
+.dlg-btn:active { transform: translateY(0.5px); }
+.dlg-btn:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+    outline-offset: 2px;
+}
+/* 主操作：实心主题色 + 轻微立体感 */
+.dlg-btn-primary {
+    border-color: transparent;
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--accent) 92%, white),
+        var(--accent));
+    color: #fff;
+    font-weight: 600;
+    box-shadow:
+        0 2px 10px color-mix(in srgb, var(--accent) 32%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, .28);
+}
+.dlg-btn-primary:hover {
+    filter: brightness(1.07);
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--accent) 92%, white),
+        var(--accent));
+    box-shadow:
+        0 4px 16px color-mix(in srgb, var(--accent) 40%, transparent),
+        inset 0 1px 0 rgba(255, 255, 255, .3);
+}
+/* 次操作：描边 */
+.dlg-btn-secondary {
+    border-color: color-mix(in srgb, var(--border) 85%, transparent);
+    color: var(--text-dim);
+}
+.dlg-btn-secondary:hover {
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    color: var(--text);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+/* 弱操作：默认完全没有框，鼠标移上去才显形（不抢注意力，但看得见） */
+.dlg-btn-ghost {
+    border-color: transparent;
+    background: transparent;
+    color: var(--text-dim);
+    opacity: .8;
+}
+.dlg-btn-ghost:hover {
+    border-color: color-mix(in srgb, var(--border) 80%, transparent);
+    background: var(--bg-elevated);
+    color: var(--text);
+    opacity: 1;
+}
+/* 「不保存」这类会丢数据的操作：平时低调，鼠标移上去才变红 */
+.dlg-btn-danger {
+    border-color: transparent;
+    background: transparent;
     color: var(--danger);
+    opacity: .85;
+}
+.dlg-btn-danger:hover {
+    border-color: color-mix(in srgb, var(--danger) 50%, transparent);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    color: var(--danger);
+    opacity: 1;
 }
 
 /* === 拖放文件提示 === */
