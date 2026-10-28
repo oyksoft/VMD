@@ -486,6 +486,13 @@ function rebuildLineStarts(text) {
 
 /** 设置完整文本（会清空浏览器的撤销栈 —— 和 textarea 一样） */
 function setEditorText(text) {
+    // ⚠️⚠️ **换行符必须规范化**（CRLF 和 CR 都变成 LF）。
+    //    <textarea> 的 value 按 HTML 规范将 CRLF 规范化成 LF，
+    //    所以 textarea 时代「模型 == DOM」天然成立。
+    //    contenteditable 里浏览器也会把 CR 规范化成 LF（DOM 里没有 CR），
+    //    如果模型还留着 CR → **模型和 DOM 差一堆 CR** → 所有字符偏移全部错位
+    //    （实测 4000 行的 CRLF 文件差 3998 个字符 → 选区、格式化、查找全歪。
+    text = String(text).replace(/\r\n?/g, '\n');
     // ⚠️ 记住有没有焦点 —— 重建 DOM 会丢焦点，
     //    而换文件/打开文件这类操作是希望焦点还在编辑区的。
     const hadFocus = (document.activeElement === edEl);
@@ -687,6 +694,11 @@ const editor = {
     blur() { edEl.blur(); },
     addEventListener(t, f, o) { edEl.addEventListener(t, f, o); },
     removeEventListener(t, f, o) { edEl.removeEventListener(t, f, o); },
+    dispatchEvent(e) { return edEl.dispatchEvent(e); },
+    get style() { return edEl.style; },
+    get dataset() { return edEl.dataset; },
+    get tagName() { return edEl.tagName; },
+    get isContentEditable() { return edEl.isContentEditable; },
     get scrollTop() { return edEl.scrollTop; },
     set scrollTop(v) { edEl.scrollTop = v; },
     get scrollLeft() { return edEl.scrollLeft; },
@@ -6116,4 +6128,4 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         sel.removeAllRanges();
         sel.addRange(range);
     }
-})();
+})();
