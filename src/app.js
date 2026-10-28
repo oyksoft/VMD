@@ -3450,6 +3450,10 @@ function onTocItemClick(e) {
     // 编辑区精确落到对应的那一行（行号由 syncTocLines() 维护，从 dataset 读最新的）
     const line = parseInt(div.dataset.line, 10);
     if (!isNaN(line)) scrollEditorToLine(line);
+    // ⚠️ **这次点击对应的是哪个章节** —— 跳转结束后要把目录高亮挪到它身上。
+    //    （跳转期间 syncing=true，所有 scroll 事件都被忽略 → 高亮不会被更新；
+    //      不主动设置的话，目录高亮会一直停在原来那一项。）
+    const clickIdx = headingPairs.findIndex(p => p.el && p.el.id === div.dataset.id);
     // 跳转结束后解锁。这里不能再按比例同步一次 —— 那会把精确位置冲掉。
     let finished = false;
     const done = () => {
@@ -3458,6 +3462,13 @@ function onTocItemClick(e) {
         previewWrap.removeEventListener('scrollend', done);
         clearTimeout(fallback);
         syncing = false;
+        // 主动把目录高亮挪到刚点击的那一项
+        if (clickIdx >= 0) {
+            alignedIdx = clickIdx;
+            updateTocHighlight();
+        } else if (!isNaN(line)) {
+            updateAlignedChapter(line);
+        }
         // ⚠️ 校正：smooth 滚动可能没到位（被钳制 / 被打断 / 行高算错），
         //    这里按目标再对一次，直接跳到位（不再 smooth）。
         const maxPrev = previewWrap.scrollHeight - previewWrap.clientHeight;
