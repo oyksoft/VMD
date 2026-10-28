@@ -1623,6 +1623,8 @@ let anchorList = [];   // [{el, line, endLine, block, top, height}]
 // 目录的滚动位置（scroll 事件里缓存 —— 那时布局已算好，读 scrollTop 是免费的）
 let tocKeepScroll = 0;
 let anchorsDirty = true;   // 渲染后位置会变 → 滚动时再重测，按源码行升序
+/** 光标所在行（渲染时算好，等位置表测好后用来跟随）—— -1 = 没有待跟随的光标 */
+let pendingCaretLine = -1;
 
 /** 顶层块 → 真正的内容元素（表格被包进了 .table-wrap，代码块被包进了 .code-block） */
 function contentElementOf(el) {
@@ -1707,6 +1709,15 @@ function scheduleAnchorMeasure() {
         refreshPreviewScrollMax();
         buildAnchorTable();      // 预览 DOM 变了 → 重建行级锚点表
         ensureAnchorPositions(); // 顺带测位置（浏览器这一帧本来就要重排）
+        // ★ **光标跟随必须在这里补一次** ——
+        //   渲染时（renderPreview）位置表还是脏的，followCaretInPreview() 直接 return，
+        //   当时的位置表测好后**没人再调用它** → 「光标跟随」设置项形同虚设。
+        //   现在位置表测好了（anchorsDirty 已被 buildAnchorTable 清掉）→ 跟得上。
+        if (pendingCaretLine >= 0) {
+            const ln = pendingCaretLine;
+            pendingCaretLine = -1;
+            followCaretInPreview(ln);
+        }
     });
 }
 
@@ -2387,7 +2398,11 @@ function renderPreview() {
     // 否则它会以为位置还是准的 → 同步测位置 → 强制全局重排 → 卡死）
     anchorsDirty = true;
     updateSelToolbar();   // 换文件后选区没了，浮动工具栏要收起来
-    followCaretInPreview();   // 光标所在的内容要能在预览里看见
+    // ⚠️ **光标行号要在标脏之前算好**（用缓存的模型 + 行首表二分，O(log n)，
+    //    不读 DOM —— 读 DOM 会强制同步整个编辑区，几百毫秒）。
+    //    位置表还没测好（anchorsDirty）→ 现在跟不了 → 存下来，下一帧测好再用。
+    pendingCaretLine = lineIndexAtPos(editorText, selStartOff);
+    followCaretInPreview(pendingCaretLine);   // 光标所在的内容要能在预览里看见
     // ⚠️ 锚点表 + 位置测量**都不能在输入路径里同步做**：
     //    - 遍历 1.2 万个块建表：几百毫秒
     //    - 测位置会强制整个预览（1.2 万个元素）重新布局：几百毫秒
@@ -2406,7 +2421,7 @@ function renderPreview() {
  * 只在光标块**完全不在视口内**时才动 —— 用户主动滚去看别处时，
  * 只要光标那块还看得见，就不去打断他。
  */
-function followCaretInPreview() {
+function followCaretInPreview(caretLine) {
     if (!settings.followCaret || !previewScroll) return;
     if (!blockLines.length || preview.children.length !== blockLines.length) return;
     // ⚠️ 位置表还没测好（刚渲染完）→ 别在这里同步测位置：
@@ -2415,8 +2430,13 @@ function followCaretInPreview() {
     if (anchorsDirty) return;
     const { lh } = editorMetrics();
     if (!lh) return;
-    // ⚠️ selectionStart 是**字符偏移**，不是行号 —— 用行首表二分查（别 slice 整个前缀）
-    const line = lineIndexAtPos(editor.value, editor.selectionStart);
+    // ⚠️ 光标行号由调用方给（渲染时算好存下来）。
+    //    这里**不能**自己读 editor.selectionStart —— 那会触发 syncModelNow()
+    //    → readTextFromDom() 遍历整个编辑区 DOM（1MB 文档 = 30458 个行元素）
+    //    → 几百毫秒 → 打字卡死。
+    const line = (caretLine != null && caretLine >= 0)
+        ? caretLine
+        : lineIndexAtPos(editorText, selStartOff);
     const k = blockIndexAtLine(line);
     if (k < 0) return;
     const el = preview.children[k];
