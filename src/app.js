@@ -1555,6 +1555,10 @@ function replaceSelectionKeepingUndo(text, selStart, selEnd) {
     editor.value = after;
     editor.setSelectionRange(selStart, selStart + text.length);
     markEdited();
+    // ⚠️ **直接改 value 不会触发 input 事件** → 预览不会自己刷新。
+    //    必须显式排一次渲染，否则编辑器里内容变了、右边预览还是旧的
+    //    （用户会以为"格式化没生效"）。
+    schedulePreviewRender();
     return true;
 }
 
@@ -5851,7 +5855,13 @@ if (window.__TAURI__ && window.__TAURI__.event) {
 // =================== 自定义右键菜单 ===================
 (function () {
     const ctxMenu = document.getElementById('ctx-menu');
-    const editor = document.getElementById('editor');
+    // ⚠️ **不要在这里再 `const editor = document.getElementById('editor')`** ——
+    //    那会遮蔽全局的 `editor` **代理对象**，拿到的是原始 DOM 元素。
+    //    原始 contenteditable div 上：
+    //      - 没有 `readOnly` 属性（是 undefined）→ 只读模式下菜单项**不会置灰**，
+    //        而且 undo/redo/cut/paste 的只读拦截也失效（会真的改内容）
+    //      - 没有 `select()` 方法 → 点「全选」直接抛 TypeError
+    //    直接用全局代理（有 readOnly / select / focus 等）。
     const preview = document.getElementById('preview');         // 点击区域检测
     const previewScroll = document.getElementById('preview-wrap'); // 可滚动容器
     let menuTarget = null;   // 'editor' | 'preview'
