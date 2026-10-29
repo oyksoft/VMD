@@ -1,6 +1,6 @@
 # VMD · 一个轻量的 Markdown 编辑器（带实时预览）
 
-[![version](https://img.shields.io/badge/version-0.2.8-blue)](https://github.com/oyksoft/VMD)
+[![version](https://img.shields.io/badge/version-0.2.9-blue)](https://github.com/oyksoft/VMD)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4?logo=windows)](https://github.com/oyksoft/VMD)
 [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/oyksoft/VMD)
 
@@ -341,7 +341,7 @@ cargo build --release
 mkdir ..\release -Force | Out-Null
 copy /y target\release\vmd.exe ..\release\VMD.exe
 cd ..\release
-Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.8-win64-portable.zip -Force
+Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.9-win64-portable.zip -Force
 ```
 
 > touch `tauri.conf.json` 这步别漏 —— `tauri-build` 只监听配置文件的变化，
@@ -350,6 +350,35 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.8-win64-porta
 ---
 
 ## 更新日志
+
+### 0.2.9（当前）
+
+这一版修的都是 **0.2.8 换成 `contenteditable` 之后暴露出来的问题**（编辑区底层换了，选区和偏移都得自己算）。
+
+- 🐛 **插入链接/表格/代码块/图片会跑到下一块** —— 光标在行末或空行时，插入的内容不在光标处，
+  而是掉到了下一行。原因是 `offsetOfNode()` 处理「光标挂在行元素本身」这种情况时，
+  把「上一行的长度」当成了行内偏移（Chrome 的选区端点常常就是这种形式 →
+  行末、空行都会命中）→ 整体错一行。
+- 🐛 **只读（自动重载）模式下右键菜单不置灰** —— 而且 `撤销/重做/剪切/粘贴` 会真的改内容，
+  「全选」还会报错。原因是右键菜单那段代码里 `const editor = document.getElementById('editor')`
+  **遮蔽了全局的 `editor` 代理对象**，拿到的是原始 contenteditable 元素 ——
+  它没有 `readOnly` 属性、也没有 `select()` 方法。
+- 🐛 **格式化走兜底路径后预览不刷新** —— `execCommand` 失败时会直接改文本，
+  而直接改不会触发 input 事件 → 编辑区变了、右边预览还是旧的（看起来像"没生效"）。
+- 🐛 **编辑区遇到 HTML 标签就中断** —— 打开含 `<textarea>` 这类标签的文档（比如本文件的更新日志），
+  编辑区从那一行开始后面的内容全被吞进去，整个编辑区错乱。
+  原因是文件里有两个同名 `escapeHtml` 函数，生效的是那个**没做转义**的空操作版本 →
+  含标签的行被浏览器当成真标签解析（`<textarea>` 是原始文本元素，后面全被吞）。
+- 🐛 **滚动预览区不再带动编辑区** —— 回弹抑制把用户自己的滚动误判成"程序同步的回弹"吞掉了。
+- 🗑 **砍掉「光标跟随」设置项** —— 它和「滚动同步」功能重复，而且你手动把预览区滚到别处看内容时，
+  打个字预览区就会被拽回光标处（乱跳）。而且这个功能从头到尾就没真正工作过
+  （渲染时位置表是脏的 → 直接返回；注释说"下一帧会自动跟上"，但下一帧压根没再调它）。
+  保留「滚动同步」—— 那才是有用的那个。
+- 🐛 **阅读模式切回编辑模式后，滚预览区编辑区不跟随** —— 编辑区的可滚动高度缓存是 0，
+  滚动同步里 `maxLine` 算成 -1，预览区一滚就直接返回。
+  缓存只在 input 事件后刷新，而打开文件走的是 `setEditorText()`（不触发 input）；
+  切换模式后要用 `setTimeout`（不是 rAF）刷新 —— rAF 回调在渲染前执行，布局还没重算。
+
 
 ### 0.2.8
 
@@ -380,25 +409,11 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.8-win64-porta
 - 🐛 **浮动工具栏不显示 / 位置跑到别处** —— 三个独立原因：
   选区变化事件（`selectionchange`）、焦点判断、空行高度。
 - 🐛 **CRLF 行尾的文件，所有字符偏移都错位** —— 模型里留着 `\r`，DOM 里没有。
-- 🐛 **编辑区遇到 HTML 标签就中断** —— 打开含 `<textarea>` 这类标签的文档（比如本文件的更新日志），
-  编辑区从那一行开始后面的内容全被吞进去，整个编辑区错乱。
-  原因是文件里有两个同名 `escapeHtml` 函数，生效的是那个**没做转义**的空操作版本 →
-  含标签的行被浏览器当成真标签解析（`<textarea>` 是原始文本元素，后面全被吞）。
-- 🐛 **滚动预览区不再带动编辑区** —— 回弹抑制把用户自己的滚动误判成"程序同步的回弹"吞掉了。
-- 🗑 **砍掉「光标跟随」设置项** —— 它和「滚动同步」功能重复，而且你手动把预览区滚到别处看内容时，
-  打个字预览区就会被拽回光标处（乱跳）。而且这个功能从头到尾就没真正工作过
-  （渲染时位置表是脏的 → 直接返回；注释说"下一帧会自动跟上"，但下一帧压根没再调它）。
-  保留「滚动同步」—— 那才是有用的那个。
-- 🐛 **阅读模式切回编辑模式后，滚预览区编辑区不跟随** —— 编辑区的可滚动高度缓存是 0，
-  滚动同步里 `maxLine` 算成 -1，预览区一滚就直接返回。
-  缓存只在 input 事件后刷新，而打开文件走的是 `setEditorText()`（不触发 input）；
-  切换模式后要用 `setTimeout`（不是 rAF）刷新 —— rAF 回调在渲染前执行，布局还没重算。
 
 **弹窗重新设计** —— 关闭询问的「不保存 / 取消 / 保存」三个按钮原来大小、字重完全不一致，
 并排看着歪歪扭扭。现在**统一尺寸**，靠语义分层：主操作实心主题色、次操作描边、
 「不保存」无框文字（危险时变红）。弹窗本体圆角加大、阴影加层、顶部一道渐变高光条、
 出现时轻微浮起。
-
 ### 0.2.7
 
 这一版把「写起来更顺手」做了一大截，另外重写了滚动同步 —— 之前两边总是对不齐。
