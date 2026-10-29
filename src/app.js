@@ -538,8 +538,22 @@ function offsetOfNode(node, offsetInNode) {
             if (n === node) { off += offsetInNode; break; }
             off += n.nodeValue.length;
         }
+    } else if (node === el) {
+        // ⚠️ 光标挂在**行元素本身**上（空行没有 text node 时就会这样，
+        //    见 locateOffset() 的 fallback）——
+        //    这时 offsetInNode 是「子节点索引」，不是字符偏移。
+        //
+        //    ⚠️ 以前这里和下面那个分支共用一段逻辑：数 node 的**前兄弟**的文本长度。
+        //    但 node 是顶层的行 div，它的 previousSibling 是**上一行** →
+        //    累加出来的是上一行的长度 → 行内偏移直接错一行
+        //    → 在空行上插入的内容跑到下一块去了（这个 bug 就是这么来的）。
+        let c = 0;
+        for (let i = 0; i < offsetInNode && i < el.childNodes.length; i++) {
+            c += (el.childNodes[i].textContent || '').length;
+        }
+        off = c;
     } else {
-        // 元素节点：数它之前的兄弟文本长度
+        // 行内的子元素节点：数它之前的兄弟文本长度
         let prev = node.previousSibling;
         while (prev) { off += prev.textContent.length; prev = prev.previousSibling; }
         off += offsetInNode;
@@ -575,6 +589,7 @@ function locateOffset(off) {
     }
     const last = el.lastChild;
     if (last && last.nodeType === 3) return { node: last, offset: last.nodeValue.length };
+    // 空行（或者目标列超过实际内容）→ 行元素本身，第 0 个子节点之前
     return { node: el, offset: 0 };
 }
 
@@ -1369,6 +1384,8 @@ async function insertImage() {
         // 路径里有空格时用尖括号包起来（markdown 标准写法，不用 %20 编码）
         const target = /\s/.test(rel) ? '<' + rel + '>' : rel;
         const text = '\n![](' + target + ')\n';
+        // ⚠️ 光标位置必须在这里读（insertAtCursor 之前）——
+        //    insertAtCursor 之后位置已经变了，用它算 alt 位置会错。
         const s = editor.selectionStart;
         insertAtCursor(text);
         // 光标落到 alt 文本里（![] 的中间），用户直接就能写图片说明
