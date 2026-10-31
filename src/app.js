@@ -438,8 +438,39 @@ let editorLineStarts = [];
 let selStartOff = 0;
 let selEndOff = 0;
 
+// 转义映射表（模块级常量 —— escapeHtml 会被逐行调用上万次，
+// 在函数体内建对象字面量就是白白造几万个对象）
+//
+// ⚠️⚠️ **值必须是完整的 HTML 实体，不能是字符本身**。
+//    String.fromCharCode(38) 得到的是 '&'，不是 '&' ——
+//    写成那样等于**没有转义**（恒等函数）。
+//    这里用码点拼出实体字符串，避开源码里的 HTML 实体字面量
+//    （字面量容易被工具/编辑器改坏）。
+const ESC_MAP = {
+    '&': String.fromCharCode(38, 97, 109, 112, 59),          // &
+    '<': String.fromCharCode(38, 108, 116, 59),               // <
+    '>': String.fromCharCode(38, 103, 116, 59),               // >
+    '"': String.fromCharCode(38, 113, 117, 111, 116, 59),     // "
+    "'": String.fromCharCode(38, 35, 51, 57, 59),             // &#39;
+};
+const ESC_MAP_ATTR = {
+    '&': ESC_MAP['&'], '<': ESC_MAP['<'], '>': ESC_MAP['>'], '"': ESC_MAP['"'],
+};
+
+/**
+ * 转义字符串（用于拼进 HTML 的**文本节点**）。
+ *
+ * ⚠️ 用码点而不是 '&amp;' 这样的**字面量** ——
+ *    源码里写 HTML 实体字面量容易被改坏（大小写、漏分号），
+ *    用 String.fromCharCode 最稳。
+ */
 function escapeHtml(t) {
-    return t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(t).replace(/[&<>]/g, c => ESC_MAP[c]);
+}
+
+/** 属性值转义（拼 HTML 字符串时用，比 escapeHtml 多处理引号） */
+function escAttr(s) {
+    return String(s).replace(/[&<>"]/g, c => ESC_MAP_ATTR[c]);
 }
 
 /**
@@ -776,7 +807,12 @@ preview.addEventListener('click', async (e) => {
     e.preventDefault();
     const href = a.getAttribute('href');
     if (!href) return;
-    if (href.startsWith('#')) return;   // 锚点不处理（marked 会渲染成普通链接）
+    if (href.startsWith('#')) {
+        // 页内锚点：自己跳（原因见 jumpToPreviewAnchor 的注释）。
+        // 这里 e.preventDefault() 已经在上头拦掉了原生 hash 导航。
+        if (!jumpToPreviewAnchor(href)) showToast('没找到对应的标题', 2200);
+        return;
+    }
     // ⚠️ 只把 **网址** 交给系统打开 ——
     //    open_url 底层是 ShellExecuteW("open")，会用系统默认程序「打开」任何东西
     //    （.exe 直接就执行了）。md 可能来自别人，里面的链接不可信。
@@ -2279,9 +2315,43 @@ let previewRenderedSource = null;
 // 上一次渲染时当前文件所在目录（相对路径图片的解析基准）
 let previewRenderedBase = null;
 // 本地图片 → data URI 的缓存。key = 基准目录 + \0 + 原始 src
+// Map 的插入顺序当 LRU 用：命中就删了重插回末尾。
 const localImageCache = new Map();
-// 缓存上限：data URI 很大（base64 膨胀 1/3），无上限会吃光内存
+// 缓存上限：data URI 很大（base64 膨胀 1/3），无上限会吃光内存。
+// ⚠️ 光按条数限不够 —— 单张最大 8MB 图转出来 ≈ 11MB，300 条理论上能到 3GB+。
+// 所以条数 + 总字节双限，超了从最旧的开始逐个淘汰。
+// （以前是超了 `clear()` 全清，所有图重新读盘、画面闪一下。）
 const LOCAL_IMAGE_CACHE_MAX = 300;
+const LOCAL_IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+let localImageCacheBytes = 0;
+
+/** 取缓存（命中就移到队尾 —— Map 插入顺序就是 LRU 顺序） */
+function imageCacheGet(key) {
+    const uri = localImageCache.get(key);
+    if (uri === undefined) return null;
+    localImageCache.delete(key);
+    localImageCache.set(key, uri);
+    return uri;
+}
+
+/** 写缓存 + 按条数 / 总字节淘汰最旧的 */
+function imageCachePut(key, uri) {
+    const prev = localImageCache.get(key);
+    if (prev !== undefined) {
+        localImageCacheBytes -= prev.length;
+        localImageCache.delete(key);
+    }
+    localImageCache.set(key, uri);
+    // base64 是纯 ASCII，字符串 length 就是字节数，直接拿来算
+    localImageCacheBytes += uri.length;
+    while (localImageCache.size > LOCAL_IMAGE_CACHE_MAX ||
+           localImageCacheBytes > LOCAL_IMAGE_CACHE_MAX_BYTES) {
+        const oldest = localImageCache.keys().next();
+        if (oldest.done) break;
+        localImageCacheBytes -= (localImageCache.get(oldest.value) || '').length;
+        localImageCache.delete(oldest.value);
+    }
+}
 // 正在解析的本地图片数量（导出 PDF 前要等它们转完）
 let localImagePending = 0;
 let localImageWaiters = [];
@@ -2339,6 +2409,20 @@ function renderPreview() {
 
     if (canPatch && newEnd < a && oldEnd < a) {
         // 一个字都没改到结构：连重排都省了
+        //
+        // ⚠️ 但**换了基准目录**时例外（打开另一个目录下内容相同的文件）：
+        //    块结构没变、预览 DOM 复用，可图片的相对路径已经不能用旧目录解析了。
+        if (baseDir !== previewRenderedBase) {
+            // 先把已转成 data URI 的图片还原成原始路径（data: 会被 isLocalImageSrc
+            // 当成非本地图片跳过），再清掉"试过了"的标记，然后按新目录重解析。
+            for (const im of preview.querySelectorAll('img')) {
+                const orig = im.dataset.vmdImgOrig;
+                if (!orig) continue;
+                im.setAttribute('src', orig);
+                delete im.dataset.vmdImgTried;
+            }
+            resolveLocalImages();
+        }
         previewBlockKeys = keys;
         previewRenderedSource = text;
         previewRenderedBase = baseDir;
@@ -2445,8 +2529,12 @@ function resolveLocalImages() {
         // 那时候 baseDir 是空的，不能因此把图片整个跳过（会白屏）。
         if (!baseDir && !isAbsoluteImageSrc(src)) continue;
         const key = baseDir + '\u0000' + src;
-        const cached = localImageCache.get(key);
+        const cached = imageCacheGet(key);
         if (cached) {
+            // 记下原始路径：换了基准目录（打开另一个目录下内容相同的文件）时要
+            // 按新目录重新解析，那时得先把 src 还原成原路径 ——
+            // 否则 isLocalImageSrc() 会把已经是 data: 的当成"不是本地图片"跳过。
+            im.dataset.vmdImgOrig = src;
             im.setAttribute('src', cached);
             continue;
         }
@@ -2466,10 +2554,7 @@ function resolveLocalImages() {
             // 渲染期间这个节点可能已经被换掉了
             if (!p.img.isConnected) continue;
             if (uri) {
-                if (localImageCache.size >= LOCAL_IMAGE_CACHE_MAX) {
-                    localImageCache.clear();   // 简单粗暴：超了就清空
-                }
-                localImageCache.set(p.key, uri);
+                imageCachePut(p.key, uri);
                 p.img.setAttribute('src', uri);
             } else {
                 // 读不出来 → 还原原路径，让浏览器显示破图（提示用户路径有问题）
@@ -2496,6 +2581,25 @@ function resolveLocalImages() {
 function whenLocalImagesReady() {
     if (localImagePending <= 0) return Promise.resolve();
     return new Promise(resolve => localImageWaiters.push(resolve));
+}
+
+/**
+ * 等 Mermaid / KaTeX 渲染完成（导出 PDF 前用）。
+ *
+ * 两者都是**异步**的（mermaid.render 返回 Promise；KaTeX 是 queueMath + rAF），
+ * 刚打开文档就导出的话图还是源码块、公式还没渲染。
+ * 轮询 + 5 秒超时兜底 —— 某个渲染卡住也不能让导出永远转圈。
+ */
+function whenRenderersReady() {
+    return new Promise(resolve => {
+        const deadline = Date.now() + 5000;
+        const tick = () => {
+            const busy = mermaidPending > 0 || mathRafPending || mathQueue.length > 0;
+            if (!busy || Date.now() > deadline) { resolve(); return; }
+            setTimeout(tick, 40);
+        };
+        tick();
+    });
 }
 
 /** 是不是「本地路径」图片（远程的、data: 的都不算） */
@@ -2647,18 +2751,18 @@ function buildTocHtml() {
             // 先关上一项 <li>（如果有），再嵌一个 <ul>，再开新 <li>
             if (liOpen) { html += '</li>'; liOpen = false; }
             for (let i = 0; i < lvlDiff; i++) html += '<ul>';
-            html += `<li class="lvl${level}"><a href="#${h.id}">${escHTML(h.textContent)}</a>`;
+            html += `<li class="lvl${level}"><a href="#${h.id}">${escapeHtml(h.textContent)}</a>`;
             liOpen = true;
         } else if (lvlDiff < 0) {
             // 降级：关当前 <li>，闭 N 层 </ul>，开新 <li>
             if (liOpen) { html += '</li>'; liOpen = false; }
             for (let i = 0; i < -lvlDiff; i++) html += '</ul>';
-            html += `<li class="lvl${level}"><a href="#${h.id}">${escHTML(h.textContent)}</a>`;
+            html += `<li class="lvl${level}"><a href="#${h.id}">${escapeHtml(h.textContent)}</a>`;
             liOpen = true;
         } else {
             // 同级：关当前 <li>，开新 <li>
             if (liOpen) { html += '</li>'; liOpen = false; }
-            html += `<li class="lvl${level}"><a href="#${h.id}">${escHTML(h.textContent)}</a>`;
+            html += `<li class="lvl${level}"><a href="#${h.id}">${escapeHtml(h.textContent)}</a>`;
             liOpen = true;
         }
         lastLevel = level;
@@ -2684,20 +2788,10 @@ function buildTocHtmlFlat() {
             h.id = id;
         }
         seen.add(h.id);
-        html += `<li class="lvl${parseInt(h.tagName.charAt(1))}"><a href="#${h.id}">${escHTML(h.textContent)}</a></li>`;
+        html += `<li class="lvl${parseInt(h.tagName.charAt(1))}"><a href="#${h.id}">${escapeHtml(h.textContent)}</a></li>`;
     }
     html += '</ol>';
     return html;
-}
-
-function escHTML(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-/** 属性值转义（拼 HTML 字符串时用，比 escHTML 多处理引号） */
-function escAttr(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-        .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ============ KaTeX 数学公式 ============
@@ -2830,6 +2924,8 @@ function convertOldFlowchart(src) {
 
 let mermaidReady = false;
 let mermaidCounter = 0;
+// 正在跑的 Mermaid 渲染数量（异步）—— 导出 PDF 前要等它们完成，否则图还没出来
+let mermaidPending = 0;
 // 从 App 的 CSS 变量取色，生成 Mermaid 的 themeVariables
 // 这样图表的线条/文字/节点颜色和当前主题完全一致（深色主题下也能看清）
 function mermaidThemeVars() {
@@ -2896,46 +2992,79 @@ function mermaidThemeVars() {
     };
 }
 let currentMermaidTheme = null;
+// 懒加载：vendor/mermaid.min.js 有 2.5MB，**大多数文档根本没有图表**。
+// 以前在 <head> 里同步加载，每次启动都要白白解析一遍 2.5MB 的 JS。
+// 现在改成：预览里第一次出现 mermaid 代码块时才动态注入 <script>。
+// 这个 Promise 缓存住，重复调用不会重复加载。
+let mermaidLoading = null;
+
+/** 动态加载 mermaid.min.js（只加载一次） */
+function loadMermaidScript() {
+    if (window.mermaid) return Promise.resolve();
+    if (mermaidLoading) return mermaidLoading;
+    mermaidLoading = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'vendor/mermaid.min.js';
+        s.onload = () => resolve();
+        s.onerror = () => {
+            mermaidLoading = null;   // 失败了下次还能重试
+            reject(new Error('mermaid.min.js 加载失败'));
+        };
+        document.head.appendChild(s);
+    });
+    return mermaidLoading;
+}
+
 function ensureMermaid(theme) {
-    if (!window.mermaid) return Promise.reject('mermaid not loaded');
-    const want = theme || currentAppTheme;
-    if (mermaidReady && currentMermaidTheme === want) return Promise.resolve();
-    mermaidReady = true;
-    currentMermaidTheme = want;
-    try {
-        window.mermaid.initialize({
-            startOnLoad: false,
-            theme: 'base',                 // base 主题不覆盖 themeVariables
-            themeVariables: mermaidThemeVars(),
-            // strict：禁掉图里的 click 事件和 HTML 标签。md 文件可能来自别人，
-            // loose 下 `click A href "..."` 能把链接塞进预览，而预览 DOM 已经过消毒，
-            // 这里再插入的内容 DOMPurify 不会再管。代价：节点文本里的 <br> 会显示成字面量。
-            securityLevel: 'strict',
-            fontFamily: 'inherit',
-        });
-    } catch (e) {
-        console.warn('mermaid init error:', e);
-    }
-    return Promise.resolve();
+    // 先把脚本拉下来（懒加载），再 initialize
+    return loadMermaidScript().then(() => {
+        // ⚠️ 主题要在**加载完成之后**才取 —— 加载要一两百毫秒，
+        //    期间用户可能已经切了主题（want 是调用时的旧值 → 图表配色跟不上）。
+        const want = theme || currentAppTheme;
+        if (mermaidReady && currentMermaidTheme === want) return;
+        mermaidReady = true;
+        currentMermaidTheme = want;
+        try {
+            window.mermaid.initialize({
+                startOnLoad: false,
+                theme: 'base',                 // base 主题不覆盖 themeVariables
+                themeVariables: mermaidThemeVars(),
+                // strict：禁掉图里的 click 事件和 HTML 标签。md 文件可能来自别人，
+                // loose 下 `click A href "..."` 能把链接塞进预览，而预览 DOM 已经过消毒，
+                // 这里再插入的内容 DOMPurify 不会再管。代价：节点文本里的 <br> 会显示成字面量。
+                securityLevel: 'strict',
+                fontFamily: 'inherit',
+            });
+        } catch (e) {
+            console.warn('mermaid init error:', e);
+        }
+    });
 }
 
 // 主题切换后：重新渲染所有 Mermaid 图
 function rerenderMermaid() {
+    // ⚠️ 这里的 `!window.mermaid` 早退是安全的：没有加载过 mermaid
+    //    → 预览里不可能有已渲染的 mermaid-block（渲染必然先加载了脚本）。
     if (!window.mermaid) return;
     const blocks = Array.from(preview.querySelectorAll('.mermaid-block'));
     if (blocks.length === 0) return;
     const want = currentAppTheme;
     if (currentMermaidTheme === want) return;
-    ensureMermaid(want).then(() => {
+    ensureMermaid(want).catch(e => {
+        console.warn('mermaid 加载失败：', e);
+    }).then(() => {
+        if (!window.mermaid) return;
         blocks.forEach(container => {
             const source = container.dataset.mermaidSource;
             if (!source) return;
             const id = 'mermaid-' + (++mermaidCounter);
+            mermaidPending++;
             window.mermaid.render(id + '-svg', source)
                 .then(({ svg }) => { container.innerHTML = svg; })
                 .catch(e => {
                     container.replaceChildren(renderErrorBox('Mermaid', e.message, ''));
-                });
+                })
+                .finally(() => { mermaidPending--; });
         });
     });
 }
@@ -2973,9 +3102,13 @@ function renderErrorBox(what, msg, source) {
 }
 
 function renderMermaidBlocks(root = preview) {
-    if (!window.mermaid) return;
+    // ⚠️ 这里**不能**用 `if (!window.mermaid) return` 早退 ——
+    //    mermaid 是懒加载的，第一次遇到图表时 window.mermaid 还不存在，
+    //    早退就永远触发不了加载（图永远不渲染）。
+    //    所以改成：先把代码块换成容器，再由 ensureMermaid() 去拉脚本。
     // 支持 mermaid、seq、flow、sequence、diagram 作为代码块语言别名
     const codes = sel(root, 'pre code.language-mermaid, pre code.language-seq, pre code.language-flow, pre code.language-sequence, pre code.language-diagram');
+    if (!codes.length) return;
     codes.forEach(code => {
         if (code.dataset.mermaidRendered) return;
         const source = normalizeMermaidSource(code.textContent);
@@ -2987,6 +3120,7 @@ function renderMermaidBlocks(root = preview) {
         container.textContent = source;
         container.dataset.mermaidSource = source;   // 主题切换时按新主题重渲染
         pre.parentNode.replaceChild(container, pre);
+        mermaidPending++;
         ensureMermaid().then(() => {
             return window.mermaid.render(id + '-svg', source);
         }).then(({ svg }) => {
@@ -2995,6 +3129,8 @@ function renderMermaidBlocks(root = preview) {
         }).catch(e => {
             container.replaceChildren(renderErrorBox('Mermaid', e.message, source));
             container.dataset.mermaidRendered = '1';
+        }).finally(() => {
+            mermaidPending--;
         });
     });
 }
@@ -3535,6 +3671,66 @@ function onTocItemClick(e) {
     if (Math.abs(previewWrap.scrollTop - top) < 2) done();
 }
 
+/**
+ * 预览内的锚点跳转（`[x](#标题)`，或者 `[TOC]` 生成的那种 `#h-N`）。
+ *
+ * 为什么不能交给浏览器原生 hash 导航：
+ *   1. 上面 click 处理里已经 `preventDefault()` 了 —— 原生导航根本不会发生；
+ *   2. 就算不拦，md 里手写的 `[x](#标题)` 的 hash 是「标题文本」，
+ *      而标题 id 是 `h-N` / `h-N-slug` —— 两边对不上，浏览器同样跳不动。
+ * 所以自己查元素、自己滚（跟左边目录点击是同一套）。
+ *
+ * @returns {boolean} 找到了目标并已滚动 = true
+ */
+function jumpToPreviewAnchor(href) {
+    const raw = href.slice(1);
+    if (!raw) return false;
+    let id = raw;
+    try { id = decodeURIComponent(raw); } catch (e) { /* 不是合法编码就用原样 */ }
+    // 1) 直接按 id 找（`[TOC]` 生成的链接就是这种）
+    let target = document.getElementById(id);
+    // 2) 手写的 `#标题`：按 slug 文本反查第一个同名标题
+    if (!target) {
+        const want = slugify(id);
+        if (want) {
+            for (const h of preview.querySelectorAll('h1, h2, h3, h4, h5, h6')) {
+                if (slugify(h.textContent) === want) { target = h; break; }
+            }
+        }
+    }
+    if (!target || !preview.contains(target)) return false;
+    const previewWrap = document.getElementById('preview-wrap');
+    if (!previewWrap) return false;
+    // 锁住自动同步，防止 smooth scroll 的中间帧把编辑区拽回原位
+    syncing = true;
+    const top = target.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top
+        + previewWrap.scrollTop - 12;
+    previewWrap.scrollTo({ top, behavior: 'smooth' });
+    // 编辑区也跟到对应标题行（有映射时）
+    const idx = headingPairs.findIndex(p => p.el === target);
+    if (idx >= 0 && typeof headingPairs[idx].line === 'number') {
+        scrollEditorToLine(headingPairs[idx].line);
+    }
+    let finished = false;
+    const done = () => {
+        if (finished) return;
+        finished = true;
+        previewWrap.removeEventListener('scrollend', done);
+        clearTimeout(fallback);
+        syncing = false;
+        if (idx >= 0) { alignedIdx = idx; updateTocHighlight(); }
+        // 校正：smooth 滚动可能没到位（被钳制 / 被打断）
+        const maxPrev = previewWrap.scrollHeight - previewWrap.clientHeight;
+        if (top <= maxPrev && Math.abs(previewWrap.scrollTop - top) > 4) {
+            setScrollTop(previewWrap, top);
+        }
+    };
+    previewWrap.addEventListener('scrollend', done);
+    const fallback = setTimeout(done, 1200);
+    if (Math.abs(previewWrap.scrollTop - top) < 2) done();
+    return true;
+}
+
 function renderToc() {
     const headings = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
 
@@ -3614,7 +3810,7 @@ function renderToc() {
         for (const it of shown) {
             const lineAttr = it.line !== undefined ? ' data-line="' + it.line + '"' : '';
             parts.push('<div class="toc-item lvl' + it.level + '" data-id="' + escAttr(it.id) + '"' +
-                lineAttr + '>' + escHTML(it.text) + '</div>');
+                lineAttr + '>' + escapeHtml(it.text) + '</div>');
         }
         if (truncated) {
             parts.push('<div class="toc-empty">…还有 ' + (items.length - TOC_MAX_ITEMS) + ' 个标题未列出</div>');
@@ -4050,37 +4246,62 @@ let findMode = 'find';
 let findMatches = [];    // editor: 匹配位置；preview: mark 元素
 let findIndex = -1;      // 当前是第几个
 let findTimer = 0;
+// 高亮/标记的条数上限：1MB 文档搜常见字（比如「的」）能有几万个匹配，
+// 全包成 <mark> 会生成几万个 DOM 节点 / 一个 MB 级的 innerHTML → 卡死。
+// 计数仍然是准确的，只是超出的部分不画高亮。
+const HL_MAX_MARKS = 2000;
+// 匹配位置的总数上限（查找计数用）
+const FIND_MAX_MATCHES = 50000;
 
-// ---- 编辑区高亮层（textarea 下面那层）----
-// textarea 未聚焦时**选区是不显示的** → 光靠 setSelectionRange 用户根本看不见匹配在哪。
-// 所以在 textarea 下面叠一层"镜像文本"，只把匹配片段标上背景色。
+// ---- 编辑区高亮层（编辑区下面那层）----
+// contenteditable 未聚焦时**选区是不显示的** → 光靠 setSelectionRange 用户根本看不见匹配在哪。
+// 所以在编辑区下面叠一层"镜像文本"，只把匹配片段标上背景色。
 const editorHl = document.getElementById('editor-hl');
 
-function escHl(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-/** 编辑区：重建高亮层（文字跟编辑区完全一致，只把匹配片段包上 <mark>） */
+/**
+ * 编辑区：重建高亮层（文字跟编辑区完全一致，只把匹配片段包上 <mark>）
+ *
+ * ⚠️ **自己扫一遍文本**，不用 collectMatches() 的结果 ——
+ *    findMatches 是某一时刻的快照，而编辑区内容随时会变
+ *    （setEditorText 那几条路径不触发 input 事件 → findMatches 就是旧的）。
+ *    用旧位置去切新文本 → 高亮错位。
+ */
 function renderEditorHighlights() {
     if (!editorHl) return;
     const q = findInput ? findInput.value : '';
-    if (!q || !findBar || !findBar.classList.contains('open')) {
+    // 阅读模式下查找目标是预览区、编辑区是隐藏的 —— 不用重建这个层
+    if (!q || !findBar || !findBar.classList.contains('open') || findTarget !== 'editor') {
         editorHl.innerHTML = '';
         return;
     }
     const text = editor.value;
-    let html = '';
+    // 先把匹配位置全找出来（上限跟 collectMatches 一样，两边口径一致）
+    const pos = [];
     let i = 0;
-    let n = 0;
-    while (true) {
+    while (pos.length < FIND_MAX_MATCHES) {
         const p = text.indexOf(q, i);
         if (p === -1) break;
-        html += escHl(text.slice(i, p));
-        html += '<mark' + (n === findIndex ? ' class="current"' : '') + '>' + escHl(q) + '</mark>';
+        pos.push(p);
         i = p + q.length;
-        n++;
     }
-    html += escHl(text.slice(i));
+    if (!pos.length) { editorHl.innerHTML = ''; return; }
+    let html = '';
+    let last = 0;
+    // 只画"当前位置附近"的一段（默认从开头算）——
+    // 不能永远取前 2000 个：翻到第 5000 个匹配时高亮层就没有 current 标记了，
+    // 而查找栏有焦点时编辑区选区不显示，用户会看不到自己翻到哪。
+    let start = 0;
+    if (pos.length > HL_MAX_MARKS && findIndex >= 0) {
+        start = Math.max(0, Math.min(findIndex - 100, pos.length - HL_MAX_MARKS));
+    }
+    const end = Math.min(pos.length, start + HL_MAX_MARKS);
+    for (let n = start; n < end; n++) {
+        const p = pos[n];
+        html += escapeHtml(text.slice(last, p));
+        html += '<mark' + (n === findIndex ? ' class="current"' : '') + '>' + escapeHtml(q) + '</mark>';
+        last = p + q.length;
+    }
+    html += escapeHtml(text.slice(last));
     editorHl.innerHTML = html;
     syncHlScroll();
 }
@@ -4172,7 +4393,7 @@ function collectMatches() {
             if (p === -1) break;
             findMatches.push(p);
             i = p + q.length;
-            if (findMatches.length >= 50000) break;   // 超大文件别把内存吃光
+            if (findMatches.length >= FIND_MAX_MATCHES) break;   // 超大文件别把内存吃光
         }
     }
     updateFindCount();
@@ -5450,18 +5671,6 @@ async function buildKatexCss(roots) {
     return css;
 }
 
-function escapeText(s) {
-    // 手写转义：仓库里 HTML 实体字面量不可靠（现有的 escapeHtml 就是个空操作），用码点绕开
-    const map = {
-        '&': String.fromCharCode(38),
-        '<': String.fromCharCode(60),
-        '>': String.fromCharCode(62),
-        '"': String.fromCharCode(34),
-        "'": String.fromCharCode(39),
-    };
-    return String(s).replace(/[&<>"']/g, c => map[c]);
-}
-
 /** 组装导出的 HTML（自包含单文件：图片 base64、公式字体内嵌、配色用当前主题） */
 async function buildExportHtml() {
     const theme = THEMES[activeTheme];
@@ -5490,7 +5699,7 @@ async function buildExportHtml() {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>${escapeText(title)}</title>
+<title>${escAttr(title)}</title>
 <style>
 :root{${themeVars}}
 ${exportCss}
@@ -5520,6 +5729,14 @@ async function exportHtml() {
         if (!path) return;
 
         showToast('正在导出 HTML…', 0);
+        // 本地图片是异步转成 data URI 的：不等它们转完就克隆 DOM，
+        // 拿到的是 1×1 透明占位图（data: 开头的 gif），而 Rust 侧的
+        // inline_local_images 见到 data: 就跳过 → 导出的文件里图片是空白。
+        // （导出 PDF 早就等了这个，导出 HTML 之前漏了。）
+        await whenLocalImagesReady();
+        // 再等 Mermaid / KaTeX —— 它们也是异步的（mermaid 还是懒加载的，
+        // 脚本可能还没拉下来），不等就会导出成源码块 / 未渲染的公式。
+        await whenRenderersReady();
         const html = await buildExportHtml();
         // 本地图片按 markdown 文件所在目录解析，Rust 侧转成 base64 内嵌
         const baseDir = currentFile ? currentFile.replace(/[^\\\/]+$/, '') : '';
@@ -5577,6 +5794,8 @@ async function exportPdf() {
         document.documentElement.classList.add('print-mode');   // html 也要放开 height/overflow
         // 等本地图片转成 data URI（图片是异步转的，不等会打印出空图）
         await whenLocalImagesReady();
+        // 再等 Mermaid / KaTeX —— 它们也是异步的，刚打开就导出会打成源码块
+        await whenRenderersReady();
         // 等浏览器完成布局刷新，确保打印的是新样式
         await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
         try {
@@ -5838,6 +6057,7 @@ updateThemeButton();
     }
     // 上次没能正常退出的话（崩溃/断电），把没保存的内容捞回来
     maybeOfferDraftRestore();
+
 })();
 
 // 外部修改检测：每 3 秒查一次（窗口没焦点时不查，切回来立刻查）
@@ -5919,8 +6139,8 @@ if (window.__TAURI__ && window.__TAURI__.event) {
         const dis = opts.disabled ? ' ctx-item-disabled' : '';
         const danger = opts.danger ? ' ctx-item-danger' : '';
         const icon = opts.icon ? `<span class="ctx-item-icon">${opts.icon}</span>` : '';
-        const shortcut = opts.shortcut ? `<span class="ctx-item-shortcut">${escHTML(opts.shortcut)}</span>` : '';
-        return `<div class="ctx-item${dis}${danger}" data-act="${opts.act}">${icon}<span class="ctx-item-label">${escHTML(label)}</span>${shortcut}</div>`;
+        const shortcut = opts.shortcut ? `<span class="ctx-item-shortcut">${escapeHtml(opts.shortcut)}</span>` : '';
+        return `<div class="ctx-item${dis}${danger}" data-act="${opts.act}">${icon}<span class="ctx-item-label">${escapeHtml(label)}</span>${shortcut}</div>`;
     }
 
     /**
@@ -5930,7 +6150,7 @@ if (window.__TAURI__ && window.__TAURI__.event) {
     function subItem(label, key, icon, childrenHtml) {
         return `<div class="ctx-item ctx-item-has-sub" data-sub="${key}">` +
             `<span class="ctx-item-icon">${icon}</span>` +
-            `<span class="ctx-item-label">${escHTML(label)}</span>` +
+            `<span class="ctx-item-label">${escapeHtml(label)}</span>` +
             `<span class="ctx-item-arrow">›</span>` +
             `<div class="ctx-submenu">${childrenHtml}</div>` +
             `</div>`;

@@ -1,6 +1,6 @@
 # VMD · 一个轻量的 Markdown 编辑器（带实时预览）
 
-[![version](https://img.shields.io/badge/version-0.2.9-blue)](https://github.com/oyksoft/VMD)
+[![version](https://img.shields.io/badge/version-0.2.10-blue)](https://github.com/oyksoft/VMD)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4?logo=windows)](https://github.com/oyksoft/VMD)
 [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/oyksoft/VMD)
 
@@ -341,7 +341,7 @@ cargo build --release
 mkdir ..\release -Force | Out-Null
 copy /y target\release\vmd.exe ..\release\VMD.exe
 cd ..\release
-Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.9-win64-portable.zip -Force
+Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.10-win64-portable.zip -Force
 ```
 
 > touch `tauri.conf.json` 这步别漏 —— `tauri-build` 只监听配置文件的变化，
@@ -351,7 +351,39 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.9-win64-porta
 
 ## 更新日志
 
-### 0.2.9（当前）
+### 0.2.10（当前）
+
+这一版是**一轮代码审查 + 自建测试**的结果。写测试的时候当场抓出了一个
+**很严重的回归**（见下），所以如果你只记住一条，就是这条。
+
+- 🐛 **⚠️ 转义函数失效 —— 会吞掉文档里的 HTML 标签**（本轮引入，已在发版前修掉）
+  做代码清理时把转义函数从「直接写 HTML 实体」改成了「用码点拼」，
+  但码点拼出来的是字符**本身**（一个 & 号）而不是**实体**（& 加 amp 四个字符）——
+  等于**根本没有转义**。
+  后果跟 0.2.9 那个 `<textarea>` 的 bug 一模一样：打开含 HTML 标签的文档，
+  那一行之后的内容全被浏览器当成真标签解析掉。现在用的是码点拼出的完整实体。
+  （0.2.9 里那个「两个同名 escapeHtml」的坑，到这一版才算彻底埋完。）
+- 🐛 **文字缩放后，编辑区的查找高亮会错位** —— 缩放只改了编辑区的字号，
+  底下那层高亮镜像还是固定 13.5px → 第 N 个匹配的黄色标记会偏出 N × 行高差，越往下越离谱。
+- 🐛 **导出 HTML 时图片是空白的** —— 图片转 data URI 是异步的，导出没等它转完，
+  克隆到的是 1×1 透明占位图。现在导出会等图片、公式、图表全部渲染完。
+- 🐛 **导出 PDF / HTML 时，流程图和公式是源码块** —— Mermaid 和 KaTeX 都是异步渲染的，
+  刚打开文档就导出，图和公式还没出来。现在会等它们渲染完再导。
+- 🐛 **打开另一个目录下内容相同的文件，图片不跟着换** —— 文档内容一个字没变，
+  预览区会直接复用上一次的 DOM，图片却还按旧目录解析。
+- 🐛 **预览里的锚点链接点了没反应** —— `[TOC]` 生成的链接、以及自己写的 `[跳转](#某节)` 都跳不动。
+  现在能跳了（编辑区也会跟到对应行）。
+- 🐛 **大文档查找会卡** —— 搜一个常见字可能命中几万个位置，
+  以前每次都要生成几万个 `<mark>` 节点。现在只画当前附近的 2000 个，计数依然准确。
+- ⚡ **Mermaid 改成懒加载** —— `mermaid.min.js` 有 2.5MB，而绝大多数文档根本没有图表。
+  以前每次启动都要白白解析一遍，现在第一次遇到图表时才下载。
+- ⚡ **图片缓存不再「超限全清」** —— 超过 300 张图就整个清空，所有图重新读盘、画面闪一下。
+  现在按「条数 + 总字节」双限逐个淘汰最旧的。
+- 🔒 **导出时不再把超大图整个读进内存** —— 预览有 8MB 上限，导出这条路径原来没有。
+  一张几百 MB 的图会把进程顶爆（base64 还要再膨胀 1/3）。
+- 🗑 **删掉没人用的 `file_exists` 命令**；**转义函数从 4 个收敛成 2 个**（有两个是完全重复的）。
+
+### 0.2.9
 
 这一版修的都是 **0.2.8 换成 `contenteditable` 之后暴露出来的问题**（编辑区底层换了，选区和偏移都得自己算）。
 

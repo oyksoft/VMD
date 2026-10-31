@@ -19,8 +19,11 @@
     <link rel="stylesheet" href="vendor/katex/katex.min.css">
     <script src="vendor/katex/katex.min.js"></script>
     <script src="vendor/katex/contrib/auto-render.min.js"></script>
-    <!-- Mermaid (流程图/序列图/类图等) -->
-    <script src="vendor/mermaid.min.js"></script>
+    <!-- Mermaid (流程图/序列图/类图等) —— **懒加载**，不在这里写 <script>。
+         vendor/mermaid.min.js 有 2.5MB，而绝大多数文档根本没有图表 ——
+         放在 <head> 里同步加载，每次启动都要白白解析一遍。
+         现在改成：预览里第一次出现 mermaid 代码块时才动态注入 <script>
+         （见 app.js 的 loadMermaidScript()）。 -->
     <!-- Emoji 短代码表（:smile: → 😄，来自 GitHub 的 gemoji 数据集） -->
     <script src="vendor/emoji.js"></script>
 </head>

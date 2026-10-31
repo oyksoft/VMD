@@ -423,8 +423,15 @@ fn attr_span(tag: &str, name: &str) -> Option<(usize, usize)> {
 }
 
 /// 读一张本地图片，转成 data URI（相对路径按 markdown 文件所在目录找）
+///
+/// ⚠️ **这里也必须有体积上限**：导出 HTML 走的是这条路径（预览那条在
+/// `read_local_images` 里单独检查过）。一张几百 MB 的图会在导出时整个读进内存，
+/// base64 还要再膨胀 1/3 → 直接把进程顶爆。超限就返回 None（保留原路径）。
 fn img_to_data_uri(base_dir: &str, src: &str) -> Option<String> {
     let full = local_file_path(base_dir, src)?;
+    if fs::metadata(&full).ok()?.len() > MAX_INLINE_IMAGE {
+        return None;
+    }
     let data = fs::read(&full).ok()?;
     Some(format!(
         "data:{};base64,{}",
@@ -1221,7 +1228,7 @@ mod tests {
     /// 本地图片路径解析：预览里相对路径图片全靠它转成绝对路径。
     /// （预览页面跑在 http://tauri.localhost，file:// / asset:// 都被 WebView2 拒掉）
     mod images {
-        use super::super::{is_image_path, local_file_path};
+        use super::super::{img_to_data_uri, is_image_path, local_file_path, MAX_INLINE_IMAGE};
 
         #[test]
         fn relative_path_joins_base_dir() {
@@ -1255,6 +1262,28 @@ mod tests {
             assert!(!is_image_path("secret.txt"));
             assert!(!is_image_path("a.png.exe"));
             assert!(!is_image_path("noext"));
+        }
+
+        /// ⚠️ **导出 HTML 走的是 img_to_data_uri()**（预览那条路在 read_local_images 里
+        /// 单独检查过体积）。这里不查的话，一张几百 MB 的图会在导出时整个读进内存，
+        /// base64 还要再膨胀 1/3 → 直接把进程顶爆。
+        #[test]
+        fn oversized_image_is_not_embedded() {
+            let dir = std::env::temp_dir().join(format!("vmd-img-limit-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("big.png");
+            std::fs::write(&path, vec![0u8; (MAX_INLINE_IMAGE + 1) as usize]).unwrap();
+            let base = dir.to_string_lossy().to_string();
+            assert!(
+                img_to_data_uri(&base, "big.png").is_none(),
+                "超过 {}MB 的图不该被内嵌",
+                MAX_INLINE_IMAGE / 1024 / 1024
+            );
+            // 小图还是要能内嵌
+            std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+            let uri = img_to_data_uri(&base, "big.png").expect("小图应该能内嵌");
+            assert!(uri.starts_with("data:image/png;base64,"));
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

@@ -676,6 +676,9 @@ html.code-wrap #preview table th code {
 :root { --ui-zoom: 1; }
 
 #editor { font-size: calc(13.5px * var(--ui-zoom)); }
+/* 查找高亮镜像层必须和编辑区**字号也一致** —— 它只跟 font-size 走，
+   差一个档位，第 N 个匹配的纵向位置就整体偏出 N × 行高差。 */
+#editor-hl { font-size: calc(13.5px * var(--ui-zoom)); }
 #preview { font-size: calc(14px * var(--ui-zoom)); }
 .toc-item { font-size: calc(13px * var(--ui-zoom)); }
 .toc-item.lvl3 { font-size: calc(12px * var(--ui-zoom)); }
