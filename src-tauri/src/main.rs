@@ -480,11 +480,6 @@ fn inline_local_images(html: &str, base_dir: &str) -> String {
     out
 }
 
-#[tauri::command]
-fn file_exists(path: String) -> bool {
-    PathBuf::from(&path).exists()
-}
-
 /// 读取 Windows 系统主题（读注册表 AppsUseLightTheme）
 /// Tauri 2 在窗口主题为 Auto 时会把 WebView2 强制设成 Light，
 /// 导致前端 matchMedia('(prefers-color-scheme: dark)') 永远读不到真实系统主题。
@@ -1412,7 +1407,6 @@ fn main() {
             write_file,
             read_local_images,
             export_html,
-            file_exists,
             export_pdf,
             system_theme,
             open_url,

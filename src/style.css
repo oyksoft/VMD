@@ -422,6 +422,12 @@ html.read-mode #preview-wrap { flex: 1 1 auto; }
     min-height: 1lh;
     white-space: pre;
 }
+/* 点击预览定位后，目标行闪一下 —— 让用户立刻确认“跳对了没有” */
+#editor > div.line-flash {
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    border-radius: 3px;
+    box-shadow: -6px 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+}
 /* 编辑器获得焦点时不要显示默认的 outline（用边框代替） */
 #editor:focus { outline: none; }
 /* 高亮层：在 textarea 下面，尺寸/字体/内边距跟 textarea 完全一致，

@@ -777,6 +777,10 @@ const editor = {
 };
 const preview = document.getElementById('preview');
 const tocList = document.getElementById('toc-list');
+// ⚠️ **目录的滚动容器是 `#toc`，不是 `#toc-list`**（后者只有 padding）。
+//    声明必须**放在这里**（不能等文件末尾）—— renderToc / updateTocHighlight /
+//    scrollTocItemIntoView 都要用它，放到后面再声明就是 TDZ（踩过：界面全白）。
+const tocEl = document.getElementById('toc');
 // 目录项点击走事件委托（目录可能有上万个节点，逐个 addEventListener 太贵）
 tocList.addEventListener('click', onTocItemClick);
 const filenameEl = document.getElementById('filename');
@@ -800,10 +804,355 @@ function hideToast() {
     toastEl.classList.remove('show');
 }
 
+// ============ 预览点击 → 定位编辑区 ============
+//
+// 为什么只做「点击」这一个方向，不做「预览滚动 → 编辑区自动同步」：
+//
+//   有原始 HTML 的文档里，**「第 k 块」这个概念根本不存在**。
+//   实测（jsdom，7 个用例 4 个破坏）：
+//     · `<div>…</div>` 把中间的 md 内容**嵌套**进去 → N 个 token 塌缩成 1 个 DOM 元素
+//     · 相邻的 `<div>甲</div><div>乙</div>` 被 marked 合成 1 个 token → 1 个 token 出 N 个元素
+//   于是 blockLines（按 token 索引造）和 preview.children（按 DOM 索引）就**张冠李戴**，
+//   任何"按块索引滚动同步"都会跳错位置。
+//
+//   所以：
+//     · 编辑 → 预览：保留自动同步（写作时预览必须可见）
+//     · 预览 → 编辑：只在用户**点击**时做一次，而且**用文本内容匹配**，不依赖块索引
+//
+//   点击是"用户明确指名要跳到这儿"，因此值得多花一点成本把位置算准。
+
+/** 上一次点击定位到的源码行（重复文本时从这里往后找，提高命中率） */
+let lastPreviewSyncLine = 0;
+/** 行闪烁的定时器 */
+let flashLineTimer = 0;
+
+/**
+ * 在源码里找包含 snip 的位置 → 返回行号（找不到 -1）。
+ * 先从上次定位的位置往后找（同一段文字重复出现时，这样才不会每次跳到第一个），
+ * 找不到再全文找。
+ */
+function findSourceLineForText(snip, hintLine) {
+    if (!snip) return -1;
+    const src = editor.value;      // 读 value 会先同步模型 → editorLineStarts 也是新的
+    let pos = -1;
+    if (hintLine > 0 && editorLineStarts.length) {
+        const i = Math.min(hintLine, editorLineStarts.length - 1);
+        const hintPos = editorLineStarts[i] || 0;
+        if (hintPos > 0) pos = src.indexOf(snip, hintPos);
+    }
+    if (pos < 0) pos = src.indexOf(snip);
+    if (pos < 0) return -1;
+    return lineOfOffset(pos);
+}
+
+/**
+ * 点击位置 → 预览 DOM 里的顶层块下标（找不到 -1）。
+ * 只在文本匹配失败时当兜底用 —— HTML 文档里它可能不准，但比完全不跳好。
+ */
+function previewBlockIndexFor(el) {
+    let n = el;
+    while (n && n.parentNode && n.parentNode !== preview) n = n.parentNode;
+    if (!n || n.parentNode !== preview) return -1;
+    return Array.prototype.indexOf.call(preview.children, n);
+}
+
+/**
+ * 点击预览处 → 源码行号（找不到 -1）。
+ *
+ * 用 caretRangeFromPoint 拿到点击处的**文本节点 + 偏移**，取一小段文字，
+ * 再回源码里搜。这段文字必须限制在**同一个文本节点内**（不跨行、不跨块），
+ * 否则渲染后折行/标记剥离的差异会让它搜不到。
+ */
+/**
+ * 从（文本节点, 节点内偏移）→ 源码行号。
+ *
+ * ⚠️ **短文本节点必须用「整个节点内容」去搜，不能从偏移处截窗口**。
+ *    踩过：拖选一个标题的尾部时（起点在末尾），`text.slice(off, off+24)` 只剩
+ *    "2 节标题" 这种 4 个字符的碎片 —— 而 "第 **2** 节标题" 也包含 "2 节标题"，
+ *    `indexOf` 命中排在前面的那个 → 拖选第 62 节却跳到了第 2 节。
+ *    标题、短段落整段搜才是唯一的。
+ *
+ * 长段落（> 60 字符）才从偏移处取一个**前后各半**的窗口 ——
+ * 往前取是为了带上完整上下文（起点在句子中间时，往后取只剩断开的尾巴）。
+ */
+const SHORT_NODE = 60;       // 不超过这个长度就整段搜
+const TEXT_WINDOW = 24;      // 长节点取多大的窗口
+
+/**
+ * 找 el **所属或之前**最近的一个标题元素 —— 用来限定文本搜索的章节范围。
+ *
+ * ⚠️ **必须包含"el 自己就是标题"和"el 的祖先是标题"**。
+ *    踩过：点"### 代码高亮"这个标题本身时，只找"在它之前"的标题 →
+ *    得到的是上一节（表格/任务列表）的起始行 → 从那里往后搜"代码高亮"
+ *    命中的是别处（源码里"代码高亮"出现在 20/263/292/717/742/757 六处），
+ *    跳到 255 行去了。
+ */
+function nearestHeadingBefore(el) {
+    if (!el) return null;
+    // 1) 自己或祖先是标题
+    let n = el;
+    while (n && n !== preview) {
+        if (/^H[1-6]$/.test(n.tagName)) return n;
+        n = n.parentNode;
+    }
+    // 2) 都没命中 → 找文档顺序上在它之前的最后一个标题
+    let best = null;
+    const hs = preview.querySelectorAll('h1, h2, h3, h4, h5, h6');
+    for (const h of hs) {
+        if (el.compareDocumentPosition(h) & Node.DOCUMENT_POSITION_PRECEDING) best = h;
+        else break;
+    }
+    return best;
+}
+
+/** 某个标题元素对应的源码行（走 headingPairs，它是可靠的） */
+function headingSourceLine(h) {
+    if (!h) return -1;
+    for (const p of headingPairs) if (p.el === h) return p.line;
+    return -1;
+}
+
+/**
+ * @param hintLine 搜索起点（行号）。**点击预览时必须传「所在章节的起始行」** ——
+ *   纯文本匹配遇到重复文字必错（比如"代码高亮"在 README 里出现好几次），
+ *   限定在当前章节内搜能把错误概率降一个数量级。
+ */
+function sourceLineFromTextNode(node, off, hintLine) {
+    if (!node || node.nodeType !== 3) return -1;
+    const text = node.nodeValue || '';
+    const whole = text.trim();
+    if (whole.length < 2) return -1;
+
+    const hint = (hintLine !== undefined && hintLine >= 0) ? hintLine : lastPreviewSyncLine;
+
+    // 1) 短节点（标题、短段落、表格单元格）→ 整段搜，最准
+    if (whole.length <= SHORT_NODE) {
+        const line = findSourceLineForText(whole, hint);
+        if (line >= 0) return line;
+    }
+
+    // 2) 长节点 → 取偏移附近的窗口，前后各半（带上完整上下文）
+    //    逐档缩短，先长后短（长片段更准，短片段更鲁棒）
+    for (const win of [TEXT_WINDOW, 16, 10, 6]) {
+        const half = win >> 1;
+        let start = Math.max(0, off - half);
+        let snip = text.slice(start, start + win);
+        if (snip.replace(/\s+/g, '').length >= 3) {
+            const line = findSourceLineForText(snip.trim(), hint);
+            if (line >= 0) return line;
+        }
+        // 窗口落到行尾/文本末尾附近时，往前挪一点再试
+        let start2 = Math.max(0, off - win);
+        let snip2 = text.slice(start2, off);
+        if (snip2.replace(/\s+/g, '').length >= 3) {
+            const line = findSourceLineForText(snip2.trim(), hint);
+            if (line >= 0) return line;
+        }
+    }
+    return -1;
+}
+
+function sourceLineAtPreviewPoint(x, y, hintLine) {
+    let range = null;
+    try {
+        if (document.caretRangeFromPoint) range = document.caretRangeFromPoint(x, y);
+        else if (document.caretPositionFromPoint) {
+            const p = document.caretPositionFromPoint(x, y);
+            if (p) {
+                range = document.createRange();
+                range.setStart(p.offsetNode, p.offset);
+                range.collapse(true);
+            }
+        }
+    } catch (e) { /* 不支持就算了 */ }
+    if (!range) return -1;
+    return sourceLineFromTextNode(range.startContainer, range.startOffset, hintLine);
+}
+
+/** 让编辑区某一行闪一下（点击定位后的反馈：用户要能立刻确认跳对了没有） */
+function flashEditorLine(line) {
+    if (!editorLineEls.length) return;
+    // 清掉上一次的
+    for (const d of editorLineEls) {
+        if (d.classList.contains('line-flash')) d.classList.remove('line-flash');
+    }
+    const el = editorLineEls[Math.max(0, Math.min(line, editorLineEls.length - 1))];
+    if (!el) return;
+    // 强制重排一次让动画能重放（同一行连点两次时不然不会闪）
+    void el.offsetWidth;
+    el.classList.add('line-flash');
+    if (flashLineTimer) clearTimeout(flashLineTimer);
+    flashLineTimer = setTimeout(() => {
+        flashLineTimer = 0;
+        el.classList.remove('line-flash');
+    }, 900);
+}
+
+/** 点击预览 → 把编辑区视图定位到对应的源码行 */
+/**
+ * 兜底：用某个预览元素的**内容**去源码里找行。
+ *
+ * 用于「拿不到点击处的文本节点」的情况 —— 点在图片 / 表格边缘 / 块级 HTML 的空白里。
+ *
+ * ⚠️ **必须限制元素大小和层级**：实测点在预览空白处时 `elementFromPoint` 会返回
+ *    `<article id="preview">`（整篇文章）—— 拿它的 textContent 去搜必然命中
+ *    文章开头那段 → 编辑区"啪"地跳回第一行，看起来就是"定位错得离谱"。
+ *    所以：超过 MAX_BLOCKSIZE 字符的（容器级）一律不用，往上也只找 2 层。
+ *
+ * 三类元素要分别处理（直接拿 textContent 会搜不到）：
+ *   · 代码块：外层 `.code-block` 还带语言标签和复制按钮 → 必须取 `pre code` 里的内容
+ *   · 表格：`textContent` 里没有 `|` 分隔符 → 必须取单元格
+ *   · 标题：文本可能只有 2 个字（`## 代码`）→ 门槛不能定太高
+ */
+const MAX_BLOCKSIZE = 400;      // 超过这个长度就认为是容器，不拿它搜
+
+function sourceLineForElement(el) {
+    if (!el || el === preview) return -1;
+
+    const tryText = (text, lens) => {
+        const t = String(text || '').replace(/\s+/g, ' ').trim();
+        if (t.length > MAX_BLOCKSIZE) return -1;   // 容器级，别用
+        for (const len of lens) {
+            if (t.length < len) continue;
+            const line = findSourceLineForText(t.slice(0, len), lastPreviewSyncLine);
+            if (line >= 0) return line;
+        }
+        return -1;
+    };
+
+    // 代码块：只取代码内容
+    const code = el.querySelector ? el.querySelector('pre code') || el.querySelector('pre') : null;
+    if (code) {
+        const line = tryText(code.textContent, [40, 24, 14, 8]);
+        if (line >= 0) return line;
+    }
+
+    // 表格：取第一个单元格（源码里单元格文本是能搜到的）
+    const cell = el.querySelector ? el.querySelector('th, td') : null;
+    if (cell) {
+        const line = tryText(cell.textContent, [24, 10, 4, 2]);
+        if (line >= 0) return line;
+    }
+
+    // 普通元素 / 标题：用文本内容，门槛低到 2 个字符
+    // （标题常常只有两三个字，门槛高了就全 miss）
+    let n = el, tries = 0;
+    while (n && n !== preview && tries < 2) {
+        const line = tryText(n.textContent, [32, 20, 12, 6, 3, 2]);
+        if (line >= 0) return line;
+        n = n.parentNode;
+        tries++;
+    }
+    return -1;
+}
+
+/**
+ * 阅读模式下点了预览记住的源码行 —— 切到编辑模式时再真正定位。
+ * （阅读模式下编辑区是 display:none，scrollTop 设了也没用）
+ */
+let pendingEditModeLine = -1;
+
+/**
+ * 把算好的行落地：编辑模式 → 立即滚动 + 闪烁；阅读模式 → 记住，切模式时用。
+ */
+function applyPreviewLocatedLine(line) {
+    if (line < 0) return;
+    lastPreviewSyncLine = line;
+    if (editMode === false) {
+        // 编辑区隐藏着，滚不了 → 记下来，等切到编辑模式
+        pendingEditModeLine = line;
+        showToast('已定位到源码第 ' + (line + 1) + ' 行（切到编辑模式即可看到）', 2200);
+        return;
+    }
+    pendingEditModeLine = -1;
+    scrollEditorToLine(line, previewLocateMargin());
+    flashEditorLine(line);
+}
+
+function syncEditorFromPreviewClick(e) {
+    if (!previewScroll) return;
+
+    // 用 caretRangeFromPoint 拿真实落点 —— 它比 `e.target` 准得多：
+    //   点在段落的空白区 / 行尾时 `e.target` 可能已经是 `<article>`（整个预览），
+    //   拿它去做兜底会直接跳回文章开头。
+    let hit = e.target;
+    let range = null;
+    try {
+        if (document.caretRangeFromPoint) range = document.caretRangeFromPoint(e.clientX, e.clientY);
+    } catch (err) { /* 忽略 */ }
+    if (range) {
+        // 优先用落点所在元素（比 e.target 精细）
+        let el = range.startContainer;
+        if (el && el.nodeType !== 1) el = el.parentNode;
+        if (el && el !== preview && preview.contains(el)) hit = el;
+    }
+
+    // 0) 先算出「点击位置属于哪一章」—— 章节映射（headingPairs）是可靠的，
+    //    用它当搜索起点，重复文字才不会跑到别的章节去。
+    const chapH = nearestHeadingBefore(hit);
+    const chapLine = headingSourceLine(chapH);
+
+    // 1) 首选：点击处那一段文字（最准，不依赖块结构）
+    let line = sourceLineAtPreviewPoint(e.clientX, e.clientY, chapLine >= 0 ? chapLine : undefined);
+
+    // 2) 兜底 A：用所在元素的文本内容搜（点在图片 / 表格边缘 / 块级 HTML 空白里）
+    if (line < 0) line = sourceLineForElement(hit);
+
+    // 3) 兜底 B：顶层块索引（HTML 文档里可能不准，但比完全不跳好）
+    if (line < 0) {
+        const idx = previewBlockIndexFor(hit);
+        if (idx >= 0 && blockLines[idx]) line = blockLines[idx].start;
+    }
+
+    applyPreviewLocatedLine(line);
+}
+
+/**
+ * 拖选预览文字 → 也定位编辑区（定位到**选区起点**所在行）。
+ *
+ * ⚠️ 这条以前被我主动挡住了（怕干扰复制），但用户明确要"选中文字也同步"——
+ *    选中后编辑区跳到那段源码，是很自然的诉求。
+ *    定位到选区**起点**而不是终点：用户是从哪开始选的，心里想的就是那里。
+ */
+function syncEditorFromPreviewSelection(range) {
+    if (!previewScroll || !range) return;
+    const startEl = range.startContainer.nodeType === 1
+        ? range.startContainer : range.startContainer.parentNode;
+    const chapLine = headingSourceLine(nearestHeadingBefore(startEl));
+    let line = sourceLineFromTextNode(range.startContainer, range.startOffset,
+        chapLine >= 0 ? chapLine : undefined);
+    if (line < 0) {
+        const node = range.startContainer;
+        const el = node.nodeType === 1 ? node : node.parentNode;
+        line = sourceLineForElement(el);
+        if (line < 0) {
+            const idx = previewBlockIndexFor(el);
+            if (idx >= 0 && blockLines[idx]) line = blockLines[idx].start;
+        }
+    }
+    applyPreviewLocatedLine(line);
+}
+
 // 预览中的链接点击 → 外部调系统浏览器打开，避免 WebView 被跳走
 preview.addEventListener('click', async (e) => {
     const a = e.target.closest('a');
-    if (!a) return;
+
+    // ---- 非链接区域：点击 → 定位编辑区 ----
+    if (!a) {
+        // 代码块头部的复制按钮、任务列表的复选框不算"点正文"
+        const onUi = !!e.target.closest('.code-block-header') || e.target.tagName === 'INPUT';
+        if (onUi) return;
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+            // 拖选了一段文字 → 定位到选区起点
+            syncEditorFromPreviewSelection(sel.getRangeAt(0));
+        } else {
+            // 单击 → 按点击位置
+            syncEditorFromPreviewClick(e);
+        }
+        return;
+    }
+
     e.preventDefault();
     const href = a.getAttribute('href');
     if (!href) return;
@@ -1710,17 +2059,193 @@ function splitRows(el, start) {
     return [{ el, line: start, endLine: start }];
 }
 
+/**
+ * 把一个顶层块拆成**更细的锚点元素**。
+ *
+ * ⚠️⚠️ **这是同步精度的关键**：一个块里塞几十行内容时，
+ *    用「块内字符比例」插值必然不准（README 的 26 行列表块实测偏出几十行）。
+ *    而目录（章节）节点为什么准？因为它**双向都是 DOM 实测**，不做比例估算。
+ *    所以这里也照同样的思路：把块拆到 `<li>` / `<tr>` 粒度，每个子元素一个锚点。
+ */
+function splitIntoAnchors(el) {
+    if (!el) return [];
+    if (el.tagName === 'TABLE') {
+        const trs = Array.from(el.querySelectorAll('tr'));
+        if (trs.length) return trs;
+    }
+    if (el.tagName === 'UL' || el.tagName === 'OL') {
+        // 只取**顶层** li（嵌套列表的子 li 由父 li 的锚点覆盖，否则重复）
+        const out = [];
+        for (const li of el.children) if (li.tagName === 'LI') out.push(li);
+        if (out.length) return out;
+    }
+    if (el.tagName === 'DL') {
+        const out = [];
+        for (const c of el.children) if (c.tagName === 'DT' || c.tagName === 'DD') out.push(c);
+        if (out.length) return out;
+    }
+    const inner = contentElementOf(el);
+    return [inner || el];
+}
+
+/**
+ * 用元素的**文本内容**在源码里实测它从哪一行开始。
+ *
+ * ⚠️ 这是「可靠」的来源：行号不是按 token 索引算出来的（含原始 HTML 时会错位），
+ *    而是"这段文字在源码里到底出现在哪"。
+ *
+ * @param fromLine 只从这个行号**往后**搜（保证单调递增，重复文本不会命中前面）
+ * @returns 行号；实在搜不到返回 -1（调用方跳过这个锚点）
+ */
+function measureSourceLine(el, fromLine, src) {
+    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (text.length < 2) return -1;
+    const starts = editorLineStarts;
+    let hintPos = 0;
+    if (fromLine > 0 && starts.length) {
+        hintPos = starts[Math.min(fromLine, starts.length - 1)] || 0;
+    }
+    // 从长到短试（长片段更准，短片段更鲁棒）
+    for (const len of [28, 20, 14, 8, 5]) {
+        if (text.length < len) continue;
+        const snip = text.slice(0, len);
+        let pos = src.indexOf(snip, hintPos);
+        if (pos < 0 && hintPos > 0) {
+            // 兜底：全文搜。⚠️ **但结果必须仍在 hint 之后** ——
+            //    否则会命中前面同名的文本 → 行号乱序 →
+            //    `anchorAtLine()` 线性扫描遇到第一个 `line > target` 就 break，
+            //    整张锚点表全废（实测 35 个非单调锚点就让所有位置都返回同一行）。
+            pos = src.indexOf(snip);
+            if (pos >= 0 && pos < hintPos) pos = -1;
+        }
+        if (pos >= 0) return lineOfOffset(pos);
+    }
+    return -1;
+}
+
+/**
+ * 「源码行 → 预览内容内的精确顶部位置」表。
+ *
+ * ⚠️⚠️ **这是同步精度的终极手段：不打任何比例，逐行量出来存着。**
+ *    之前的做法（块内字符比例 / 行比例）本质都是"猜" ——
+ *    编辑区不折行、预览折行，再加上流程图/公式这种"源码几行、渲染一张图"的块，
+ *    任何比例都不可能对（用户原话："做什么都是无用的"）。
+ *
+ * 建表方式：对**多行锚点**内的每一行，取该行的文字片段，在锚点子树里用 `Range`
+ * 找到它的真实位置，读 `getBoundingClientRect().top` → 精确像素值。
+ * 单行锚点直接用它自己的 top（不用搜）。
+ *
+ * 成本：行数量级的 `indexOf + Range`（README 778 行实测几十毫秒），
+ *      只在 `buildAnchorTable()` 里做一次（渲染后 / 异步内容渲染完成后）。
+ */
+let lineTops = new Map();      // line → 预览内容内的 top（px）
+let lineTopsBase = null;       // 建表时的 scrollTop（判断是否需要重建）
+
+function buildLineTops(anchors, wrapRect, base) {
+    lineTops = new Map();
+    for (const a of anchors) {
+        const span = a.spanLines || 1;
+        // 单行锚点（绝大多数）→ 直接用测好的 top
+        if (span <= 1) {
+            if (a.line != null) lineTops.set(a.line, a.top);
+            continue;
+        }
+        // 多行锚点 → 逐行量
+        let searchFrom = 0;
+        for (let i = 0; i < span; i++) {
+            const ln = a.line + i;
+            const snip = sourceLineSnippet(ln);
+            if (!snip) continue;
+            const rg = findRangeIn(a.el, snip, 600, searchFrom);
+            if (!rg) continue;
+            const r = rg.getBoundingClientRect();
+            if (!r || (r.width === 0 && r.height === 0)) continue;
+            lineTops.set(ln, r.top - wrapRect.top + base);
+            // 下一行从这个匹配之后开始搜（块内重复文字不会命中前面）
+            searchFrom = Math.max(0, (a.el.textContent || '').indexOf(snip));
+        }
+    }
+    lineTopsBase = base;
+}
+
+/**
+ * 查「源码行 → 预览位置」。
+ *
+ * 表里没有这一行时（空行 / `</div>` 这种纯标签行 —— `sourceLineSnippet` 取不到文字，
+ * 所以量不出来），用**上下最近的两个已知行线性插值**。
+ * 这比全局比例准得多：插值区间只跨越几行，误差不会滚雪球。
+ */
+function lineTopOf(line) {
+    const v = lineTops.get(line);
+    if (v !== undefined) return v;
+    const total = editorLineStarts.length;
+    let lo = line - 1, hi = line + 1;
+    while (lo >= 0 && !lineTops.has(lo)) lo--;
+    while (hi < total && !lineTops.has(hi)) hi++;
+    const vlo = (lo >= 0) ? lineTops.get(lo) : undefined;
+    const vhi = (hi < total) ? lineTops.get(hi) : undefined;
+    if (vlo === undefined && vhi === undefined) return undefined;
+    if (vlo === undefined) return vhi;
+    if (vhi === undefined) return vlo;
+    return vlo + (vhi - vlo) * (line - lo) / (hi - lo);
+}
+
 /** 重建锚点表（预览 DOM 变了就重建） */
 function buildAnchorTable() {
     anchorList = [];
     const kids = Array.from(preview.children);
+    // 读一次全文（会先同步模型），下面每个块都用它搜
+    const src = editor.value;
     for (let k = 0; k < kids.length; k++) {
         const bl = blockLines[k];
-        if (!bl) continue;
-        const inner = contentElementOf(kids[k]);
-        const rows = splitRows(inner, bl.start);
-        for (const r of rows) { r.block = k; anchorList.push(r); }
+        const parts = splitIntoAnchors(kids[k]);
+        // ⚠️⚠️ **每个块用自己的 `bl.start` 作搜索起点，绝对不要跨块传 hint**。
+        //    踩过：某个块实测出一个靠后的错误行号 → hint 被推上去 →
+        //    后面所有块都"从那里往后搜"→ 搜不到 → 全部塌成同一个行号
+        //    （实测 355 个锚点中间那一段全变成 718，anchorAtLine 就彻底失效）。
+        //    `bl.start` 是 token 索引算出来的，不含原始 HTML 时是可靠的。
+        let hint = bl ? bl.start : 0;
+        for (const el of parts) {
+            let line = measureSourceLine(el, hint, src);
+            if (line < hint) {
+                // 实测失败 / 测到了前面 → 用块内的递增位置兜底（保证块内单调）
+                line = hint;
+            } else {
+                hint = line;
+            }
+            anchorList.push({ el, line, block: k });
+        }
     }
+    // 回填每个锚点的**行范围 + 字符范围**（用实测行号算）。
+    //
+    // ⚠️⚠️ **块内定位必须用「字符比例」，不能用「行比例」**。
+    //    编辑区是不折行的（`white-space: pre`），预览区会折行 ——
+    //    源码里 1 行长文字在预览里可能折成 10 个视觉行。
+    //    所以「行号比例」和「渲染高度比例」完全不成正比（AGENTS.md 早记过）；
+    //    **渲染高度大致正比于字符数**，只有字符比例能对上。
+    //    （上一轮我误改成了行比例 → README 长列表区同步明显偏移。）
+    const srcLen = src.length;
+    for (let i = 0; i < anchorList.length; i++) {
+        const cur = anchorList[i];
+        const nxt = anchorList[i + 1];
+        let endLine;
+        if (nxt && nxt.line > cur.line) {
+            endLine = nxt.line;
+        } else {
+            const bl = blockLines[cur.block];
+            endLine = bl ? (bl.start + bl.count) : cur.line + 1;
+        }
+        cur.spanLines = Math.max(1, endLine - cur.line);
+        // 字符范围：本锚点起始行 → 下一个锚点起始行
+        // ⚠️ 统一用 `editorLineStarts`（编辑区模型的权威行首表）。
+        //    `srcLineStarts` 是 computeBlockLines 为算行号临时建的，基于
+        //    “TOC 占位符已替换” 的文本 —— 两张表混用迟早对不上。
+        const c0 = editorLineStarts[cur.line];
+        const c1 = editorLineStarts[endLine];
+        cur.charStart = (c0 === undefined) ? 0 : c0;
+        cur.charLen = Math.max(1, ((c1 === undefined ? srcLen : c1)) - cur.charStart);
+    }
+
     // 顺带测位置（一次布局就够，后面的读取都走缓存）。
     // ⚠️ 必须在**渲染之外**做（下一帧）—— 渲染后布局是脏的，
     //    这时候测会强制整个预览（1.2 万个元素）重新布局 → 几百毫秒 → 卡死。
@@ -1732,9 +2257,27 @@ function buildAnchorTable() {
             a.top = r.top - wrapRect.top + base;     // 在预览内容里的位置
             a.height = r.height;
         }
+        // 逐行量出精确位置（查表就能定位，不用任何比例）
+        buildLineTops(anchorList, wrapRect, base);
     }
     anchorsDirty = false;
     return anchorList;
+}
+
+/**
+ * 异步渲染（Mermaid / KaTeX / 本地图片）改动过预览高度 → 位置表必须重测。
+ *
+ * ⚠️ **这是同步偏移的隐形来源**：`renderPreview()` 之后的 `scheduleAnchorMeasure()`
+ *    量到的是「Mermaid 还没渲染出来的源码块」的高度；等 SVG 真渲染出来，
+ *    块高度变了（常常差好几倍），但位置表没人重测 → 之后所有同步都按旧高度算，
+ *    越往下偏得越多。KaTeX / 图片同理（公式和图片撑开高度）。
+ *
+ *    所以：**每个异步渲染完成点都要叫一下这个**。
+ *    （`scheduleAnchorMeasure()` 自带 rAF 去重，反复调只跑一次。）
+ */
+function markPreviewLayoutChanged() {
+    anchorsDirty = true;
+    scheduleAnchorMeasure();
 }
 
 /**
@@ -1750,6 +2293,12 @@ function scheduleTocRender() {
     tocRenderRaf = requestAnimationFrame(() => {
         tocRenderRaf = 0;
         renderToc();
+        // ⚠️ 目录刚重建 → 先把高亮归位。
+        //    `alignedIdx` 可能还指着重构前的旧下标（甚至 -1），而目录 DOM 已经换了一批节点
+        //    → 不高亮的话打开文档时目录就是一片空白（实测）。
+        //    默认高亮第一节：`alignedIdx < 0` 时用 0。
+        if (alignedIdx < 0) alignedIdx = 0;
+        updateTocHighlight();
     });
 }
 
@@ -1801,11 +2350,30 @@ function blockOfAnchor(a) {
 function fracInBlock(a, topLine) {
     const bl = blockOfAnchor(a);
     if (!bl || !bl.charLen) return 0;
-    const i = Math.max(0, topLine - bl.start);
-    const lineStart = srcLineStarts[bl.start + i];
+    // ⚠️ **Mermaid / 块级公式：块内不做字符比例**。
+    //    它们的源码就那么几行（`flowchart LR` + 几条边），渲染出来却是一整张图，
+    //    高度和源码字符数**完全不成比例** —— 按字符比例算，块内滚到第 3 行
+    //    就可能偏出去 5 行（实测）。直接贴到块起点最实在：误差上限就是块高，
+    //    但绝不会跑到别的块去。
+    const cls = a.el && a.el.classList;
+    if (cls && (cls.contains('mermaid-block') || cls.contains('math-block'))) return 0;
+
+    // 单行锚点（绝大多数 li）→ 直接贴到它，不用插值
+    if ((a.spanLines || 1) <= 1) return 0;
+
+    // ⚠️⚠️ **字符比例**（不是行比例）。
+    //    编辑区不折行、预览会折行：源码 1 行长文字可能高 10 个视觉行，
+    //    「行比例」和「渲染高度比例」完全不成正比，只有**字符比例**能对上。
+    //    范围用**锚点自己的**（实测行号算的 charStart/charLen），不是整块的 token 范围 ——
+    //    锚点已经拆到 `<li>` 粒度，范围小了，误差也跟着小。
+    const charStart = (a.charStart !== undefined) ? a.charStart
+        : (editorLineStarts[a.line] === undefined ? 0 : editorLineStarts[a.line]);
+    const charLen = (a.charLen !== undefined ? a.charLen : 1);
+    const i = Math.max(0, topLine - a.line);
+    const lineStart = editorLineStarts[a.line + i];
     if (lineStart === undefined) return 0;
-    const charInBlock = Math.max(0, lineStart - bl.charStart);
-    return Math.max(0, Math.min(charInBlock / bl.charLen, 1));
+    const charIn = Math.max(0, lineStart - charStart);
+    return Math.max(0, Math.min(charIn / charLen, 1));
 }
 
 /** 锚点内某个比例（0~1）对应源码的哪一行 */
@@ -1825,9 +2393,12 @@ function lineOfCharInBlock(a, frac) {
 /** 找“源码行 <= line 的最后一个锚点” */
 function anchorAtLine(line) {
     let best = null;
+    // ⚠️ **不要用 `else break`**：只要锚点行号有一处倒退（实测实测行号可能重复/回退），
+    //    break 之后所有锚点都看不到 → 任何位置都返回同一行。
+    //    这里全表扫一遍取「line <= target 且最靠后」的那个，慢一点但不会错。
+    //    （锚点数 355 量级，每次滚动一次，开销可以忽略；1MB 文档也不会超过几万次比较。）
     for (const a of anchorList) {
-        if (a.line <= line) best = a;
-        else break;
+        if (a.line <= line && (!best || a.line >= best.line)) best = a;
     }
     return best;
 }
@@ -1998,12 +2569,16 @@ function applyScrollByRatio(fromEditor) {
  *  同一个章节里滚动时预览区不动（不抖），跳章节时才动。
  *  两边对齐到章节起点，位置永远可预测。
  */
-// ---- 诊断：滚动同步调用计数 + 熔断 ----
-// 如果两边在来回拉扯（乒乓循环），一帧内会被调用几百次 → 主线程 100% CPU。
-// 这里数一下，超过阈值就**停止同步**（宁可不同步，也不能卡死），
-// 并把计数写进窗口标题 —— 外部读进程标题就能看到。
+// ---- 诊断：滚动同步调用计数（**只计数，不熔断**）----
+//
+// ⚠️⚠️ 以前这里有个"熔断"：一帧内调用超过 60 次就 `scrollSyncBurst = true`
+//    并且**永不重置** → 之后所有滚动同步直接跳过（`if (scrollSyncBurst) return false`）。
+//    而复位靠 `requestAnimationFrame` —— **窗口隐藏/最小化时 rAF 根本不跑**，
+//    计数一路累积，切回窗口时一帧就 > 40 → 熔断 → **滚动同步永久失效**
+//    （典型症状：切到别的程序再回来，编辑区怎么滚预览都不动，但点击定位正常）。
+//    单向同步（只有 编辑 → 预览）之下根本不存在"两边拉扯"，熔断没有意义。
+//    现在只保留计数写进窗口标题（诊断用），永远不阻断同步。
 let scrollSyncCount = 0;
-let scrollSyncBurst = false;
 /** 诊断信息（会拼进窗口标题，外部读进程标题就能看到） */
 let diagInfo = '';
 let scrollSyncRaf = 0;
@@ -2011,15 +2586,12 @@ function scrollSyncTick() {
     if (scrollSyncRaf) return;
     scrollSyncRaf = requestAnimationFrame(() => {
         scrollSyncRaf = 0;
-        if (scrollSyncCount > 0) {
-            const n = scrollSyncCount;
-            scrollSyncCount = 0;
-            if (n > 40 && !scrollSyncBurst) {
-                scrollSyncBurst = true;
-                diagInfo = 'BURST' + n;
-            }
-        }
+        const n = scrollSyncCount;
+        scrollSyncCount = 0;
+        if (n > 40) diagInfo = 'BURST' + n;   // 只记录，不阻断
     });
+    // rAF 在窗口隐藏时不跑 → 挂个定时器兜底清零，免得计数无限累积
+    setTimeout(() => { scrollSyncCount = 0; }, 200);
 }
 /**
  * 滚动同步的**节流调度** —— 一帧最多做一次。
@@ -2030,6 +2602,11 @@ function scrollSyncTick() {
  *    = 主线程 100% CPU → 输入卡死。节流到一帧一次后开销降到 1/60。
  */
 let scrollSyncThrottleRaf = 0;
+/**
+ * @param side 目前**只有 `'editor'`**（编辑 → 预览）。
+ *   预览 → 编辑 的自动同步已取消（原因见 syncEditorFromPreviewClick()），
+ *   那条方向改成「用户点击预览才定位」，不走这里。
+ */
 function scheduleScrollSync(side) {
     if (scrollSyncThrottleRaf) return;
     scrollSyncThrottleRaf = requestAnimationFrame(() => {
@@ -2038,40 +2615,289 @@ function scheduleScrollSync(side) {
         else applyScrollToEditor();
     });
 }
+/**
+ * ⚠️ **永远返回 true** —— 只做诊断计数，不再熔断（原因见上面 scrollSyncTick 的注释）。
+ *    保留函数是为了调用点不用改。
+ */
 function scrollSyncGuard() {
     scrollSyncCount++;
     scrollSyncTick();
-    if (scrollSyncBurst) return false;   // 已经熔断
-    if (scrollSyncCount > 60) {         // 一帧内 60 次 → 一定在拉扯
-        scrollSyncBurst = true;
-        diagInfo = 'BURST' + scrollSyncCount;
-        return false;
-    }
     return true;
+}
+
+/**
+ * 「块锚点表」什么时候可信？
+ *
+ * 只有在**顶层 token 数 == 顶层 DOM 元素数**时才可信。
+ * 有原始 HTML 的文档里这两者必然不等（实测：40 个 `<div>` 各包 4 个 token
+ * → blockLines=160、preview.children=40）→ 锚点表里每个锚点的 `line`
+ * 都是拿错位的 token 算出来的 → 同步会跳**到别的章节去**。
+ */
+function blockAnchorsTrustworthy() {
+    return blockLines.length > 0 && preview.children.length === blockLines.length;
 }
 
 function applyScrollToPreview() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
+    // ⚠️ **不能只信 previewScrollMax 这个缓存**：异步渲染（Mermaid / KaTeX / 图片）
+    //    会把预览撑高，而缓存可能还停在旧值 → 目标位置被钳到旧底部，
+    //    表现成"滚到下面就不动了"（实测 817 vs 实际 896）。
+    //    滚动事件里布局是干净的，读一次 scrollHeight 是免费的。
     if (!previewScrollMax) refreshPreviewScrollMax();
-    const maxPrev = previewScrollMax;
-    if (!lh || !anchorList.length) { applyScrollByRatio(true); return; }
+    const maxPrev = Math.max(previewScrollMax,
+        previewScroll.scrollHeight - previewScroll.clientHeight);
+    if (!lh) { applyScrollByRatio(true); return; }
+
+    // ⚠️ 用缓存的滚动位置，别读 editor.scrollTop（布局脏时读它 = 强制重排 288ms）
+    // ⚠️ 钳到 0：滚到顶部时 (0 - padTop) / lh 是负数（同上）
+    const topLine = Math.max(0, Math.floor((editorScrollTop - padTop) / lh));
+
+    // 块锚点表不可信（文档里有包裹型原始 HTML）→ 退回章节锚点
+    if (!blockAnchorsTrustworthy() || !anchorList.length) {
+        applyScrollToPreviewByChapter(topLine, maxPrev);
+        return;
+    }
+
+    // ---- 最优先：**精确行位置表**（逐行量出来的，不含任何比例）----
+    if (lineTops.size) {
+        const exact = lineTopOf(topLine);
+        if (exact !== undefined) {
+            const want = Math.max(0, Math.min(exact, maxPrev));
+            if (Math.abs(previewScroll.scrollTop - want) < 2) { updateAlignedChapter(); return; }
+            setScrollTop(previewScroll, want);
+            updateAlignedChapter();
+            return;
+        }
+    }
 
     // 锚点 = 源码顶行所在的预览元素（**精确查表**，不是按比例估算）
-    // ⚠️ 用缓存的滚动位置，别读 editor.scrollTop（布局脏时读它 = 强制重排 288ms）
-    const topLine = Math.floor((editorScrollTop - padTop) / lh);
     const a = anchorAtLine(topLine);
-    if (!a) { applyScrollByRatio(true); return; }
+    if (!a) { applyScrollToPreviewByChapter(topLine, maxPrev); return; }
     // 锚点内部的位置用**字符比例**：长段落里源码几行、预览折成十几行，
     // 行高完全不成比例，只有字符比例能对上。
-    const frac = fracInBlock(a, topLine);
     // 位置表还没测好（刚渲染完）→ 按比例兜底，别在输入路径里强制重排
     if (anchorsDirty) { applyScrollByRatio(true); return; }
     ensureAnchorPositions();
+
+    // ---- 块内按字符比例 ----
+    // ⚠️ 试过"块内再做一次文本匹配"（在锚点元素子树里 findRangeIn），
+    //    结果**更差**：列表块的 textContent 把多个 `<li>` 拼在一起，
+    //    `indexOf` 容易命中靠后的同名文本 → README 实测误差从 -23 变成 +76/+99。
+    //    所以块内保持字符比例，只在**章节级**（`applyScrollToPreviewByChapter`）用文本匹配。
+    //    已知限制：长列表 / 长引用块内，字符比例会偏几行到几十行（渲染高度和小节间距不成正比）。
+    const frac = fracInBlock(a, topLine);
     // 目标位置 = 锚点在内容里的位置 + 块内比例偏移
     const target = a.top + frac * (a.height || 0);
     const want = Math.max(0, Math.min(target, maxPrev));
     // 幂等保护：已经在位就不动（不然同步→预览滚→回弹→反向同步… 来回拉扯）
+    if (Math.abs(previewScroll.scrollTop - want) < 2) { updateAlignedChapter(); return; }
+    setScrollTop(previewScroll, want);
+    updateAlignedChapter();
+}
+
+/**
+ * 取编辑区某一行的「可搜索片段」：剥掉 markdown 结构前缀和行内标记，
+ * 只留渲染后也会出现的纯文字。
+ *
+ * 用来在预览 DOM 里做文本匹配 —— 这是**唯一不受块索引错位影响**的对齐手段。
+ * 返回空串表示这行没有可用的文字（空行、纯 HTML 标签行），走比例兜底。
+ */
+const SNIPPET_MIN = 4;
+const SNIPPET_LEN = 16;
+function sourceLineSnippet(line) {
+    if (line == null || line < 0) return '';
+    const starts = editorLineStarts;
+    if (!starts.length || line >= starts.length) return '';
+    const s0 = starts[line];
+    const s1 = (line + 1 < starts.length) ? starts[line + 1] : editorText.length;
+    let t = editorText.slice(s0, s1).replace(/\r?\n+$/, '');
+    // 结构前缀：# 标题 / > 引用 / - 列表 / 1. 有序列表 / 缩进
+    t = t.replace(/^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)?/, '');
+    // 行内标记：**粗** *斜* `code` [文字](url) ~~删除~~
+    t = t.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+         .replace(/[*_`~]/g, '')
+         .replace(/<[^>]*>/g, '');      // 行内 HTML 标签不算文字
+    t = t.trim();
+    if (t.length < SNIPPET_MIN) return '';
+    return t.slice(0, SNIPPET_LEN);
+}
+
+/**
+ * 取 topLine **附近**的可搜索片段：顶行常常是空行或纯 HTML 标签行（`</div>`），
+ * 那种行取不到文字 → 往下找 1~3 行（不超出本节/本块），再往上找。
+ *
+ * @param from 向下搜索不能越过这个行号（本块/本节的结束行），-1 = 不限制
+ * @param to   向上搜索不能越过这个行号（本块/本节的开始行），-1 = 不限制
+ * @returns {{ snip: string, line: number }}  line = 实际取到文字的那一行（-1 = 没找到）
+ */
+function snippetNear(topLine, to, from) {
+    for (let d = 0; d < 4; d++) {
+        const ln = topLine + d;
+        if (from >= 0 && ln >= from) break;
+        const t = sourceLineSnippet(ln);
+        if (t) return { snip: t, line: ln };
+    }
+    for (let d = 1; d < 4; d++) {
+        const ln = topLine - d;
+        if (to >= 0 && ln < to) break;
+        const t = sourceLineSnippet(ln);
+        if (t) return { snip: t, line: ln };
+    }
+    return { snip: '', line: -1 };
+}
+
+/**
+ * 在容器子树里找 snip，返回**一个 Range**（起点落在匹配处）。
+ *
+ * ⚠️⚠️ **不能用「遍历文本节点 + indexOf」**：行内标记（`<code>` / `<strong>`）
+ *    会把一句话切成好几个文本节点 —— `切换模式后要用 \`setTimeout\` 刷新`
+ *    在 DOM 里是「切换模式后要用 」+「setTimeout」+「 刷新」三个节点，
+ *    任何单个节点的 `indexOf` 都找不到 → 大量 miss（实测 7/9 全 miss）。
+ *    所以必须用 `container.textContent` 搜（它把子节点文字拼起来），
+ *    再把字符偏移映射回具体的节点 + 偏移。
+ *
+ * @returns {Range|null}
+ */
+function findRangeIn(container, snip, limit, fromIdx) {
+    if (!container || !snip) return null;
+    const full = container.textContent || '';
+    const start = (fromIdx > 0) ? fromIdx : 0;
+    let idx = full.indexOf(snip, start);
+    // 从 fromIdx 往后找不到 → 退回从头（可能是行首有 markdown 前缀被剥掉了）
+    if (idx < 0 && start > 0) idx = full.indexOf(snip);
+    if (idx < 0) return null;
+    // 把 textContent 的字符偏移映射回（文本节点, 节点内偏移）
+    const tw = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    let n, acc = 0, count = 0;
+    while ((n = tw.nextNode())) {
+        if (++count > limit) return null;
+        const len = n.nodeValue.length;
+        if (acc + len > idx) {
+            const r = document.createRange();
+            const startOff = idx - acc;
+            try {
+                r.setStart(n, startOff);
+                r.setEnd(n, Math.min(len, startOff + 1));
+            } catch (e) { return null; }
+            return r;
+        }
+        acc += len;
+    }
+    return null;
+}
+
+/**
+ * 章节 k 对应的「预览搜索容器」：包含本章标题和结束位置的最小元素。
+ * 被原始 HTML 包裹时，各章节的块会共用同一个父容器（比如同一个 `<div>`），
+ * 这时容器就是那个 div —— 范围小、扫得快。
+ */
+function chapterSearchContainer(k) {
+    const pairs = headingPairs;
+    const cur = pairs[k];
+    if (!cur || !cur.el) return null;
+    const startEl = cur.el;
+    const endEl = pairs[k + 1] ? pairs[k + 1].el : null;
+    // 找包含 startEl 和 endEl 的最小共同祖先；找不到就用 startEl 的父节点
+    let c = startEl.parentNode;
+    if (!c) return null;
+    if (endEl && !c.contains(endEl)) {
+        // 下一节不在同一容器里 → 用 startEl 自己的容器
+        c = startEl.parentNode;
+    }
+    return c;
+}
+
+/**
+ * 编辑区 → 预览：**按章节锚点 + 章节内比例**。
+ *
+ * 用在「块锚点表不可信」的文档上（含包裹型原始 HTML）。
+ * 为什么还要用它：块索引错位时，直接跳块会跳到**别的章节**去；
+ * 而标题映射（`headingPairs`）是**按文本匹配**建的，HTML 文档里照样准 ——
+ * 所以退到「章节对齐」至少保证"不会跳错节"，章节内按行数比例近似。
+ *
+ * 精度：章节内不如块锚点（源码行数与渲染高度不成比例），
+ * 但实测同一章节内的偏差只有一两行，比"跳到错误章节"好得多。
+ */
+function applyScrollToPreviewByChapter(topLine, maxPrevFallback) {
+    if (!editor || !previewScroll) return;
+    const pairs = headingPairs;
+    // 没有标题（或位置还没测好）→ 全文按比例兜底
+    if (!pairs.length || anchorsDirty) { applyScrollByRatio(true); return; }
+
+    // ⚠️ `lh` 必须在这里自己取 —— 它不是本函数的参数。
+    //    之前直接用了调用方 applyScrollToPreview() 的局部变量 `lh` →
+    //    ReferenceError → 整个函数抛错 → 滚动根本没执行。
+    //    而这个异常在 scroll 事件回调里是**静默**的，表现成“同步完全不动”（踩过）。
+    const { lh } = editorMetrics();
+
+    // ⚠️ **别直接用 previewScrollMax 这个缓存**：它可能是 0（还没量过），
+    //    那下面 `Math.min(t, maxPrev)` 会把目标位置全钳成 0 →
+    //    预览永远滚不动（实测：点哪都停在顶部）。
+    if (!previewScrollMax) refreshPreviewScrollMax();
+    const liveMax = Math.max(0, previewScroll.scrollHeight - previewScroll.clientHeight);
+    const maxPrev = Math.max(previewScrollMax, liveMax, maxPrevFallback || 0);
+    const wrapRect = previewScroll.getBoundingClientRect();
+    const base = previewScroll.scrollTop;
+    /** 某个预览元素在内容里的顶部位置（实时量，不走可能错位的锚点表） */
+    const topOf = (el) => base + (el.getBoundingClientRect().top - wrapRect.top);
+
+    // topLine 之前最近的那个标题（可能 -1 = 还在第一个标题上面的前言区）
+    const k = headingIndexAtLine(topLine);
+    let srcStart, srcEnd, prevStart, prevEnd;
+    if (k >= 0) {
+        srcStart = pairs[k].line;
+        prevStart = topOf(pairs[k].el);
+        const nxt = pairs[k + 1];
+        if (nxt) {
+            srcEnd = nxt.line;
+            prevEnd = topOf(nxt.el);
+        } else {
+            // 最后一节：到文档末尾
+            srcEnd = Math.max(srcStart + 1, editorLineStarts.length);
+            prevEnd = previewScroll.scrollHeight;
+        }
+    } else {
+        srcStart = 0;
+        prevStart = 0;
+        srcEnd = pairs[0].line;
+        prevEnd = topOf(pairs[0].el);
+    }
+
+    // ---- 优先：章节内按**文本内容**定位（比行数比例准得多） ----
+    // 块索引在 HTML 文档里是错位的，但"这段文字在预览的哪个位置"永远是对的。
+    // 限制扫描节点数，扫不到（或这行没有可搜文字）就退回比例。
+    if (k >= 0) {
+        // ⚠️ 顶行常常是**空行**或纯 HTML 标签行（`</div>`）→ 取不到可搜文字。
+        //    往下找最近的有文字的几行：用户看到的本来就是"空行下面那段内容"，
+        //    用那段的文字定位，误差最多一两行，比纯比例准得多。
+        const near = snippetNear(topLine, srcStart, srcEnd);
+        const snip = near.snip, usedLine = near.line;
+        if (snip) {
+            const box = chapterSearchContainer(k);
+            const rg = findRangeIn(box, snip, 600);
+            if (rg) {
+                const r = rg.getBoundingClientRect();
+                // 用"往下第几行"的文本定位 → 回退相应行高，让顶行尽量对准视口顶部
+                let t = base + (r.top - wrapRect.top);
+                // 定位用的是"附近某一行"的文字 → 按行差回补，让视口顶部尽量对到顶行
+                if (usedLine !== topLine) t -= (usedLine - topLine) * lh;
+                t = Math.max(0, Math.min(t, maxPrev));
+                if (Math.abs(previewScroll.scrollTop - t) >= 2) {
+                    setScrollTop(previewScroll, t);
+                } else {
+                    updateAlignedChapter();
+                }
+                return;
+            }
+        }
+    }
+
+    const span = srcEnd - srcStart;
+    const frac = span > 0 ? Math.max(0, Math.min((topLine - srcStart) / span, 1)) : 0;
+    const target = prevStart + frac * (prevEnd - prevStart);
+    const want = Math.max(0, Math.min(target, maxPrev));
+    // 幂等保护：已经在位就不动（不然同步→预览滚→回弹… 来回拉扯）
     if (Math.abs(previewScroll.scrollTop - want) < 2) { updateAlignedChapter(); return; }
     setScrollTop(previewScroll, want);
     updateAlignedChapter();
@@ -2088,7 +2914,7 @@ function applyScrollToPreviewByBlock() {
         applyScrollByRatio(true);
         return;
     }
-    const topLine = Math.floor((editorScrollTop - padTop) / lh);
+    const topLine = Math.max(0, Math.floor((editorScrollTop - padTop) / lh));
     const k = blockIndexAtLine(topLine);
     if (k < 0) { applyScrollByRatio(true); return; }
     const el = preview.children[k];
@@ -2105,6 +2931,14 @@ function applyScrollToPreviewByBlock() {
 /** 把预览区的位置应用到编辑区（预览区 → 编辑区）
  *
  *  同样按**标题节点**对齐：当前章节的标题 → 源码里那一行。
+ */
+/**
+ * 预览 → 编辑区（按标题锚点）。
+ *
+ * ⚠️ **当前没有调用点** —— 「预览滚动 → 编辑区自动同步」已经取消，
+ *    改成了「点击预览才定位」（syncEditorFromPreviewClick()，那条路走文本匹配）。
+ *    函数留着是因为它把几个坑都处理过了（钳制会让两边分叉、幂等保护、
+ *    块内按字符比例），以后如果要加回"可选的双向同步"直接能用。
  */
 function applyScrollToEditor() {
     if (!editor || !previewScroll) return;
@@ -2146,7 +2980,10 @@ function applyScrollToEditor() {
     updateAlignedChapter(line);
 }
 
-/** 块级对齐（文档没有标题时的兜底） */
+/**
+ * 块级对齐（文档没有标题时的兜底）。
+ * ⚠️ 同上：当前没有调用点（预览 → 编辑的自动同步已取消）。
+ */
 function applyScrollToEditorByBlock() {
     if (!editor || !previewScroll) return;
     const { lh, padTop } = editorMetrics();
@@ -2242,10 +3079,12 @@ function scheduleImeScrollSync() {
 previewScroll && previewScroll.addEventListener('scroll', () => {
     if (syncing || !editor) return;
     if (isEchoScrollEvent(previewScroll)) return;  // 这是程序自己同步过来的 → 忽略
-    if (!settings.scrollSync) return;        // 设置里关掉了同步
-    if (!scrollSyncGuard()) return;          // 诊断：熔断
+    // 方向要记：目录高亮靠它判断"当前章节取视口的哪一端"。
     noteScrollDir('preview', previewScroll);
-    scheduleScrollSync('preview');
+    // ⚠️ **不再调 scheduleScrollSync('preview')** ——
+    //    预览 → 编辑 的**自动**同步已经取消，原因见 syncEditorFromPreviewClick()：
+    //    有原始 HTML 的文档里块索引根本对不上，自动同步=自动跳错。
+    //    改成"用户点击预览才定位"（那条路走文本匹配，不依赖块索引）。
 });
 
 // ============ 预览 HTML 消毒 ============
@@ -2568,8 +3407,10 @@ function resolveLocalImages() {
         }
     }).finally(() => {
         localImagePending--;
+        // 图片一露出来就把高度撑开了 → 位置表重测（只在这一批全转完时做一次）
         if (localImagePending <= 0) {
             localImagePending = 0;
+            markPreviewLayoutChanged();
             const ws = localImageWaiters;
             localImageWaiters = [];
             ws.forEach(fn => fn());
@@ -2848,6 +3689,8 @@ function queueMath(roots) {
             }
             // 处理 ```latex / ```math / ```tex 代码块：当作块级数学公式渲染
             renderLatexBlocks();
+            // 公式把行内文字撑高 / 块级公式撑开一大截 → 位置表重测
+            markPreviewLayoutChanged();
         } catch (e) {
             console.warn('KaTeX render error:', e);
         }
@@ -3064,7 +3907,10 @@ function rerenderMermaid() {
                 .catch(e => {
                     container.replaceChildren(renderErrorBox('Mermaid', e.message, ''));
                 })
-                .finally(() => { mermaidPending--; });
+                .finally(() => {
+                    mermaidPending--;
+                    markPreviewLayoutChanged();   // 换主题后图的高度可能变
+                });
         });
     });
 }
@@ -3126,9 +3972,12 @@ function renderMermaidBlocks(root = preview) {
         }).then(({ svg }) => {
             container.innerHTML = svg;
             container.dataset.mermaidRendered = '1';
+            // 图和源码块的高度差很多 → 位置表必须重测
+            markPreviewLayoutChanged();
         }).catch(e => {
             container.replaceChildren(renderErrorBox('Mermaid', e.message, source));
             container.dataset.mermaidRendered = '1';
+            markPreviewLayoutChanged();
         }).finally(() => {
             mermaidPending--;
         });
@@ -3374,7 +4223,9 @@ function currentHeadingElement(dir) {
 function editorTopLine() {
     const { lh, padTop } = editorMetrics();
     if (!lh) return 0;
-    return Math.floor((editorScrollTop - padTop) / lh);
+    // ⚠️ **必须钳到 0**：scrollTop=0 时 (0 - paddingTop) / lineHeight 是负数，
+    //    Math.floor 之后变成 -1 → anchorAtLine(-1) 找不到 → 每次都退回按比例兜底。
+    return Math.max(0, Math.floor((editorScrollTop - padTop) / lh));
 }
 
 // 记录“两边当前对齐到哪一节”（目录高亮用它）。
@@ -3403,6 +4254,30 @@ function updateAlignedChapter(line) {
     updateTocHighlight();
 }
 
+/**
+ * 让某个目录项滚进目录栏的可见区（最小滚动）。
+ *
+ * ⚠️ 滚动容器是 `#toc`（tocEl），**不是 `#toc-list`** —— 后者只有 padding。
+ *
+ * 只在**高亮项变化时**调（`updateTocHighlight` 里有 tocActiveId 幂等保护），
+ * 所以频率是「每跨一节一次」，不会在滚动预览时每帧都动目录。
+ * 用最小滚动而不是 scrollIntoView({block:'center'})：居中会让目录每次都大跳，
+ * 只补它露不出来的那部分，视觉上安静得多。
+ */
+function scrollTocItemIntoView(el) {
+    if (!el || !tocEl) return;
+    const view = tocEl.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    const margin = 12;      // 上下留一点，贴边看着难受
+    // 已经完整可见 → 不动
+    if (r.top >= view.top + margin && r.bottom <= view.bottom - margin) return;
+    if (r.top < view.top + margin) {
+        tocEl.scrollTop -= (view.top + margin) - r.top;
+    } else {
+        tocEl.scrollTop += (r.bottom + margin) - view.bottom;
+    }
+}
+
 function updateTocHighlight() {
     if (!previewScroll) return;
     const pair = alignedIdx >= 0 ? headingPairs[alignedIdx] : null;
@@ -3423,6 +4298,8 @@ function updateTocHighlight() {
     if (next && next.classList && next.classList.contains('toc-item')) {
         next.classList.add('active');
         tocActiveEl = next;
+        // 目录有几千项时，当前项很可能在可视区外 → 跟着滚过去
+        scrollTocItemIntoView(next);
     }
 }
 
@@ -3598,7 +4475,16 @@ function refreshEditorLineHeight() {
 }
 
 /** 把编辑区精确滚动到第 line 行（0 起） */
-function scrollEditorToLine(line) {
+/**
+ * 把编辑区滚到某一行。
+ *
+ * @param marginTop 目标行**上方**留多少 px 空白（0 / 不传 = 贴着视口顶部）。
+ *
+ * ⚠️ 点击预览定位要传一个正值：贴着顶部的话目标行只剩一行挤在最上面，
+ *    用户根本没法确认"是不是这里"（实测报了这个问题）。
+ *    TOC 跳转/锚点跳转保持 0 —— 那是"跳到某一节"，顶部对齐是标准行为。
+ */
+function scrollEditorToLine(line, marginTop) {
     // ⚠️ 每次都刷新行高 —— 文字缩放会改行高，用旧值算出来的位置是错的
     //    （缓存只在启动时刷新过一次，缩放后就过期了）
     refreshEditorLineHeight();
@@ -3606,7 +4492,18 @@ function scrollEditorToLine(line) {
     const padTop = parseFloat(cs.paddingTop) || 0;   // 滚动的原点是 padding 顶边，要补上
     // ⚠️ **向上取整**：行高是小数（如 22.95），算出来的位置会被浏览器量化，
     //    少零点几像素就落在**上一行** → 章节判定差一节（实测踩过）。
-    setScrollTop(editor, Math.ceil(line * editorLineHeight + padTop));
+    const m = Math.max(0, marginTop | 0);
+    setScrollTop(editor, Math.max(0, Math.ceil(line * editorLineHeight + padTop) - m));
+}
+
+/** 点击预览定位时，目标行上方留多少空白（视口高度的比例） */
+const PREVIEW_LOCATE_MARGIN_RATIO = 0.25;
+
+/** 算「点击预览定位」该留的上边距：大约视口高度的 1/4 */
+function previewLocateMargin() {
+    const h = edEl.clientHeight || editorBox.clientH || 0;
+    if (h <= 0) return 80;
+    return Math.max(24, Math.min(Math.round(h * PREVIEW_LOCATE_MARGIN_RATIO), 220));
 }
 
 // 上一次渲染目录时的「标题结构」签名。每次输入都会重跑 renderPreview()，
@@ -3622,6 +4519,26 @@ let tocActiveEl = null;
 const TOC_MAX_ITEMS = 2000;
 
 /** 目录项点击 —— 事件委托（目录可能有上万个节点，逐个 addEventListener 太贵） */
+
+/**
+ * 程序主动滚动之后解锁 `syncing`。
+ *
+ * 两帧后解锁（预览 + 编辑区的 scroll 事件都派发完了），
+ * **同时挂一个 setTimeout 兜底** —— 窗口隐藏/最小化时 rAF 不会执行，
+ * 只靠 rAF 会让 `syncing` 永久停在 true → 之后滚动同步彻底失效（踩过）。
+ */
+function unlockAfterScrollSync() {
+    let done = false;
+    const unlock = () => {
+        if (done) return;
+        done = true;
+        syncing = false;
+    };
+    requestAnimationFrame(() => requestAnimationFrame(unlock));
+    setTimeout(unlock, 150);
+}
+
+/** 目录项点击 */
 function onTocItemClick(e) {
     const div = e.target && e.target.closest ? e.target.closest('.toc-item') : null;
     if (!div) return;
@@ -3631,44 +4548,35 @@ function onTocItemClick(e) {
     //    必须按 id 从当前预览里重新查，不能依赖任何捕获的元素。
     const target = document.getElementById(div.dataset.id);
     if (!target) return;
-    // 锁住自动同步，防止 smooth scroll 的中间帧把编辑区拽回原位
+
+    // 锁住自动同步：下面会主动滚两个区，期间的 scroll 事件不该反过来改位置
     syncing = true;
-    const top = target.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top + previewWrap.scrollTop - 12;
-    previewWrap.scrollTo({ top, behavior: 'smooth' });
+
+    // ⚠️ **不用 smooth 动画**。原来用 `scrollTo({behavior:'smooth'})`：
+    //    动画期间目标一直在动，用户根本没法判断"到位了没有"；
+    //    而且动画被打断/被钳制时还得靠 scrollend + 1200ms 兜底 + 二次校正去补，
+    //    代码绕、效果还不稳。直接 instant 一跳到位最干脆。
+    const top = target.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top
+        + previewWrap.scrollTop - 12;
+    setScrollTop(previewWrap, Math.max(0, top));
+
     // 编辑区精确落到对应的那一行（行号由 syncTocLines() 维护，从 dataset 读最新的）
     const line = parseInt(div.dataset.line, 10);
     if (!isNaN(line)) scrollEditorToLine(line);
-    // ⚠️ **这次点击对应的是哪个章节** —— 跳转结束后要把目录高亮挪到它身上。
-    //    （跳转期间 syncing=true，所有 scroll 事件都被忽略 → 高亮不会被更新；
-    //      不主动设置的话，目录高亮会一直停在原来那一项。）
+
+    // 目录高亮主动归位（跳转期间 syncing=true，scroll 事件被忽略 → 没人会更新它）
     const clickIdx = headingPairs.findIndex(p => p.el && p.el.id === div.dataset.id);
-    // 跳转结束后解锁。这里不能再按比例同步一次 —— 那会把精确位置冲掉。
-    let finished = false;
-    const done = () => {
-        if (finished) return;
-        finished = true;
-        previewWrap.removeEventListener('scrollend', done);
-        clearTimeout(fallback);
-        syncing = false;
-        // 主动把目录高亮挪到刚点击的那一项
-        if (clickIdx >= 0) {
-            alignedIdx = clickIdx;
-            updateTocHighlight();
-        } else if (!isNaN(line)) {
-            updateAlignedChapter(line);
-        }
-        // ⚠️ 校正：smooth 滚动可能没到位（被钳制 / 被打断 / 行高算错），
-        //    这里按目标再对一次，直接跳到位（不再 smooth）。
-        const maxPrev = previewWrap.scrollHeight - previewWrap.clientHeight;
-        if (top <= maxPrev && Math.abs(previewWrap.scrollTop - top) > 4) {
-            setScrollTop(previewWrap, top);   // 预览自己跳的
-        }
-    };
-    previewWrap.addEventListener('scrollend', done);
-    // 兜底：位置没变（不会触发 scrollend）或动画被打断
-    const fallback = setTimeout(done, 1200);
-    // 已经在目标位置 → 不会有 scroll 事件，直接解锁
-    if (Math.abs(previewWrap.scrollTop - top) < 2) done();
+    if (clickIdx >= 0) {
+        alignedIdx = clickIdx;
+        updateTocHighlight();
+    } else if (!isNaN(line)) {
+        updateAlignedChapter(line);
+    }
+
+    // 解锁：两帧后（足够让预览和编辑区的 scroll 事件都派发完）。
+    // ⚠️ **必须加 setTimeout 兜底** —— 窗口隐藏时 rAF 根本不执行，
+    //    只靠 rAF 解锁会让 `syncing` 永久卡在 true，之后滚动同步彻底失效。
+    unlockAfterScrollSync();
 }
 
 /**
@@ -3701,33 +4609,21 @@ function jumpToPreviewAnchor(href) {
     if (!target || !preview.contains(target)) return false;
     const previewWrap = document.getElementById('preview-wrap');
     if (!previewWrap) return false;
-    // 锁住自动同步，防止 smooth scroll 的中间帧把编辑区拽回原位
+
     syncing = true;
+    // 同样是 instant 跳，不留动画（理由同 onTocItemClick）
     const top = target.getBoundingClientRect().top - previewWrap.getBoundingClientRect().top
         + previewWrap.scrollTop - 12;
-    previewWrap.scrollTo({ top, behavior: 'smooth' });
+    setScrollTop(previewWrap, Math.max(0, top));
+
     // 编辑区也跟到对应标题行（有映射时）
     const idx = headingPairs.findIndex(p => p.el === target);
     if (idx >= 0 && typeof headingPairs[idx].line === 'number') {
         scrollEditorToLine(headingPairs[idx].line);
     }
-    let finished = false;
-    const done = () => {
-        if (finished) return;
-        finished = true;
-        previewWrap.removeEventListener('scrollend', done);
-        clearTimeout(fallback);
-        syncing = false;
-        if (idx >= 0) { alignedIdx = idx; updateTocHighlight(); }
-        // 校正：smooth 滚动可能没到位（被钳制 / 被打断）
-        const maxPrev = previewWrap.scrollHeight - previewWrap.clientHeight;
-        if (top <= maxPrev && Math.abs(previewWrap.scrollTop - top) > 4) {
-            setScrollTop(previewWrap, top);
-        }
-    };
-    previewWrap.addEventListener('scrollend', done);
-    const fallback = setTimeout(done, 1200);
-    if (Math.abs(previewWrap.scrollTop - top) < 2) done();
+    if (idx >= 0) { alignedIdx = idx; updateTocHighlight(); }
+
+    unlockAfterScrollSync();
     return true;
 }
 
@@ -3795,7 +4691,7 @@ function renderToc() {
                 el.dataset.line = String(it.line);
             }
         }
-        tocList.scrollTop = keepScroll;   // 没重建，scrollTop 本来就没动，保险起见还是写回
+        tocEl.scrollTop = keepScroll;   // 没重建，scrollTop 本来就没动，保险起见还是写回
         updateTocHighlight();
         return;
     }
@@ -3817,7 +4713,7 @@ function renderToc() {
         }
         tocList.innerHTML = parts.join('');
     }
-    tocList.scrollTop = keepScroll;
+    tocEl.scrollTop = keepScroll;
     tocActiveId = '';        // 节点是全新的一批，高亮状态跟着清空
     updateTocHighlight();
 }
@@ -3974,6 +4870,13 @@ function setEditMode(on) {
         refreshEditorBox();
         refreshEditorLineHeight();
         scheduleEditorScrollMax();
+        // 阅读模式下点了预览（编辑区当时是隐藏的，滚不了）→ 这里补上定位
+        if (on && pendingEditModeLine >= 0) {
+            const ln = pendingEditModeLine;
+            pendingEditModeLine = -1;
+            scrollEditorToLine(ln, previewLocateMargin());
+            flashEditorLine(ln);
+        }
     }, 0);
     // 查找栏开着时，目标区域跟着模式变（编辑→查源码，阅读→查正文）
     const fb = document.getElementById('find-bar');
@@ -5165,6 +6068,8 @@ function applyZoom(percent) {
     if (val) val.textContent = z + '%';
     const range = document.getElementById('zoom-range');
     if (range && Number(range.value) !== z) range.value = String(z);
+    // ⚠️ 预览字号变了 → 折行位置全变 → 「行 → 位置」表失效
+    markPreviewLayoutChanged();
     return z;
 }
 
@@ -5303,6 +6208,8 @@ function setCodeWrap(v) {
 /** 把「代码换行」这个开关应用到 <html> 上 */
 function applyCodeWrap() {
     document.documentElement.classList.toggle('code-wrap', !!settings.codeWrap);
+    // 换行开关会让代码块高度大变 → 位置表失效
+    markPreviewLayoutChanged();
 }
 
 
@@ -5887,11 +6794,38 @@ function scheduleTocHighlight() {
     });
 }
 
-// 目录高亮跟着**编辑区顶行**走（编辑区是“真相”）——
-// 预览区滚动时编辑区会跟着同步，一样会触发这个。
-if (previewScroll) previewScroll.addEventListener('scroll', scheduleTocHighlight, { passive: true });
+/**
+ * 预览区滚动 → 按**预览里当前可见的章节**更新目录高亮。
+ *
+ * ⚠️ 这条是必须的：滚动同步改成单向（编辑 → 预览）之后，预览滚动**不再带动编辑区**，
+ *    于是再也没有人调 `updateAlignedChapter()` 去更新 `alignedIdx` ——
+ *    只调 `updateTocHighlight()` 的话它画的是**上次**那一节，目录高亮就死在原地了。
+ *    所以这里直接问预览："你现在在哪个标题上"，再换算成 headingPairs 下标。
+ *
+ * 用 `currentHeadingElement()` 而不是「视口顶行的源码行」——
+ * 后者要靠块索引，而有原始 HTML 的文档里块索引是错位的。
+ */
+let previewTocRaf = 0;
+function scheduleTocFromPreview() {
+    if (previewTocRaf) return;
+    previewTocRaf = requestAnimationFrame(() => {
+        previewTocRaf = 0;
+        const el = currentHeadingElement();
+        if (!el) return;
+        const idx = headingPairs.findIndex(p => p.el === el);
+        if (idx >= 0) {
+            alignedIdx = idx;
+            updateTocHighlight();
+        }
+    });
+}
+
+if (previewScroll) previewScroll.addEventListener('scroll', scheduleTocFromPreview, { passive: true });
 // 目录滚动位置缓存（scroll 事件里布局已算好，读 scrollTop 不会触发重排）
-tocList.addEventListener('scroll', () => { tocKeepScroll = tocList.scrollTop; }, { passive: true });
+// ⚠️ **滚动容器是 `#toc`（tocEl），不是 `#toc-list`** ——
+//    `#toc-list` 只有 padding，不滚动。以前监听的是 tocList.scroll，
+//    那个事件永远不触发 → tocKeepScroll 永远是 0 → 目录重建后滚动位置总归零。
+tocEl.addEventListener('scroll', () => { tocKeepScroll = tocEl.scrollTop; }, { passive: true });
 editor.addEventListener('scroll', scheduleTocHighlight, { passive: true });
 
 // ============ 面板拖拽调整宽度 ============
@@ -5906,7 +6840,6 @@ const DEFAULT_TOC = 240;
 const content = document.getElementById('content');
 const splitToc = document.getElementById('split-toc');
 const splitPreview = document.getElementById('split-preview');
-const tocEl = document.getElementById('toc');
 const editorEl = document.getElementById('editor-wrap');
 const previewEl = document.getElementById('preview-wrap');
 
@@ -5960,6 +6893,10 @@ function setupSplitter(splitter, onMove) {
         try { splitter.releasePointerCapture(e.pointerId); } catch (_) {}
         splitter.classList.remove('dragging');
         document.body.style.cursor = '';
+        // ⚠️ 拖动会改预览区宽度 → 预览重新折行 → 每个元素的高度/位置全变，
+        //    「行 → 位置」表直接失效。**松手后**重建一次
+        //    （拖动中每次都重建太贵：整表要几十毫秒，pointermove 是高频事件）。
+        markPreviewLayoutChanged();
     }
     splitter.addEventListener('pointermove', onPointerMove);
     splitter.addEventListener('pointerup', endDrag);
@@ -5999,6 +6936,7 @@ splitPreview.addEventListener('dblclick', () => {
     applyWidths();
 });
 
+let resizeRelayoutTimer = 0;
 window.addEventListener('resize', () => {
     // 窗口大小变了 → 查找栏的位置/宽度也得重算
     const fb = document.getElementById('find-bar');
@@ -6009,6 +6947,9 @@ window.addEventListener('resize', () => {
     // 不调 applyWidths（它会清空 editor width）
     // 窗口宽度变了 → 文件名可用的宽度也变了 → 重新省略
     fitFilename();
+    // ⚠️ 预览宽度变了 → 重新折行 → 「行 → 位置」表失效（防抖后重建）
+    clearTimeout(resizeRelayoutTimer);
+    resizeRelayoutTimer = setTimeout(() => { resizeRelayoutTimer = 0; markPreviewLayoutChanged(); }, 200);
 });
 
 // ============ 启动 ============
@@ -6057,6 +6998,15 @@ updateThemeButton();
     }
     // 上次没能正常退出的话（崩溃/断电），把没保存的内容捞回来
     maybeOfferDraftRestore();
+
+
+
+
+
+
+
+
+
 
 })();
 
