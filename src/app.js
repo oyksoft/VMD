@@ -2037,28 +2037,6 @@ function contentElementOf(el) {
     return el;
 }
 
-/** 把一个顶层块拆成若干“可定位元素 → 源码行” */
-function splitRows(el, start) {
-    if (!el) return [];
-    // 表格：每个 tr 一行（thead 后面那个 --- 分隔行不渲染成 tr，要跳过）
-    if (el.tagName === 'TABLE') {
-        const out = [];
-        const trs = Array.from(el.querySelectorAll('tr'));
-        trs.forEach((tr, i) => {
-            const line = i === 0 ? start : start + i + 1;
-            out.push({ el: tr, line, endLine: line });
-        });
-        return out;
-    }
-    // 代码块：**不按行细分**。
-    // ⚠️ 细分的话，大文档里每个代码行都是一个锚点（1MB 文档实测 16538 个）——
-    //    每次滚动都要遍历一遍取布局，19ms/次 → 直接卡死。
-    //    代码块内部改用**字符比例**定位（源码第 k 行在块内的字符占比），
-    //    精度和按行细分差不多，但锚点数少两个数量级。
-    // 其他：整个元素一行
-    return [{ el, line: start, endLine: start }];
-}
-
 /**
  * 把一个顶层块拆成**更细的锚点元素**。
  *
@@ -2069,8 +2047,13 @@ function splitRows(el, start) {
  */
 function splitIntoAnchors(el) {
     if (!el) return [];
-    if (el.tagName === 'TABLE') {
-        const trs = Array.from(el.querySelectorAll('tr'));
+    // ⚠️ 表格被 `wrapTables()` 包成了 `<div class="table-wrap">`，
+    //    所以顶层看到的是 div 不是 table —— 不认这一层的话**整个表格只有 1 个锚点**，
+    //    行号靠 textContent 搜（但源码里表格行带 `|` 分隔符，渲染后没有 → 搜不到）→ 整块行号错。
+    const table = (el.tagName === 'TABLE') ? el
+        : (el.querySelector ? el.querySelector('table') : null);
+    if (table) {
+        const trs = Array.from(table.querySelectorAll('tr'));
         if (trs.length) return trs;
     }
     if (el.tagName === 'UL' || el.tagName === 'OL') {
@@ -2097,7 +2080,68 @@ function splitIntoAnchors(el) {
  * @param fromLine 只从这个行号**往后**搜（保证单调递增，重复文本不会命中前面）
  * @returns 行号；实在搜不到返回 -1（调用方跳过这个锚点）
  */
-function measureSourceLine(el, fromLine, src) {
+/**
+ * @param limitLine **搜索范围上限**（这个块的最后一行）。
+ *   ⚠️⚠️ **必须有上限** —— 否则兜底的全文搜索会命中块外的同名文字。
+ *   实测某个 `<li>` 测成了 718 行（而它所在的块只覆盖 60~63 行）
+ *   → 锚点范围横跨 658 行 → 后面所有量不到的行都被填成同一个错值
+ *   → 预览滚到那一带就“突然跳到”某个不相关的地方。
+ */
+function measureSourceLine(el, fromLine, src, limitLine) {
+    // ⚠️ **表格行**：`<tr>` 的 textContent 是 `内容支持示例`（单元格文字拼起来），
+    //    源码里却是 `| 内容 | 支持 | 示例 |`（带 `|` 和空格）→ 直接搜搜不到。
+    //    所以表格行改成**按单元格**找：第一个能对上源码的行就是它。
+    if (el.tagName === 'TR') {
+        // ⚠️ 表格行要**整行一起验证**：
+        //    单元格里常是「内容」「支持」「示例」这种**通用词**，别处也出现过
+        //    （README 第 62 行就有"自动只导正文内容"）→ 只搜一个单元格会命中错行。
+        //    所以：用**最长的**单元格定位（最独特），再**验证该行确实包含所有单元格**。
+        const cells = [];
+        for (const cell of el.children) {
+            const t = (cell.textContent || '').replace(/\s+/g, ' ').trim();
+            if (t.length >= 2) cells.push(t);
+        }
+        if (!cells.length) return -1;
+        cells.sort((a, b) => b.length - a.length);   // 最长的最独特
+        // ⚠️ 用 `editorLineStarts`（编辑区模型的权威行首表），
+        //    不是 `srcLineStarts`（那是 computeBlockLines 为算行号临时建的，
+        //    基于"TOC 占位符已替换"的文本 —— 两张表混用会算错位置）。
+        const starts = editorLineStarts;
+        const hintPos = (fromLine > 0 && starts.length)
+            ? (starts[Math.min(fromLine, starts.length - 1)] || 0) : 0;
+        // 搜索上限：块的最后一行（+1 是那一行的结束位置）
+        const limitPos = (limitLine >= 0 && starts.length)
+            ? (starts[Math.min(limitLine + 1, starts.length - 1)] || src.length) : src.length;
+        for (const len of [Math.min(cells[0].length, 40), 20, 10, 5]) {
+            const snip = cells[0].slice(0, len);
+            // ⚠️ **要一路往后找**，不能只看第一次命中 ——
+            //    通用词（「内容」）第一次命中的是别处（README 第 62 行"正文内容"），
+            //    那行不含其它单元格 → 不合格 → 必须继续找下一个候选。
+            let from = hintPos;
+            for (let guard = 0; guard < 200; guard++) {
+                let pos = src.indexOf(snip, from);
+                if (pos < 0 && from === 0 && hintPos > 0) {
+                    // 兜底：全文搜。⚠️ **结果必须仍在 hint 之后** ——
+                    //    否则会命中前面同名的文字 → 行号乱序 → 锚点表塌陷。
+                    pos = src.indexOf(snip);
+                    if (pos >= 0 && pos < hintPos) pos = -1;
+                }
+                if (pos < 0) break;
+                if (pos >= limitPos) break;          // 超出块的范围 → 不可能是它
+                const ln = lineOfOffset(pos);
+                if (fromLine > 0 && ln < fromLine) { from = pos + 1; continue; }
+                // **验证**：这一行必须**包含所有单元格** —— 否则就是命中了别处
+                const lineText = src.slice(starts[ln] || 0,
+                    (ln + 1 < starts.length ? starts[ln + 1] : src.length));
+                let all = true;
+                for (const c of cells) if (lineText.indexOf(c) < 0) { all = false; break; }
+                if (all) return ln;
+                from = pos + 1;   // 不合格 → 继续找下一个
+            }
+        }
+        return -1;
+    }
+
     const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
     if (text.length < 2) return -1;
     const starts = editorLineStarts;
@@ -2105,6 +2149,9 @@ function measureSourceLine(el, fromLine, src) {
     if (fromLine > 0 && starts.length) {
         hintPos = starts[Math.min(fromLine, starts.length - 1)] || 0;
     }
+    // 搜索上限：块的最后一行（+1 是那一行的结束位置）
+    const limitPos = (limitLine >= 0 && starts.length)
+        ? (starts[Math.min(limitLine + 1, starts.length - 1)] || src.length) : src.length;
     // 从长到短试（长片段更准，短片段更鲁棒）
     for (const len of [28, 20, 14, 8, 5]) {
         if (text.length < len) continue;
@@ -2118,77 +2165,19 @@ function measureSourceLine(el, fromLine, src) {
             pos = src.indexOf(snip);
             if (pos >= 0 && pos < hintPos) pos = -1;
         }
-        if (pos >= 0) return lineOfOffset(pos);
+        if (pos < 0) continue;
+        // ⚠️ **必须落在块的范围内** —— 否则会命中块外的同名文字
+        //    （实测某个 `<li>` 测成了 718 行，而它的块只覆盖 60~63 行
+        //      → 锚点范围横跨 658 行 → 后面所有行都被填成同一个错值
+        //      → 预览滚到那一带就"突然跳到"某个不相关的地方）。
+        if (pos >= limitPos) break;
+        const ln = lineOfOffset(pos);
+        if (fromLine > 0 && ln < fromLine) continue;   // 必须单调
+        return ln;
     }
     return -1;
 }
 
-/**
- * 「源码行 → 预览内容内的精确顶部位置」表。
- *
- * ⚠️⚠️ **这是同步精度的终极手段：不打任何比例，逐行量出来存着。**
- *    之前的做法（块内字符比例 / 行比例）本质都是"猜" ——
- *    编辑区不折行、预览折行，再加上流程图/公式这种"源码几行、渲染一张图"的块，
- *    任何比例都不可能对（用户原话："做什么都是无用的"）。
- *
- * 建表方式：对**多行锚点**内的每一行，取该行的文字片段，在锚点子树里用 `Range`
- * 找到它的真实位置，读 `getBoundingClientRect().top` → 精确像素值。
- * 单行锚点直接用它自己的 top（不用搜）。
- *
- * 成本：行数量级的 `indexOf + Range`（README 778 行实测几十毫秒），
- *      只在 `buildAnchorTable()` 里做一次（渲染后 / 异步内容渲染完成后）。
- */
-let lineTops = new Map();      // line → 预览内容内的 top（px）
-let lineTopsBase = null;       // 建表时的 scrollTop（判断是否需要重建）
-
-function buildLineTops(anchors, wrapRect, base) {
-    lineTops = new Map();
-    for (const a of anchors) {
-        const span = a.spanLines || 1;
-        // 单行锚点（绝大多数）→ 直接用测好的 top
-        if (span <= 1) {
-            if (a.line != null) lineTops.set(a.line, a.top);
-            continue;
-        }
-        // 多行锚点 → 逐行量
-        let searchFrom = 0;
-        for (let i = 0; i < span; i++) {
-            const ln = a.line + i;
-            const snip = sourceLineSnippet(ln);
-            if (!snip) continue;
-            const rg = findRangeIn(a.el, snip, 600, searchFrom);
-            if (!rg) continue;
-            const r = rg.getBoundingClientRect();
-            if (!r || (r.width === 0 && r.height === 0)) continue;
-            lineTops.set(ln, r.top - wrapRect.top + base);
-            // 下一行从这个匹配之后开始搜（块内重复文字不会命中前面）
-            searchFrom = Math.max(0, (a.el.textContent || '').indexOf(snip));
-        }
-    }
-    lineTopsBase = base;
-}
-
-/**
- * 查「源码行 → 预览位置」。
- *
- * 表里没有这一行时（空行 / `</div>` 这种纯标签行 —— `sourceLineSnippet` 取不到文字，
- * 所以量不出来），用**上下最近的两个已知行线性插值**。
- * 这比全局比例准得多：插值区间只跨越几行，误差不会滚雪球。
- */
-function lineTopOf(line) {
-    const v = lineTops.get(line);
-    if (v !== undefined) return v;
-    const total = editorLineStarts.length;
-    let lo = line - 1, hi = line + 1;
-    while (lo >= 0 && !lineTops.has(lo)) lo--;
-    while (hi < total && !lineTops.has(hi)) hi++;
-    const vlo = (lo >= 0) ? lineTops.get(lo) : undefined;
-    const vhi = (hi < total) ? lineTops.get(hi) : undefined;
-    if (vlo === undefined && vhi === undefined) return undefined;
-    if (vlo === undefined) return vhi;
-    if (vhi === undefined) return vlo;
-    return vlo + (vhi - vlo) * (line - lo) / (hi - lo);
-}
 
 /** 重建锚点表（预览 DOM 变了就重建） */
 function buildAnchorTable() {
@@ -2206,14 +2195,25 @@ function buildAnchorTable() {
         //    `bl.start` 是 token 索引算出来的，不含原始 HTML 时是可靠的。
         let hint = bl ? bl.start : 0;
         for (const el of parts) {
-            let line = measureSourceLine(el, hint, src);
+            const limitLine = bl ? (bl.start + bl.count - 1) : -1;
+            let line = measureSourceLine(el, hint, src, limitLine);
             if (line < hint) {
                 // 实测失败 / 测到了前面 → 用块内的递增位置兜底（保证块内单调）
                 line = hint;
             } else {
                 hint = line;
             }
-            anchorList.push({ el, line, block: k });
+            // `rangeStart` = 这个块在源码里的**起始行**（token 起始，html 块就是开标签那行）
+            // `line` = 实测到的、有文字的行（定位起点）
+            // 两者分开：开标签行/闭标签行本身没有渲染位置，要按**块边界**处理
+            // ⚠️ `rangeStart` 只有**块的第一个子锚点**才用 `bl.start`（含开标签行）；
+            //    后面的子锚点用它自己的实测行 —— 否则表格的 12 个 tr 范围起点全一样
+            //    → span 算出来是几十行 → 块内边界规则失效。
+            const firstOfBlock = (parts[0] === el);
+            anchorList.push({
+                el, line, block: k,
+                rangeStart: (firstOfBlock && bl) ? bl.start : line,
+            });
         }
     }
     // 回填每个锚点的**行范围 + 字符范围**（用实测行号算）。
@@ -2228,14 +2228,19 @@ function buildAnchorTable() {
     for (let i = 0; i < anchorList.length; i++) {
         const cur = anchorList[i];
         const nxt = anchorList[i + 1];
+        const curStart = (cur.rangeStart !== undefined) ? cur.rangeStart : cur.line;
+        // 终点 = 下一个锚点的**范围起点**（不是它的 line —— 那个是实测的内容行）
+        const nxtStart = nxt ? ((nxt.rangeStart !== undefined) ? nxt.rangeStart : nxt.line) : -1;
         let endLine;
-        if (nxt && nxt.line > cur.line) {
-            endLine = nxt.line;
+        if (nxtStart > cur.line) {
+            endLine = nxtStart;
         } else {
             const bl = blockLines[cur.block];
             endLine = bl ? (bl.start + bl.count) : cur.line + 1;
         }
         cur.spanLines = Math.max(1, endLine - cur.line);
+        cur.rangeEnd = endLine;
+        cur.rangeStart = curStart;
         // 字符范围：本锚点起始行 → 下一个锚点起始行
         // ⚠️ 统一用 `editorLineStarts`（编辑区模型的权威行首表）。
         //    `srcLineStarts` 是 computeBlockLines 为算行号临时建的，基于
@@ -2257,8 +2262,6 @@ function buildAnchorTable() {
             a.top = r.top - wrapRect.top + base;     // 在预览内容里的位置
             a.height = r.height;
         }
-        // 逐行量出精确位置（查表就能定位，不用任何比例）
-        buildLineTops(anchorList, wrapRect, base);
     }
     anchorsDirty = false;
     return anchorList;
@@ -2321,73 +2324,9 @@ function ensureAnchorPositions() {
     if (!anchorList.length) buildAnchorTable();
 }
 
-/** 某个预览元素在预览内容里的顶部位置（用锚点表缓存，避免读布局） */
-function elTopInContent(el) {
-    ensureAnchorPositions();
-    for (const a of anchorList) {
-        if (a.el === el) return a.top;
-    }
-    return 0;
-}
-function elHeightInContent(el) {
-    ensureAnchorPositions();
-    for (const a of anchorList) {
-        if (a.el === el) return a.height;
-    }
-    return 0;
-}
-
 /** 锚点对应的块 */
 function blockOfAnchor(a) {
     return a && a.block !== undefined ? blockLines[a.block] : null;
-}
-
-/**
- * 源码顶行在锚点内部的位置（0~1）—— 按**字符比例**算。
- * 长段落里源码只有几行，预览却折成十几行，行高完全不成比例；
- * 只有字符比例能对上（渲染后的高度大致与内容量成正比）。
- */
-function fracInBlock(a, topLine) {
-    const bl = blockOfAnchor(a);
-    if (!bl || !bl.charLen) return 0;
-    // ⚠️ **Mermaid / 块级公式：块内不做字符比例**。
-    //    它们的源码就那么几行（`flowchart LR` + 几条边），渲染出来却是一整张图，
-    //    高度和源码字符数**完全不成比例** —— 按字符比例算，块内滚到第 3 行
-    //    就可能偏出去 5 行（实测）。直接贴到块起点最实在：误差上限就是块高，
-    //    但绝不会跑到别的块去。
-    const cls = a.el && a.el.classList;
-    if (cls && (cls.contains('mermaid-block') || cls.contains('math-block'))) return 0;
-
-    // 单行锚点（绝大多数 li）→ 直接贴到它，不用插值
-    if ((a.spanLines || 1) <= 1) return 0;
-
-    // ⚠️⚠️ **字符比例**（不是行比例）。
-    //    编辑区不折行、预览会折行：源码 1 行长文字可能高 10 个视觉行，
-    //    「行比例」和「渲染高度比例」完全不成正比，只有**字符比例**能对上。
-    //    范围用**锚点自己的**（实测行号算的 charStart/charLen），不是整块的 token 范围 ——
-    //    锚点已经拆到 `<li>` 粒度，范围小了，误差也跟着小。
-    const charStart = (a.charStart !== undefined) ? a.charStart
-        : (editorLineStarts[a.line] === undefined ? 0 : editorLineStarts[a.line]);
-    const charLen = (a.charLen !== undefined ? a.charLen : 1);
-    const i = Math.max(0, topLine - a.line);
-    const lineStart = editorLineStarts[a.line + i];
-    if (lineStart === undefined) return 0;
-    const charIn = Math.max(0, lineStart - charStart);
-    return Math.max(0, Math.min(charIn / charLen, 1));
-}
-
-/** 锚点内某个比例（0~1）对应源码的哪一行 */
-function lineOfCharInBlock(a, frac) {
-    const bl = blockOfAnchor(a);
-    if (!bl) return a ? a.line : 0;
-    const charInBlock = frac * bl.charLen;
-    let li = 0;
-    const maxI = Math.min(bl.count - 1, srcLineStarts.length - bl.start - 1);
-    for (let i = 0; i <= maxI; i++) {
-        const off = srcLineStarts[bl.start + i] - bl.charStart;
-        if (off <= charInBlock) li = i; else break;
-    }
-    return bl.start + li;
 }
 
 /** 找“源码行 <= line 的最后一个锚点” */
@@ -2603,9 +2542,11 @@ function scrollSyncTick() {
  */
 let scrollSyncThrottleRaf = 0;
 /**
- * @param side 目前**只有 `'editor'`**（编辑 → 预览）。
- *   预览 → 编辑 的自动同步已取消（原因见 syncEditorFromPreviewClick()），
- *   那条方向改成「用户点击预览才定位」，不走这里。
+ * 滚动同步的调度 —— 一帧最多做一次。
+ *
+ * 两个方向都走**章节锚点**（headingPairs，按标题文本匹配），
+ * 所以含原始 HTML 的文档里也不会跳错章节。
+ * 乒乓由 `pendingEcho`（程序设过的确切位置）抑制。
  */
 function scheduleScrollSync(side) {
     if (scrollSyncThrottleRaf) return;
@@ -2625,80 +2566,187 @@ function scrollSyncGuard() {
     return true;
 }
 
+/** 上一次同步到的章节下标（章节模式用，判断"章节变了没"） */
+let lastSyncedChapter = -1;
+
 /**
- * 「块锚点表」什么时候可信？
+ * 编辑区 → 预览：**只在跨章节时滚动**（「章节」模式）。
  *
- * 只有在**顶层 token 数 == 顶层 DOM 元素数**时才可信。
- * 有原始 HTML 的文档里这两者必然不等（实测：40 个 `<div>` 各包 4 个 token
- * → blockLines=160、preview.children=40）→ 锚点表里每个锚点的 `line`
- * 都是拿错位的 token 算出来的 → 同步会跳**到别的章节去**。
+ * 为什么这个模式更稳：章节锚点来自 `headingPairs` —— 那是**按标题文本匹配**建立的，
+ * 跟块索引、跟行级位置表都无关，所以**永远指向正确的章节**。
+ * 而行级表里有一半的行是插值来的（空行、`---` 这类量不到位置的行），
+ * 插值区间一长，滚动时就会看到"预览突然跳一下"。
+ *
+ * 代价：章节内预览不动（长章节里滚动，预览会一直停在章节开头）。
  */
-function blockAnchorsTrustworthy() {
-    return blockLines.length > 0 && preview.children.length === blockLines.length;
-}
+function applyScrollToPreviewByChapterOnly(topLine) {
+    if (!headingPairs.length) return;
+    const k = headingIndexAtLine(topLine);
+    if (k < 0) return;                   // 还在第一个标题之前 → 不动
+    const pair = headingPairs[k];
+    const el = pair.el;
+    if (!el) return;
 
-function applyScrollToPreview() {
-    if (!editor || !previewScroll) return;
-    const { lh, padTop } = editorMetrics();
-    // ⚠️ **不能只信 previewScrollMax 这个缓存**：异步渲染（Mermaid / KaTeX / 图片）
-    //    会把预览撑高，而缓存可能还停在旧值 → 目标位置被钳到旧底部，
-    //    表现成"滚到下面就不动了"（实测 817 vs 实际 896）。
-    //    滚动事件里布局是干净的，读一次 scrollHeight 是免费的。
-    if (!previewScrollMax) refreshPreviewScrollMax();
-    const maxPrev = Math.max(previewScrollMax,
-        previewScroll.scrollHeight - previewScroll.clientHeight);
-    if (!lh) { applyScrollByRatio(true); return; }
+    // ---- 章节在源码里的**字符范围** ----
+    // 用字符比例而不是行数比例：渲染高度大致正比于**内容量**，
+    // 而源码行数跟渲染高度完全不成正比（源码 2 行的长段落，渲染出来 20 行高）。
+    const starts = editorLineStarts;
+    const srcStart = pair.line;
+    const srcEnd = headingPairs[k + 1] ? headingPairs[k + 1].line : (starts.length - 1);
+    const charStart = (starts[srcStart] === undefined) ? 0 : starts[srcStart];
+    const charEnd = (starts[srcEnd] === undefined) ? editorText.length : starts[srcEnd];
+    const lineChar = (starts[topLine] === undefined) ? charStart : starts[topLine];
+    const span = Math.max(1, charEnd - charStart);
+    const frac = Math.max(0, Math.min((lineChar - charStart) / span, 1));
 
-    // ⚠️ 用缓存的滚动位置，别读 editor.scrollTop（布局脏时读它 = 强制重排 288ms）
-    // ⚠️ 钳到 0：滚到顶部时 (0 - padTop) / lh 是负数（同上）
-    const topLine = Math.max(0, Math.floor((editorScrollTop - padTop) / lh));
-
-    // 块锚点表不可信（文档里有包裹型原始 HTML）→ 退回章节锚点
-    if (!blockAnchorsTrustworthy() || !anchorList.length) {
-        applyScrollToPreviewByChapter(topLine, maxPrev);
-        return;
+    // ---- 章节在预览里的起止位置（实时量）----
+    // 章节标题是顶层元素，量一次就够（同一帧内第二次 getBoundingClientRect 是免费的）。
+    const wrapRect = previewScroll.getBoundingClientRect();
+    const r0 = el.getBoundingClientRect();
+    const top0 = r0.top - wrapRect.top + previewScroll.scrollTop;
+    let top1;
+    const nextEl = headingPairs[k + 1] ? headingPairs[k + 1].el : null;
+    if (nextEl) {
+        const r1 = nextEl.getBoundingClientRect();
+        top1 = r1.top - wrapRect.top + previewScroll.scrollTop;
+    } else {
+        // 最后一节 → 到内容底部
+        top1 = Math.max(top0 + 1, previewScroll.scrollHeight);
     }
 
-    // ---- 最优先：**精确行位置表**（逐行量出来的，不含任何比例）----
-    if (lineTops.size) {
-        const exact = lineTopOf(topLine);
-        if (exact !== undefined) {
-            const want = Math.max(0, Math.min(exact, maxPrev));
-            if (Math.abs(previewScroll.scrollTop - want) < 2) { updateAlignedChapter(); return; }
-            setScrollTop(previewScroll, want);
-            updateAlignedChapter();
-            return;
-        }
-    }
+    // ---- 目标位置 ----
+    // ⚠️ **跨章节时也用同一个公式**（frac 天然≈0 → 落在新章节起点）。
+    //    之前是先跳到章节起点、下一帧又跟到 frac 位置 → 会闪一下。
+    const want = Math.max(0, Math.min(top0 + frac * (top1 - top0), previewScroll.scrollHeight));
 
-    // 锚点 = 源码顶行所在的预览元素（**精确查表**，不是按比例估算）
-    const a = anchorAtLine(topLine);
-    if (!a) { applyScrollToPreviewByChapter(topLine, maxPrev); return; }
-    // 锚点内部的位置用**字符比例**：长段落里源码几行、预览折成十几行，
-    // 行高完全不成比例，只有字符比例能对上。
-    // 位置表还没测好（刚渲染完）→ 按比例兜底，别在输入路径里强制重排
-    if (anchorsDirty) { applyScrollByRatio(true); return; }
-    ensureAnchorPositions();
+    // 跨章节了 → 记一下（只用于诊断/将来判断）
+    if (k !== lastSyncedChapter) lastSyncedChapter = k;
 
-    // ---- 块内按字符比例 ----
-    // ⚠️ 试过"块内再做一次文本匹配"（在锚点元素子树里 findRangeIn），
-    //    结果**更差**：列表块的 textContent 把多个 `<li>` 拼在一起，
-    //    `indexOf` 容易命中靠后的同名文本 → README 实测误差从 -23 变成 +76/+99。
-    //    所以块内保持字符比例，只在**章节级**（`applyScrollToPreviewByChapter`）用文本匹配。
-    //    已知限制：长列表 / 长引用块内，字符比例会偏几行到几十行（渲染高度和小节间距不成正比）。
-    const frac = fracInBlock(a, topLine);
-    // 目标位置 = 锚点在内容里的位置 + 块内比例偏移
-    const target = a.top + frac * (a.height || 0);
-    const want = Math.max(0, Math.min(target, maxPrev));
-    // 幂等保护：已经在位就不动（不然同步→预览滚→回弹→反向同步… 来回拉扯）
     if (Math.abs(previewScroll.scrollTop - want) < 2) { updateAlignedChapter(); return; }
     setScrollTop(previewScroll, want);
     updateAlignedChapter();
 }
 
 /**
- * 取编辑区某一行的「可搜索片段」：剥掉 markdown 结构前缀和行内标记，
- * 只留渲染后也会出现的纯文字。
+ * 编辑区 → 预览区：**只在跨章节时更新**。
+ *
+ * 为什么用「章节」而不是逐行精确：
+ *   逐行精确要靠一张「源码行 → 预览位置」的表，而这张表里**有一半的行是插值来的**
+ *   （空行、`---` 这类渲染后没有独立位置的行）。插值区间一长，
+ *   滚动时就会看到"预览突然跳一下" —— 实测比章节级更难受。
+ *
+ * 章节锚点（`headingPairs`）是**按标题文本匹配**建立的，跟块索引、
+ * 跟行级位置表都无关 → **永远指向正确的章节**，绝不会跳到奇怪的地方。
+ *
+ * 代价：章节内预览不动（长章节里滚动，预览会停在章节开头）。
+ */
+function applyScrollToPreview() {
+    if (!editor || !previewScroll) return;
+    const { lh, padTop } = editorMetrics();
+    if (!lh) return;
+    // ⚠️ 用缓存的滚动位置，别读 editor.scrollTop（布局脏时读它 = 强制重排 288ms）
+    // ⚠️ 钳到 0：滚到顶部时 (0 - padTop) / lh 是负数（找不到锚点）
+    const topLine = Math.max(0, Math.floor((editorScrollTop - padTop) / lh));
+    applyScrollToPreviewByChapterOnly(topLine);
+}
+
+/**
+ * 源码里**代码块（围栏）覆盖的行号区间**。
+ *
+ * 用途：区分「独立的 `---` 横线」和「代码块里的 `---` 文字」。
+ * 前者渲染成 `<hr>`（没有文字，不能拿去搜 —— `---` 满文档都是，会命中错行）；
+ * 后者在 `<code>` 里是**真实文字**（要保留）。
+ *
+ * 懒算 + 按 editorText 缓存：源码不变就不重算。
+ */
+let codeBlockRanges = null;
+let codeBlockRangesFor = null;
+function getCodeBlockRanges() {
+    if (codeBlockRangesFor === editorText) return codeBlockRanges;
+    const ranges = [];
+    const starts = editorLineStarts;
+    let open = -1;
+    for (let i = 0; i < starts.length; i++) {
+        const s0 = starts[i];
+        const s1 = (i + 1 < starts.length) ? starts[i + 1] : editorText.length;
+        const line = editorText.slice(s0, s1).replace(/[\r\n]+$/, '');
+        const t = line.trim();
+        if (/^(```|~~~)/.test(t)) {
+            if (open < 0) open = i;                            // 开围栏
+            else { ranges.push([open, i]); open = -1; }        // 闭围栏
+        }
+    }
+    if (open >= 0) ranges.push([open, starts.length - 1]);     // 没闭合
+    codeBlockRanges = ranges;
+    codeBlockRangesFor = editorText;
+    return ranges;
+}
+
+/** 这一行是不是在代码块里 */
+function isLineInCodeBlock(line) {
+    const rs = getCodeBlockRanges();
+    for (let i = 0; i < rs.length; i++) {
+        if (line >= rs[i][0] && line <= rs[i][1]) return true;
+    }
+    return false;
+}
+
+/**
+ * 预览区 → 编辑区：**按章节 + 章节内比例**定位。
+ *
+ * 和「编辑 → 预览」用的是同一套原理、同一套锚点（`headingPairs`）——
+ * 章节锚点是**按标题文本匹配**建立的，跟块索引无关，
+ * 所以含原始 HTML 的文档里也不会跳错章节。
+ *
+ * 章节内的比例用的是**渲染高度比例**（视口顶在章节里的位置），
+ * 映射回源码的行号 —— 精度不如编辑侧那个「字符比例」，
+ * 但来回滚动时偏差是有界的（用户主动滚动会重置），不会越滚越偏。
+ */
+function applyScrollToEditor() {
+    if (!editor || !previewScroll) return;
+    const k = previewChapterIndex();
+    if (k < 0) return;
+    const pair = headingPairs[k];
+    const el = pair.el;
+    if (!el) return;
+
+    // 章节在源码里的行范围
+    const srcStart = pair.line;
+    const srcEnd = headingPairs[k + 1] ? headingPairs[k + 1].line : (editorLineStarts.length - 1);
+
+    // 章节在预览里的起止位置（实时量）
+    const wrapRect = previewScroll.getBoundingClientRect();
+    const top0 = el.getBoundingClientRect().top - wrapRect.top + previewScroll.scrollTop;
+    const nextEl = headingPairs[k + 1] ? headingPairs[k + 1].el : null;
+    const top1 = nextEl
+        ? (nextEl.getBoundingClientRect().top - wrapRect.top + previewScroll.scrollTop)
+        : Math.max(top0 + 1, previewScroll.scrollHeight);
+
+    // 视口顶在章节内的相对位置
+    const frac = Math.max(0, Math.min((previewScroll.scrollTop - top0) / Math.max(1, top1 - top0), 1));
+    // 映射回源码行
+    const line = srcStart + Math.round(frac * (srcEnd - srcStart));
+    scrollEditorToLine(line);
+}
+
+/**
+ * 预览视口顶所在的章节下标（-1 = 没有可见标题）。
+ * ⚠️ 一次滚动只算一次，不能用 `headingPairs.indexOf()`（O(n)，几千项时每秒几十次 → 卡死）。
+ */
+function previewChapterIndex() {
+    if (!previewScroll || !headingPairs.length) return -1;
+    const wr = previewScroll.getBoundingClientRect();
+    // headingPairs 按文档顺序排 → 第一个「底边还在视口内」的就是视口顶所在的章节
+    for (let i = 0; i < headingPairs.length; i++) {
+        const r = headingPairs[i].el.getBoundingClientRect();
+        if (r.bottom > wr.top + 2) return i;
+    }
+    return -1;
+}
+
+/**
+ * 取编辑区某一行的「可搜索片段」
+ * 剥掉 markdown 结构前缀和行内标记，只留渲染后也会出现的纯文字。
  *
  * 用来在预览 DOM 里做文本匹配 —— 这是**唯一不受块索引错位影响**的对齐手段。
  * 返回空串表示这行没有可用的文字（空行、纯 HTML 标签行），走比例兜底。
@@ -2718,8 +2766,31 @@ function sourceLineSnippet(line) {
     t = t.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
          .replace(/[*_`~]/g, '')
          .replace(/<[^>]*>/g, '');      // 行内 HTML 标签不算文字
+    // ⚠️⚠️ **表格行**：源码里是 `| 内容 | 支持 | 示例 |`，渲染后 `<td>` 里是 `内容`。
+    //    不去掉 `|` 的话，这个片段在预览 DOM 里**永远搜不到** → 那一行量不出位置。
+    //    而且**不能把单元格用空格拼起来** —— DOM 里 `<td>` 之间是**直接拼接**（没有空格），
+    //    拼起来的片段同样搜不到（实测 README 的表格中间几行全都量不到）。
+    //    正确做法：取**最长的那一个单元格**（它内部的空格在 DOM 里是保留的）。
+    if (/^\s*\|/.test(t)) {
+        const cells = t.split('|').map(x => x.trim()).filter(Boolean);
+        // 表头分隔行 `|---|---|` 没有文字 → 用不到
+        if (cells.length && !/^[-: ]+$/.test(cells[0])) {
+            cells.sort((a, b) => b.length - a.length);
+            // 表格单元格常常只有 2~3 个字（「内容」「支持」「示例」），
+            // 比普通文本的门槛（4 字）低一点，否则表头行量不到位置。
+            if (cells[0].length >= 2) t = cells[0];
+        }
+    }
     t = t.trim();
-    if (t.length < SNIPPET_MIN) return '';
+    // ⚠️⚠️ **纯符号行（`---` / `===`）不是文字，绝不能当 snippet**。
+    //    `---` 在文档里到处都是 → 拿去搜会命中别处的横线 → 行号错 →
+    //    预览滚到那一行就跳到别的地方（用户实测：`---` 那行必跳）。
+    //    判断依据是**有没有文字字符**，不是长度 ——
+    //    长度判断会把 3 个符号的 `---` 放进来，却把 2 个汉字的「内容」挡在外面。
+    //    ⚠️ 但**代码块里的 `---` 是真实文字**（在 `<code>` 里渲染出来了）→ 要保留。
+    if (!/[\p{L}\p{N}]/u.test(t) && !isLineInCodeBlock(line)) return '';
+    // 含文字的行，长度门槛可以低到 2（表格单元格常只有 2 个字）
+    if (t.length < 2) return '';
     return t.slice(0, SNIPPET_LEN);
 }
 
@@ -2808,211 +2879,6 @@ function chapterSearchContainer(k) {
     return c;
 }
 
-/**
- * 编辑区 → 预览：**按章节锚点 + 章节内比例**。
- *
- * 用在「块锚点表不可信」的文档上（含包裹型原始 HTML）。
- * 为什么还要用它：块索引错位时，直接跳块会跳到**别的章节**去；
- * 而标题映射（`headingPairs`）是**按文本匹配**建的，HTML 文档里照样准 ——
- * 所以退到「章节对齐」至少保证"不会跳错节"，章节内按行数比例近似。
- *
- * 精度：章节内不如块锚点（源码行数与渲染高度不成比例），
- * 但实测同一章节内的偏差只有一两行，比"跳到错误章节"好得多。
- */
-function applyScrollToPreviewByChapter(topLine, maxPrevFallback) {
-    if (!editor || !previewScroll) return;
-    const pairs = headingPairs;
-    // 没有标题（或位置还没测好）→ 全文按比例兜底
-    if (!pairs.length || anchorsDirty) { applyScrollByRatio(true); return; }
-
-    // ⚠️ `lh` 必须在这里自己取 —— 它不是本函数的参数。
-    //    之前直接用了调用方 applyScrollToPreview() 的局部变量 `lh` →
-    //    ReferenceError → 整个函数抛错 → 滚动根本没执行。
-    //    而这个异常在 scroll 事件回调里是**静默**的，表现成“同步完全不动”（踩过）。
-    const { lh } = editorMetrics();
-
-    // ⚠️ **别直接用 previewScrollMax 这个缓存**：它可能是 0（还没量过），
-    //    那下面 `Math.min(t, maxPrev)` 会把目标位置全钳成 0 →
-    //    预览永远滚不动（实测：点哪都停在顶部）。
-    if (!previewScrollMax) refreshPreviewScrollMax();
-    const liveMax = Math.max(0, previewScroll.scrollHeight - previewScroll.clientHeight);
-    const maxPrev = Math.max(previewScrollMax, liveMax, maxPrevFallback || 0);
-    const wrapRect = previewScroll.getBoundingClientRect();
-    const base = previewScroll.scrollTop;
-    /** 某个预览元素在内容里的顶部位置（实时量，不走可能错位的锚点表） */
-    const topOf = (el) => base + (el.getBoundingClientRect().top - wrapRect.top);
-
-    // topLine 之前最近的那个标题（可能 -1 = 还在第一个标题上面的前言区）
-    const k = headingIndexAtLine(topLine);
-    let srcStart, srcEnd, prevStart, prevEnd;
-    if (k >= 0) {
-        srcStart = pairs[k].line;
-        prevStart = topOf(pairs[k].el);
-        const nxt = pairs[k + 1];
-        if (nxt) {
-            srcEnd = nxt.line;
-            prevEnd = topOf(nxt.el);
-        } else {
-            // 最后一节：到文档末尾
-            srcEnd = Math.max(srcStart + 1, editorLineStarts.length);
-            prevEnd = previewScroll.scrollHeight;
-        }
-    } else {
-        srcStart = 0;
-        prevStart = 0;
-        srcEnd = pairs[0].line;
-        prevEnd = topOf(pairs[0].el);
-    }
-
-    // ---- 优先：章节内按**文本内容**定位（比行数比例准得多） ----
-    // 块索引在 HTML 文档里是错位的，但"这段文字在预览的哪个位置"永远是对的。
-    // 限制扫描节点数，扫不到（或这行没有可搜文字）就退回比例。
-    if (k >= 0) {
-        // ⚠️ 顶行常常是**空行**或纯 HTML 标签行（`</div>`）→ 取不到可搜文字。
-        //    往下找最近的有文字的几行：用户看到的本来就是"空行下面那段内容"，
-        //    用那段的文字定位，误差最多一两行，比纯比例准得多。
-        const near = snippetNear(topLine, srcStart, srcEnd);
-        const snip = near.snip, usedLine = near.line;
-        if (snip) {
-            const box = chapterSearchContainer(k);
-            const rg = findRangeIn(box, snip, 600);
-            if (rg) {
-                const r = rg.getBoundingClientRect();
-                // 用"往下第几行"的文本定位 → 回退相应行高，让顶行尽量对准视口顶部
-                let t = base + (r.top - wrapRect.top);
-                // 定位用的是"附近某一行"的文字 → 按行差回补，让视口顶部尽量对到顶行
-                if (usedLine !== topLine) t -= (usedLine - topLine) * lh;
-                t = Math.max(0, Math.min(t, maxPrev));
-                if (Math.abs(previewScroll.scrollTop - t) >= 2) {
-                    setScrollTop(previewScroll, t);
-                } else {
-                    updateAlignedChapter();
-                }
-                return;
-            }
-        }
-    }
-
-    const span = srcEnd - srcStart;
-    const frac = span > 0 ? Math.max(0, Math.min((topLine - srcStart) / span, 1)) : 0;
-    const target = prevStart + frac * (prevEnd - prevStart);
-    const want = Math.max(0, Math.min(target, maxPrev));
-    // 幂等保护：已经在位就不动（不然同步→预览滚→回弹… 来回拉扯）
-    if (Math.abs(previewScroll.scrollTop - want) < 2) { updateAlignedChapter(); return; }
-    setScrollTop(previewScroll, want);
-    updateAlignedChapter();
-}
-
-/** 块级对齐（文档没有标题时的兜底） */
-function applyScrollToPreviewByBlock() {
-    if (!editor || !previewScroll) return;
-    const { lh, padTop } = editorMetrics();
-    if (!previewScrollMax) refreshPreviewScrollMax();
-    const maxPrev = previewScrollMax;
-    // 块数对不上（原始 HTML 展开成多个预览节点）→ 退回按比例
-    if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
-        applyScrollByRatio(true);
-        return;
-    }
-    const topLine = Math.max(0, Math.floor((editorScrollTop - padTop) / lh));
-    const k = blockIndexAtLine(topLine);
-    if (k < 0) { applyScrollByRatio(true); return; }
-    const el = preview.children[k];
-    if (!el) { applyScrollByRatio(true); return; }
-    const bl = blockLines[k];
-    const frac = bl.count > 0 ? (topLine - bl.start) / bl.count : 0;
-    const ratio = Math.max(0, Math.min(frac, 1));
-    const wrapRect = previewScroll.getBoundingClientRect();
-    const elRect = el.getBoundingClientRect();
-    const target = previewScroll.scrollTop + (elRect.top - wrapRect.top) + ratio * elRect.height;
-    setScrollTop(previewScroll, Math.min(target, maxPrev));
-}
-
-/** 把预览区的位置应用到编辑区（预览区 → 编辑区）
- *
- *  同样按**标题节点**对齐：当前章节的标题 → 源码里那一行。
- */
-/**
- * 预览 → 编辑区（按标题锚点）。
- *
- * ⚠️ **当前没有调用点** —— 「预览滚动 → 编辑区自动同步」已经取消，
- *    改成了「点击预览才定位」（syncEditorFromPreviewClick()，那条路走文本匹配）。
- *    函数留着是因为它把几个坑都处理过了（钳制会让两边分叉、幂等保护、
- *    块内按字符比例），以后如果要加回"可选的双向同步"直接能用。
- */
-function applyScrollToEditor() {
-    if (!editor || !previewScroll) return;
-    const { lh, padTop } = editorMetrics();
-    // ⚠️ 缓存还没算出来（刚打开文件 / 刚切模式）→ 实时算一次。
-    //    不然 maxLine = (0 - padTop) / lh = -1 → `line > maxLine` 永远成立
-    //    → 预览区滚动时编辑区永远不动。
-    let maxEdit = editorScrollMax;
-    if (maxEdit <= 0) {
-        maxEdit = Math.max(0, editor.scrollHeight - editor.clientHeight);
-        editorScrollMax = maxEdit;
-    }
-    if (!lh || !anchorList.length) { applyScrollByRatio(false); return; }
-
-    // 锚点 = 预览视口顶部所在的元素（**精确查表**）
-    const a = anchorAtViewportTop();
-    if (!a) { applyScrollByRatio(false); return; }   // 位置表还没测好 → 按比例
-    ensureAnchorPositions();
-    // 锚点内部的位置（视口顶在这个锚点里往下滑了多少）
-    const passed = previewScroll.scrollTop - a.top;     // 正数 = 视口顶在锚点上方
-    const frac = a.height > 0 ? Math.max(0, Math.min(passed / a.height, 1)) : 0;
-    let line = lineOfCharInBlock(a, frac);
-    // 源码那边滚不到这么远（预览渲染后比源码高）→ **编辑区原地不动，预览继续走**
-    // ⚠️ 这里**不能**把编辑区钳制到底再往下设：
-    //    钳制会让 scrollTop 变一点点 → 触发编辑区的 scroll 事件 → 预览又被拽回去
-    //    → 滚轮溢出只生效一次（实测 +120 而不是 +960）。
-    //    编辑区反正已经到底了，保持原样最干净。
-    const maxLine = Math.floor((maxEdit - padTop) / lh);
-    if (line > maxLine) {
-        updateAlignedChapter(line);
-        return;                      // 编辑区不动 → 不会触发反向同步 → 预览自由滚
-    }
-    // 幂等保护：已经在那一行就不动
-    const wantPos = Math.min(Math.ceil(line * lh + padTop), maxEdit);
-    if (Math.abs(editorScrollTop - wantPos) < 2) { updateAlignedChapter(line); return; }
-    scrollEditorToLine(line);
-    // ⚠️ 用刚算出的 line —— 编辑区的 scroll 事件还没派发，
-    //    editorScrollTop 还是旧值，用它算章节会得到错的高亮。
-    updateAlignedChapter(line);
-}
-
-/**
- * 块级对齐（文档没有标题时的兜底）。
- * ⚠️ 同上：当前没有调用点（预览 → 编辑的自动同步已取消）。
- */
-function applyScrollToEditorByBlock() {
-    if (!editor || !previewScroll) return;
-    const { lh, padTop } = editorMetrics();
-    const maxEdit = editorScrollMax;
-    if (!previewScrollMax) refreshPreviewScrollMax();
-    const maxPrev = previewScrollMax;
-    if (!lh || !blockLines.length || preview.children.length !== blockLines.length) {
-        applyScrollByRatio(false);
-        return;
-    }
-    const wrapRect = previewScroll.getBoundingClientRect();
-    let k = -1;
-    for (let i = 0; i < preview.children.length; i++) {
-        const r = preview.children[i].getBoundingClientRect();
-        if (r.bottom > wrapRect.top) { k = i; break; }
-    }
-    if (k < 0) { applyScrollByRatio(false); return; }
-    const bl = blockLines[k];
-    if (!bl) { applyScrollByRatio(false); return; }
-    const elRect = preview.children[k].getBoundingClientRect();
-    const passed = wrapRect.top - elRect.top;
-    const frac = elRect.height > 0 ? passed / elRect.height : 0;
-    const ratio = Math.max(0, Math.min(frac, 1));
-    let line = bl.start + ratio * Math.max(0, bl.count - 1);
-    const maxLine = Math.floor((maxEdit - padTop) / lh);
-    if (line > maxLine) line = maxLine;
-    scrollEditorToLine(line);          // 它会补上 paddingTop
-}
-
 // 编辑区已经到底、但预览区还有内容时，滚轮要能继续往下走。
 // ⚠️ 编辑区到底后 scrollTop 不再变 → 浏览器**不再触发 scroll 事件** →
 //    只靠 scroll 事件是收不到这个信号的，必须监听 wheel。
@@ -3079,12 +2945,12 @@ function scheduleImeScrollSync() {
 previewScroll && previewScroll.addEventListener('scroll', () => {
     if (syncing || !editor) return;
     if (isEchoScrollEvent(previewScroll)) return;  // 这是程序自己同步过来的 → 忽略
+    if (!settings.scrollSync) return;             // 设置里关掉了同步
     // 方向要记：目录高亮靠它判断"当前章节取视口的哪一端"。
     noteScrollDir('preview', previewScroll);
-    // ⚠️ **不再调 scheduleScrollSync('preview')** ——
-    //    预览 → 编辑 的**自动**同步已经取消，原因见 syncEditorFromPreviewClick()：
-    //    有原始 HTML 的文档里块索引根本对不上，自动同步=自动跳错。
-    //    改成"用户点击预览才定位"（那条路走文本匹配，不依赖块索引）。
+    // 预览 → 编辑：同样按章节 + 比例定位（见 applyScrollToEditor 的注释）。
+    // ⚠️ 回弹抑制靠 `pendingEcho`（程序设过的确切位置）→ 不会乒乓。
+    scheduleScrollSync('preview');
 });
 
 // ============ 预览 HTML 消毒 ============
@@ -4855,6 +4721,7 @@ let editMode = false;
 
 function setEditMode(on) {
     editMode = on;
+    lastSyncedChapter = -1;             // 切模式 → 预览尺寸变了，章节锚点位置要重量
     // 用 <html> 上的 class（Rust 启动时也会注入同一个 class，首帧就一致）
     document.documentElement.classList.toggle('read-mode', !on);
     segBtns.forEach(b => b.classList.toggle('is-active', (b.dataset.mode === 'edit') === on));
@@ -5030,6 +4897,7 @@ async function openPath(path) {
     editor.setSelectionRange(0, 0);     // 光标回到开头
     editor.scrollTop = 0;               // 先归零（渲染和后续同步都以顶部为基准）
     editorScrollTop = 0;                // 缓存同步
+    lastSyncedChapter = -1;             // 换文件 → 章节基准重置（否则第一个章节算"没变"）
     currentFile = path;
     currentEncoding = file.encoding || 'utf-8';
     dirty = false;
@@ -5808,6 +5676,7 @@ async function autoReloadFromDisk() {
 
 /** 把外部的内容灌进编辑器（保持光标和滚动位置） */
 function applyExternalContent(content, tip) {
+    lastSyncedChapter = -1;             // 内容换了 → 章节基准重置
     const selStart = editor.selectionStart;
     const selEnd = editor.selectionEnd;
     const edScroll = editor.scrollTop;
@@ -5878,6 +5747,7 @@ async function dropDraft() {
 
 /** 把草稿灌回编辑器（恢复上次未保存的内容） */
 async function restoreDraft(draft) {
+    lastSyncedChapter = -1;             // 内容换了 → 章节基准重置
     editor.value = draft.content;
     editor.scrollTop = 0;               // 恢复的是上次的内容 → 从顶部开始看
     editorScrollTop = 0;                // 缓存同步
@@ -6220,6 +6090,7 @@ function setScrollSync(v) {
     syncSettingsUI();
 }
 
+
 function saveSettings() {
     // 存到设置文件（Rust 写），下次启动时 Rust 会读它来决定窗口底色
     invoke('save_settings', { settings: settings }).catch((e) => {
@@ -6244,6 +6115,7 @@ function syncSettingsUI() {
     document.querySelectorAll('#set-sync .seg-btn').forEach(b => {
         b.classList.toggle('is-active', (b.dataset.v === '1') === !!settings.scrollSync);
     });
+
 }
 
 /** 生成主题色块（颜色直接取自 THEMES，避免两处各写一份） */
@@ -6309,6 +6181,7 @@ document.querySelectorAll('#set-wrap .seg-btn').forEach(b => {
 document.querySelectorAll('#set-sync .seg-btn').forEach(b => {
     b.addEventListener('click', () => setScrollSync(b.dataset.v));
 });
+
 // 系统右键菜单项（.md 文件右键时多一个「用 VMD 打开」）
 document.getElementById('menu-on').addEventListener('click', async () => {
     try {
