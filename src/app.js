@@ -2942,9 +2942,32 @@ function scheduleImeScrollSync() {
     });
 }
 // 反向同步：预览区滚动 → 编辑区
+/**
+ * 预览区最近一次 scroll 是不是「程序自己滚的」。
+ *
+ * ⚠️ 需要这个标记：`isEchoScrollEvent()` 是**一次性消费**的，
+ * 而预览的 scroll 有**两个 listener**（本函数 + scheduleTocFromPreview）。
+ * 主 listener 先跑、把 echo 消费掉 → 后面的 listener 就以为是用户滚的 →
+ * 用**陈旧的** scrollDir.preview 去取锚点 → 目录高亮跑到别的章节去
+ * （实测：点第 485 节，高亮跑到 492 节 —— 因为按"往上滚"的旧方向
+ *   取了视口里**最靠下**的那个标题）。
+ */
+let lastPreviewScrollWasEcho = false;
+
 previewScroll && previewScroll.addEventListener('scroll', () => {
-    if (syncing || !editor) return;
-    if (isEchoScrollEvent(previewScroll)) return;  // 这是程序自己同步过来的 → 忽略
+    if (syncing || !editor) {
+        // ⚠️ **syncing 期间也是程序滚的**（目录跳转 / 编辑→预览同步），
+        //    这里提前 return → 不会消费 pendingEcho → 后面那个 listener
+        //    分不清是程序还是用户 → 目录高亮会跑到别的章节去。
+        //    所以这里也要标记。
+        if (syncing) lastPreviewScrollWasEcho = true;
+        return;
+    }
+    if (isEchoScrollEvent(previewScroll)) {
+        lastPreviewScrollWasEcho = true;    // 程序滚的 → 目录高亮别动
+        return;
+    }
+    lastPreviewScrollWasEcho = false;
     if (!settings.scrollSync) return;             // 设置里关掉了同步
     // 方向要记：目录高亮靠它判断"当前章节取视口的哪一端"。
     noteScrollDir('preview', previewScroll);
@@ -6681,8 +6704,16 @@ function scheduleTocHighlight() {
 let previewTocRaf = 0;
 function scheduleTocFromPreview() {
     if (previewTocRaf) return;
+    // ⚠️ **状态必须在这里（事件发生的瞬间）捕获**，不能等 rAF 回调里再看 ——
+    //    程序滚动只锁 `syncing` 两帧，rAF 回调时锁可能已经解开了。
+    const wasEcho = lastPreviewScrollWasEcho || syncing;
     previewTocRaf = requestAnimationFrame(() => {
         previewTocRaf = 0;
+        // ⚠️ 程序滚动（目录跳转 / 编辑→预览同步）时**不改高亮** ——
+        //    那次的锚点已经由点击方（或编辑区）算好了。
+        //    改了会取到错误的章节（实测：点第 485 节，高亮跑到 491 节 ——
+        //    因为按"往上滚"的**陈旧**方向取了视口里最靠下的标题）。
+        if (wasEcho) return;
         const el = currentHeadingElement();
         if (!el) return;
         const idx = headingPairs.findIndex(p => p.el === el);
