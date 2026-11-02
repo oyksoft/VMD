@@ -1,6 +1,6 @@
 # VMD · 一个轻量的 Markdown 编辑器（带实时预览）
 
-[![version](https://img.shields.io/badge/version-0.2.10-blue)](https://github.com/oyksoft/VMD)
+[![version](https://img.shields.io/badge/version-0.2.11-blue)](https://github.com/oyksoft/VMD)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078d4?logo=windows)](https://github.com/oyksoft/VMD)
 [![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/oyksoft/VMD)
 
@@ -341,7 +341,7 @@ cargo build --release
 mkdir ..\release -Force | Out-Null
 copy /y target\release\vmd.exe ..\release\VMD.exe
 cd ..\release
-Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.10-win64-portable.zip -Force
+Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.11-win64-portable.zip -Force
 ```
 
 > touch `tauri.conf.json` 这步别漏 —— `tauri-build` 只监听配置文件的变化，
@@ -351,7 +351,16 @@ Compress-Archive -Path VMD.exe,README.txt -DestinationPath VMD-0.2.10-win64-port
 
 ## 更新日志
 
-### 0.2.10（当前）
+### 0.2.11（当前）
+
+- 🐛 **滚动同步不再突然跳走** —— 编辑区和预览区双向跟随，位置算得更准。
+  之前遇到 `---` 分隔线、表格这类行会算错位置，预览会莫名其妙跳到别的地方。
+- 🐛 **点目录后高亮不再跑偏** —— 之前点第 485 节，高亮会跑到 492 节。
+- ✨ **点预览里的文字能直接定位到源码** —— 编辑区滚到对应位置并闪一下；选中一段文字也一样。
+- 🐛 **目录高亮跟着滚动走** —— 滚预览区时，左侧目录会高亮当前所在章节。
+- ⚡ **点目录跳转不再有滑动动画** —— 一跳到位，位置更准。
+
+### 0.2.10
 
 这一版是**一轮代码审查 + 自建测试**的结果。写测试的时候当场抓出了一个
 **很严重的回归**（见下），所以如果你只记住一条，就是这条。
